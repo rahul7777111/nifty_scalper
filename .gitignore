@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Environment variables (Sensitive)
+.scalper.env
+
+# Logs
+*.log
+.scalper.ui.log
+mconnect.log
+
+# Large Data Files
+*.csv
+scripmaster.csv
+
+# Local databases / artifacts
+*.db
+diff*.txt
+error*.txt
+
+# IDEs
+.vscode/
+.idea/

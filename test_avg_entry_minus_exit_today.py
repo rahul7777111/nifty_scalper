@@ -121,3 +121,44 @@ def test_close_event_with_zero_qty_keeps_leg_history_and_ltp_exit() -> None:
     assert ui._trade_state["T1"]["legs"][0]["ltp"] == 95.0
     assert len(ui._closed_option_legs) == 1
     assert ui._closed_option_legs[0]["exit_price"] == 95.0
+
+
+def test_completed_trade_event_is_persisted_to_db() -> None:
+    class DummyDb:
+        def __init__(self) -> None:
+            self.rows = []
+
+        def insert_trade(self, **kwargs) -> None:
+            self.rows.append(kwargs)
+
+    ui = ScalperUI.__new__(ScalperUI)
+    db = DummyDb()
+    ui._db_manager = db
+    ui._persisted_trade_events = set()
+
+    evt = TradeLogEvent(
+        ts=1234.0,
+        event="CLOSE",
+        trade_id="T-db",
+        position_type="multi",
+        name="iron_condor",
+        legs=[
+            {
+                "symbol": "NIFTY27MAR2522400CE",
+                "side": "SELL",
+                "quantity": 50,
+                "entry_price": 100.0,
+                "exit_price": 90.0,
+            }
+        ],
+        realized=500.0,
+    )
+
+    ScalperUI._persist_completed_trade_event(ui, evt)
+    ScalperUI._persist_completed_trade_event(ui, evt)
+
+    assert len(db.rows) == 1
+    assert db.rows[0]["trade_id"] == "T-db"
+    assert db.rows[0]["symbol"] == "NIFTY27MAR2522400CE"
+    assert db.rows[0]["quantity"] == 50
+    assert db.rows[0]["realized_pnl"] == 500.0

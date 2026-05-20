@@ -1,0 +1,871 @@
+PS C:\Users\rahul\Downloads\NiftyScalper> 
++                if hasattr(self, "bt_status_var"):
++                    self.after(0, lambda: self.bt_status_var.set(f"{title} finished."))
++
++        threading.Thread(target=worker, daemon=True).start()
++
++    def _on_backtest_compare(self) -> None:
++        try:
++            args = self._backtest_base_args() + ["--compare-presets"]
++        except Exception as exc:  # noqa: BLE001
++            messagebox.showerror("Backtest inputs", f"Check the backtest inputs: {exc}")
++            return
++        self._run_tool_async("Backtest compare", "backtest_today.py", args)
++
++    def _on_backtest_single(self, preset: str) -> None:
++        try:
++            args = self._backtest_base_args() + ["--preset", str(preset)]
++        except Exception as exc:  # noqa: BLE001
++            messagebox.showerror("Backtest inputs", f"Check the backtest inputs: {exc}")
++            return
++        self._run_tool_async(f"Backtest {preset}", "backtest_today.py", args)
++
++    def _on_backtest_tune(self) -> None:
++        try:
++            base_args = self._backtest_base_args()
++        except Exception as exc:  # noqa: BLE001
++            messagebox.showerror("Backtest inputs", f"Check the backtest inputs: {exc}")
++            return
++        # tune_presets_today.py loads all 1m/3m/5m timeframes itself, so it does not accept --timeframe.
++        filtered: list[str] = []
++        skip_next = False
++        for i, part in enumerate(base_args):
++            if skip_next:
++                skip_next = False
++                continue
++            if part == "--timeframe":
++                skip_next = True
++                continue
++            filtered.append(part)
++        try:
++            iters = int(float(str(self.bt_iters_var.get() or "120").strip()))
++            dd_penalty = float(str(self.bt_dd_penalty_var.get() or "0.5").strip())
++        except Exception as exc:  # noqa: BLE001
++            messagebox.showerror("Tune inputs", f"Check the tune inputs: {exc}")
++            return
++        args = filtered + ["--iters", str(iters), "--dd-penalty", str(dd_penalty)]
++        min_exp_raw = str(self.bt_min_expectancy_var.get() or "").strip()
++        min_pf_raw = str(self.bt_min_profit_factor_var.get() or "").strip()
++        try:
++            if min_exp_raw:
++                args.extend(["--min-expectancy", str(float(min_exp_raw))])
++            if min_pf_raw:
++                args.extend(["--min-profit-factor", str(float(min_pf_raw))])
++        except Exception as exc:  # noqa: BLE001
++            messagebox.showerror("Tune quality inputs", f"Check min expectancy / min PF: {exc}")
++            return
++        self._run_tool_async("Preset tuner", "tune_presets_today.py", args)
++
+     def _build_signals_tab(self) -> None:
+         root = ttk.Frame(self.signals_frame)
+         root.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+@@ -4660,6 +5121,52 @@ class ScalperUI(tk.Tk):
+         except Exception:
+             pass
+ 
++    def _prune_old_closed_trades(self, max_keep: int = 250) -> None:
++        """Remove old fully closed trades from tracking and the UI to prevent memory leaks and UI freezing."""
++        try:
++            # Gather fully CLOSED trade IDs. We rely on the fact that dict insertion order
++            # roughly matches chronological order in Python 3.7+.
++            closed_ids: list[str] = []
++            for trade_id, state in list(self._trade_state.items()):
++                if str(trade_id).endswith("-H"):
++                    # We prune hedges when we prune the original
++                    continue
++                st = str((state or {}).get("status") or "").strip().upper()
++                if st.startswith("CLOSED"):
++                    closed_ids.append(str(trade_id))
++
++            # Only prune if we have more than max_keep perfectly closed trades
++            if len(closed_ids) <= max_keep:
++                return
++
++            stale_ids = closed_ids[:-max_keep]
++
++            for trade_id in stale_ids:
++                try:
++                    row = self._trade_rows.pop(trade_id, None)
++                    if row is not None:
++                        self.trade_tree.delete(row)
++                except Exception:
++                    pass
++                try:
++                    self._trade_state.pop(trade_id, None)
++                except Exception:
++                    pass
++
++                hedge_trade_id = f"{trade_id}-H"
++                try:
++                    hedge_row = self._trade_rows.pop(hedge_trade_id, None)
++                    if hedge_row is not None:
++                        self.trade_tree.delete(hedge_row)
++                except Exception:
++                    pass
++                try:
++                    self._trade_state.pop(hedge_trade_id, None)
++                except Exception:
++                    pass
++        except Exception:
++            pass
++
+     def _format_legs(
+         self,
+         legs: list[dict],
+@@ -4672,6 +5179,8 @@ class ScalperUI(tk.Tk):
+             try:
+                 side = str(leg.get("side") or "").upper()
+                 sym = str(leg.get("symbol") or "")
++                if ":" in sym:
++                    sym = sym.split(":", 1)[-1].strip()
+                 qty = self._get_leg_qty(leg)
+                 if not sym:
+                     continue
+@@ -4739,6 +5248,16 @@ class ScalperUI(tk.Tk):
+                         digits = body[j + 1 :]
+                         if digits:
+                             label = f"{digits} {opt}"
++                    if is_option_leg and expiry is not None:
++                        try:
++                            if hasattr(expiry, "strftime"):
++                                exp_str = expiry.strftime("%d-%b-%y")
++                            else:
++                                exp_str = str(expiry).split()[0]
++                        except Exception:
++                            exp_str = str(expiry)
++                        if exp_str:
++                            label = f"{exp_str} {label}"
+ 
+                 # Attach price info where available.
+                 entry = leg.get("entry_price")
+@@ -5082,6 +5601,121 @@ class ScalperUI(tk.Tk):
+         if add_qty > 0:
+             self._hedge_qty_traded_total += int(add_qty)
+ 
++    def _event_realized_pnl(self, evt: TradeLogEvent) -> float | None:
++        try:
++            if evt.realized is not None:
++                return float(evt.realized)
++        except Exception:
++            pass
++
++        total = 0.0
++        any_leg = False
++        for leg in list(evt.legs or []):
++            if not isinstance(leg, dict):
++                continue
++            try:
++                side = str(leg.get("side") or "").strip().upper()
++                qty = int(leg.get("quantity") or 0)
++                entry = float(leg.get("entry_price"))
++                exit_raw = leg.get("exit_price")
++                if exit_raw is None:
++                    exit_raw = leg.get("ltp")
++                exit_price = float(exit_raw)
++            except Exception:
++                continue
++            if qty <= 0 or side not in {"BUY", "SELL"}:
++                continue
++            sign = 1.0 if side == "BUY" else -1.0
++            total += (float(exit_price) - float(entry)) * sign * float(abs(qty))
++            any_leg = True
++
++        return float(total) if any_leg else None
++
++    def _persist_completed_trade_event(self, evt: TradeLogEvent) -> None:
++        """Persist realized close events so terminal P&L can read trades.db."""
++
++        try:
++            if str(evt.event or "").upper() not in {"PARTIAL_CLOSE", "CLOSE"}:
++                return
++        except Exception:
++            return
++
++        db_manager = getattr(self, "_db_manager", None)
++        if db_manager is None:
++            try:
++                db_manager = DatabaseManager()
++                self._db_manager = db_manager
++            except Exception:
++                return
++
++        realized = self._event_realized_pnl(evt)
++        if realized is None:
++            return
++
++        try:
++            ts_key = round(float(evt.ts), 3)
++        except Exception:
++            ts_key = round(time.time(), 3)
++        dedupe_key = (str(evt.trade_id), str(evt.event), ts_key, round(float(realized), 4))
++        try:
++            if dedupe_key in self._persisted_trade_events:
++                return
++            self._persisted_trade_events.add(dedupe_key)
++        except Exception:
++            pass
++
++        legs = [leg for leg in list(evt.legs or []) if isinstance(leg, dict)]
++        symbols: list[str] = []
++        qty_total = 0
++        entries: list[float] = []
++        exits: list[float] = []
++        sides: set[str] = set()
++        for leg in legs:
++            sym = str(leg.get("symbol") or "").strip()
++            if sym and sym not in symbols:
++                symbols.append(sym)
++            try:
++                qty_total += abs(int(leg.get("quantity") or 0))
++            except Exception:
++                pass
++            side = str(leg.get("side") or "").strip().upper()
++            if side:
++                sides.add(side)
++            try:
++                if leg.get("entry_price") is not None:
++                    entries.append(float(leg.get("entry_price")))
++            except Exception:
++                pass
++            try:
++                exit_raw = leg.get("exit_price")
++                if exit_raw is None:
++                    exit_raw = leg.get("ltp")
++                if exit_raw is not None:
++                    exits.append(float(exit_raw))
++            except Exception:
++                pass
++
++        symbol = ", ".join(symbols[:3]) if symbols else str(evt.name or evt.position_type or "trade")
++        if len(symbols) > 3:
++            symbol = f"{symbol}, ..."
++        side = "/".join(sorted(sides)) if sides else str(evt.position_type or evt.event or "TRADE")
++        entry_price = (sum(entries) / len(entries)) if entries else 0.0
++        exit_price = (sum(exits) / len(exits)) if exits else 0.0
++        quantity = int(qty_total or 1)
++
++        try:
++            db_manager.insert_trade(
++                trade_id=str(evt.trade_id),
++                symbol=str(symbol),
++                side=str(side),
++                quantity=int(quantity),
++                entry_price=float(entry_price),
++                exit_price=float(exit_price),
++                realized_pnl=float(realized),
++            )
++        except Exception:
++            return
++
+     def _pump_trades(self) -> None:
+         try:
+             processed = 0
+@@ -5105,6 +5739,7 @@ class ScalperUI(tk.Tk):
+                     elif evt.event == "PARTIAL_CLOSE":
+                         state["status"] = "PARTIAL"
+                         self._note_closed_option_legs(evt)
++                        self._persist_completed_trade_event(evt)
+                         self._note_traded_qty(evt)
+                         self._note_hedge_traded_qty(evt)
+                         # IMPORTANT: strategy emits PARTIAL_CLOSE events with only the closed leg(s)
+@@ -5260,6 +5895,7 @@ class ScalperUI(tk.Tk):
+                         except Exception:
+                             close_evt = evt
+                         self._note_closed_option_legs(close_evt)
++                        self._persist_completed_trade_event(close_evt)
+                         self._note_traded_qty(evt)
+                         self._note_hedge_traded_qty(evt)
+                     elif evt.event == "UPDATE":
+@@ -5269,10 +5905,52 @@ class ScalperUI(tk.Tk):
+                         self._note_traded_qty(evt)
+                         self._note_hedge_traded_qty(evt)
+ 
++                    recomputed_update_mtm = None
+                     if evt.legs and evt.event not in {"PARTIAL_CLOSE", "CLOSE"}:
+-                        state["legs"] = evt.legs
++                        legs_in = list(evt.legs)
++                        if evt.event == "UPDATE":
++                            try:
++                                prev_legs = state.get("legs") if isinstance(state.get("legs"), list) else []
++                                prev_by_key: dict[tuple[str, str] | tuple[str, str, str], dict] = {}
++                                for prev_leg in prev_legs:
++                                    if not isinstance(prev_leg, dict):
++                                        continue
++                                    pk, keys_all = self._qty_track_keys(trade_id, prev_leg)
++                                    for k in keys_all or ([pk] if pk is not None else []):
++                                        if k is not None:
++                                            prev_by_key[k] = prev_leg
++
++                                merged_legs: list[dict] = []
++                                for leg_in in legs_in:
++                                    if not isinstance(leg_in, dict):
++                                        continue
++                                    leg_copy = dict(leg_in)
++                                    incoming_ltp = leg_copy.get("ltp")
++                                    if incoming_ltp in (None, ""):
++                                        pk, keys_all = self._qty_track_keys(trade_id, leg_copy)
++                                        prev_match = None
++                                        for k in keys_all or ([pk] if pk is not None else []):
++                                            if k is not None and k in prev_by_key:
++                                                prev_match = prev_by_key[k]
++                                                break
++                                        if isinstance(prev_match, dict) and prev_match.get("ltp") not in (None, ""):
++                                            leg_copy["ltp"] = prev_match.get("ltp")
++                                    merged_legs.append(leg_copy)
++                                if merged_legs:
++                                    legs_in = merged_legs
++                            except Exception:
++                                pass
++                        state["legs"] = legs_in
++                        if evt.event == "UPDATE":
++                            try:
++                                recomputed_update_mtm = self._compute_cached_trade_mtm(legs_in)
++                            except Exception:
++                                recomputed_update_mtm = None
+                     if evt.mtm is not None:
+-                        state["mtm"] = float(evt.mtm)
++                        if evt.event == "UPDATE" and recomputed_update_mtm is not None:
++                            state["mtm"] = float(recomputed_update_mtm)
++                        else:
++                            state["mtm"] = float(evt.mtm)
+                     if evt.realized is not None:
+                         # Accumulate realized P&L for partial bookings
+                         cur_realized = float(state.get("realized") or 0.0)
+@@ -5385,13 +6063,7 @@ class ScalperUI(tk.Tk):
+                             except Exception:
+                                 has_ltp = False
+                             if not has_ltp:
+-                                try:
+-                                    live_ltp = self._try_get_live_ltp_for_leg(client, leg_copy) if client is not None else None
+-                                except Exception:
+-                                    live_ltp = None
+-                                if live_ltp is not None:
+-                                    leg_copy["ltp"] = float(live_ltp)
+-                                elif leg_copy.get("exit_price") is not None:
++                                if leg_copy.get("exit_price") is not None:
+                                     try:
+                                         leg_copy["ltp"] = float(leg_copy.get("exit_price"))
+                                     except Exception:
+@@ -5509,6 +6181,13 @@ class ScalperUI(tk.Tk):
+                 self._prune_stale_open_rows_when_idle()
+             except Exception:
+                 pass
++            
++            # Prune excessively old closed trades to prevent memory leaks/UI freezes
++            try:
++                self._prune_old_closed_trades()
++            except Exception:
++                pass
++
+             self.after(150, self._pump_trades)
+ 
+     def _on_show_settings(self) -> None:
+@@ -6153,6 +6832,9 @@ class ScalperUI(tk.Tk):
+                 "Entry Require BA": entry_req_ba_var,
+                 "Entry Spread %": entry_spread_pct_var,
+                 "Entry Spread Abs": entry_spread_abs_var,
++                "Entry Spread Shock": entry_spread_shock_var,
++                "Entry Shock Lookback": entry_spread_shock_lookback_var,
++                "Entry Shock Samples": entry_spread_shock_min_samples_var,
+                 "IV Expand %": iv_expand_var,
+                 "IV Contract %": iv_contract_var,
+                 "GPT Leg Manage": gpt_leg_manage_var,
+@@ -6188,6 +6870,16 @@ class ScalperUI(tk.Tk):
+                 "Dir Allow Tie": dir_allow_tie_var,
+                 "Exit Short Touch": exit_short_var,
+                 "Exit Wing Touch": exit_wing_var,
++                "IV Filter": iv_filter_enabled_var,
++                "MTF Hard Filter": mtf_hard_filter_var,
++                "Theta Stop Widen": theta_stop_widen_var,
++                "Theta Stop Max Mult": theta_stop_max_mult_var,
++                "Theta Stop Threshold": theta_stop_threshold_var,
++                "Exit Ladder": exit_ladder_enabled_var,
++                "Exit Ladder Steps": exit_ladder_steps_var,
++                "DH Vol Adjust": dh_vol_adjust_var,
++                "DH Vol Low Factor": dh_vol_low_factor_var,
++                "DH Vol High Factor": dh_vol_high_factor_var,
+             }
+             for label, var in vars_to_track.items():
+                 try:
+@@ -6263,6 +6955,9 @@ class ScalperUI(tk.Tk):
+                 entry_candle_range_var.set("3.5")
+                 entry_gap_var.set("2.0")
+                 entry_req_ba_var.set(False)
++                entry_spread_shock_var.set("2.2")
++                entry_spread_shock_lookback_var.set("20")
++                entry_spread_shock_min_samples_var.set("5")
+                 iv_expand_var.set("4.5")
+                 iv_contract_var.set("4.0")
+                 gpt_leg_refresh_var.set("30")
+@@ -6281,6 +6976,17 @@ class ScalperUI(tk.Tk):
+                 max_pos_var.set(str(preset_position_limit))
+                 exit_short_var.set(True)
+                 exit_wing_var.set(True)
++                # New features: aggressive defaults
++                iv_filter_enabled_var.set(True)
++                mtf_hard_filter_var.set(True)
++                theta_stop_widen_var.set(True)
++                theta_stop_max_mult_var.set("2.5")
++                theta_stop_threshold_var.set("-8.0")
++                exit_ladder_enabled_var.set(True)
++                exit_ladder_steps_var.set("0.25:0.8,0.25:1.2,0.30:1.8")
++                dh_vol_adjust_var.set(True)
++                dh_vol_low_factor_var.set("0.6")
++                dh_vol_high_factor_var.set("1.6")
+ 
+             elif name == "Conservative":
+                 if allow_strategy_override:
+@@ -6333,6 +7039,9 @@ class ScalperUI(tk.Tk):
+                 entry_gap_var.set("1.4")
+                 entry_req_ba_var.set(True)
+                 entry_spread_pct_var.set("0.45")
++                entry_spread_shock_var.set("2.0")
++                entry_spread_shock_lookback_var.set("25")
++                entry_spread_shock_min_samples_var.set("6")
+                 iv_expand_var.set("3.0")
+                 iv_contract_var.set("3.2")
+                 gpt_leg_refresh_var.set("60")
+@@ -6351,6 +7060,17 @@ class ScalperUI(tk.Tk):
+                 max_pos_var.set(str(preset_position_limit))
+                 exit_short_var.set(True)
+                 exit_wing_var.set(False)
++                # New features: conservative defaults
++                iv_filter_enabled_var.set(True)
++                mtf_hard_filter_var.set(False)
++                theta_stop_widen_var.set(True)
++                theta_stop_max_mult_var.set("1.8")
++                theta_stop_threshold_var.set("-4.0")
++                exit_ladder_enabled_var.set(True)
++                exit_ladder_steps_var.set("0.20:1.0,0.20:1.5,0.20:2.0")
++                dh_vol_adjust_var.set(True)
++                dh_vol_low_factor_var.set("0.8")
++                dh_vol_high_factor_var.set("1.3")
+ 
+             after = _snapshot_preset_fields()
+             keys = list({*before.keys(), *after.keys()})
+@@ -6583,6 +7303,17 @@ class ScalperUI(tk.Tk):
+         entry_spread_abs_var = tk.StringVar(value=str(getattr(cfg, "entry_max_bid_ask_spread_abs", 0.0)))
+         tk.Entry(entry_spread_frame, textvariable=entry_spread_abs_var, width=8).pack(side=tk.LEFT, padx=(6, 0))
+ 
++        row += 1
++        tk.Label(content, text="Entry spread shock x / lookback / samples").grid(row=row, column=0, sticky="w", padx=8)
++        entry_spread_shock_frame = tk.Frame(content)
++        entry_spread_shock_frame.grid(row=row, column=1, sticky="w", padx=8)
++        entry_spread_shock_var = tk.StringVar(value=str(getattr(cfg, "entry_spread_shock_mult", 0.0)))
++        tk.Entry(entry_spread_shock_frame, textvariable=entry_spread_shock_var, width=8).pack(side=tk.LEFT)
++        entry_spread_shock_lookback_var = tk.StringVar(value=str(getattr(cfg, "entry_spread_shock_lookback", 20)))
++        tk.Entry(entry_spread_shock_frame, textvariable=entry_spread_shock_lookback_var, width=8).pack(side=tk.LEFT, padx=(6, 0))
++        entry_spread_shock_min_samples_var = tk.StringVar(value=str(getattr(cfg, "entry_spread_shock_min_samples", 5)))
++        tk.Entry(entry_spread_shock_frame, textvariable=entry_spread_shock_min_samples_var, width=8).pack(side=tk.LEFT, padx=(6, 0))
++
+         row += 1
+         tk.Label(content, text="IV expand / contract % (short/long)").grid(row=row, column=0, sticky="w", padx=8)
+         iv_frame = tk.Frame(content)
+@@ -6840,6 +7571,71 @@ class ScalperUI(tk.Tk):
+         tk.Label(content, text="Dir BE / Trail x ATR (BE can be negative)").grid(row=row, column=0, sticky="w", padx=8)
+         dir_trail_frame = tk.Frame(content)
+         dir_trail_frame.grid(row=row, column=1, sticky="w", padx=8)
++        
++        row += 1
++        tk.Label(content, text='Initial SL / TP (ATR Mult)').grid(row=row, column=0, sticky="w", padx=8)
++        sltp_frame = tk.Frame(content)
++        sltp_frame.grid(row=row, column=1, sticky="w", padx=8)
++        dir_sl_var = tk.StringVar(value=str(getattr(cfg, "dir_sl_atr_mult", 1.5)))
++        dir_tp_var = tk.StringVar(value=str(getattr(cfg, "dir_tp_atr_mult", 3.0)))
++        tk.Entry(sltp_frame, textvariable=dir_sl_var, width=10).pack(side=tk.LEFT)
++        tk.Entry(sltp_frame, textvariable=dir_tp_var, width=10).pack(side=tk.LEFT, padx=(6, 0))
++
++        row += 1
++        tk.Label(content, text='Delta Strikes / Theta Filter').grid(row=row, column=0, sticky="w", padx=8)
++        delta_frame = tk.Frame(content)
++        delta_frame.grid(row=row, column=1, sticky="w", padx=8)
++        iv_filter_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "iv_filter_enabled", False)))
++        mtf_hard_filter_var = tk.BooleanVar(value=bool(getattr(cfg, "mtf_hard_filter", False)))
++        theta_stop_widen_var = tk.BooleanVar(value=bool(getattr(cfg, "theta_stop_widen_enabled", False)))
++        theta_stop_max_mult_var = tk.StringVar(value=str(getattr(cfg, "theta_stop_widen_max_mult", 2.0)))
++        theta_stop_threshold_var = tk.StringVar(value=str(getattr(cfg, "theta_stop_widen_threshold", -5.0)))
++        exit_ladder_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "exit_ladder_enabled", False)))
++        exit_ladder_steps_var = tk.StringVar(value=str(getattr(cfg, "exit_ladder_steps", "0.25:1.0,0.25:1.5,0.25:2.0")))
++        dh_vol_adjust_var = tk.BooleanVar(value=bool(getattr(cfg, "delta_hedge_vol_adjust_enabled", False)))
++        dh_vol_low_factor_var = tk.StringVar(value=str(getattr(cfg, "delta_hedge_vol_low_tol_factor", 0.7)))
++        dh_vol_high_factor_var = tk.StringVar(value=str(getattr(cfg, "delta_hedge_vol_high_tol_factor", 1.5)))
++
++        delta_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_delta_strike_selection", False)))
++        delta_target_var = tk.StringVar(value=str(getattr(cfg, "target_delta", 0.40)))
++        theta_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_theta_decay_filter", False)))
++        ttk.Checkbutton(delta_frame, text="Delta", variable=delta_enabled_var).pack(side=tk.LEFT)
++        tk.Entry(delta_frame, textvariable=delta_target_var, width=6).pack(side=tk.LEFT, padx=(2, 6))
++        ttk.Checkbutton(delta_frame, text="Theta", variable=theta_enabled_var).pack(side=tk.LEFT)
++
++        row += 1
++        tk.Label(content, text='Hard CHOP / RSI Confluence').grid(row=row, column=0, sticky="w", padx=8)
++        filter_frame = tk.Frame(content)
++        filter_frame.grid(row=row, column=1, sticky="w", padx=8)
++        chop_hard_var = tk.BooleanVar(value=bool(getattr(cfg, "choppiness_hard_filter", False)))
++        rsi_conf_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_rsi_confluence", False)))
++        ttk.Checkbutton(filter_frame, text="Hard Chop", variable=chop_hard_var).pack(side=tk.LEFT)
++        ttk.Checkbutton(filter_frame, text="RSI Conf", variable=rsi_conf_var).pack(side=tk.LEFT, padx=(6, 0))
++
++        row += 1
++        adv_frame = tk.Frame(content)
++        adv_frame.grid(row=row, column=1, sticky="w", padx=8)
++        iv_filter_var = tk.BooleanVar(value=bool(getattr(cfg, "iv_filter_enabled", False)))
++        mtf_hard_var = tk.BooleanVar(value=bool(getattr(cfg, "mtf_hard_filter", False)))
++        theta_stop_var = tk.BooleanVar(value=bool(getattr(cfg, "theta_stop_widen_enabled", False)))
++        theta_max_mult_var = tk.StringVar(value=str(getattr(cfg, "theta_stop_widen_max_mult", 2.0)))
++        theta_threshold_var = tk.StringVar(value=str(getattr(cfg, "theta_stop_widen_threshold", -5.0)))
++        exit_ladder_var = tk.BooleanVar(value=bool(getattr(cfg, "exit_ladder_enabled", False)))
++        exit_ladder_steps_var2 = tk.StringVar(value=str(getattr(cfg, "exit_ladder_steps", "0.25:1.0,0.25:1.5,0.25:2.0")))
++        dh_vol_var = tk.BooleanVar(value=bool(getattr(cfg, "delta_hedge_vol_adjust_enabled", False)))
++        dh_vol_low_var = tk.StringVar(value=str(getattr(cfg, "delta_hedge_vol_low_tol_factor", 0.7)))
++        dh_vol_high_var = tk.StringVar(value=str(getattr(cfg, "delta_hedge_vol_high_tol_factor", 1.5)))
++        ttk.Checkbutton(adv_frame, text="IV Filter", variable=iv_filter_var).pack(side=tk.LEFT, padx=(0, 4))
++        ttk.Checkbutton(adv_frame, text="MTF Hard", variable=mtf_hard_var).pack(side=tk.LEFT, padx=(4, 4))
++        ttk.Checkbutton(adv_frame, text="Theta Stop", variable=theta_stop_var).pack(side=tk.LEFT, padx=(4, 4))
++        tk.Entry(adv_frame, textvariable=theta_max_mult_var, width=5).pack(side=tk.LEFT, padx=(2, 2))
++        tk.Entry(adv_frame, textvariable=theta_threshold_var, width=5).pack(side=tk.LEFT, padx=(2, 4))
++        ttk.Checkbutton(adv_frame, text="Exit Ladder", variable=exit_ladder_var).pack(side=tk.LEFT, padx=(4, 2))
++        tk.Entry(adv_frame, textvariable=exit_ladder_steps_var2, width=14).pack(side=tk.LEFT, padx=(2, 4))
++        ttk.Checkbutton(adv_frame, text="DH Vol Adj", variable=dh_vol_var).pack(side=tk.LEFT, padx=(4, 2))
++        tk.Entry(adv_frame, textvariable=dh_vol_low_var, width=4).pack(side=tk.LEFT, padx=(2, 2))
++        tk.Entry(adv_frame, textvariable=dh_vol_high_var, width=4).pack(side=tk.LEFT, padx=(2, 0))
++
+         dir_be_var = tk.StringVar(value=str(cfg.dir_breakeven_atr_mult))
+         tk.Entry(dir_trail_frame, textvariable=dir_be_var, width=10).pack(side=tk.LEFT)
+         dir_trail_atr_var = tk.StringVar(value=str(cfg.dir_trail_atr_mult))
+@@ -7424,6 +8220,33 @@ class ScalperUI(tk.Tk):
+                     v = str(float(entry_spread_abs_var.get().strip()))
+                     os.environ["MSTOCK_ENTRY_MAX_BID_ASK_SPREAD_ABS"] = v
+                     to_persist["MSTOCK_ENTRY_MAX_BID_ASK_SPREAD_ABS"] = v
++                if entry_spread_shock_var.get().strip():
++                    v = str(float(entry_spread_shock_var.get().strip()))
++                    os.environ["MSTOCK_ENTRY_SPREAD_SHOCK_MULT"] = v
++                    to_persist["MSTOCK_ENTRY_SPREAD_SHOCK_MULT"] = v
++                    try:
++                        if hasattr(self, "entry_spread_shock_mult_var"):
++                            self.entry_spread_shock_mult_var.set(v)
++                    except Exception:
++                        pass
++                if entry_spread_shock_lookback_var.get().strip():
++                    v = str(int(float(entry_spread_shock_lookback_var.get().strip())))
++                    os.environ["MSTOCK_ENTRY_SPREAD_SHOCK_LOOKBACK"] = v
++                    to_persist["MSTOCK_ENTRY_SPREAD_SHOCK_LOOKBACK"] = v
++                    try:
++                        if hasattr(self, "entry_spread_shock_lookback_var"):
++                            self.entry_spread_shock_lookback_var.set(v)
++                    except Exception:
++                        pass
++                if entry_spread_shock_min_samples_var.get().strip():
++                    v = str(int(float(entry_spread_shock_min_samples_var.get().strip())))
++                    os.environ["MSTOCK_ENTRY_SPREAD_SHOCK_MIN_SAMPLES"] = v
++                    to_persist["MSTOCK_ENTRY_SPREAD_SHOCK_MIN_SAMPLES"] = v
++                    try:
++                        if hasattr(self, "entry_spread_shock_min_samples_var"):
++                            self.entry_spread_shock_min_samples_var.set(v)
++                    except Exception:
++                        pass
+                 if iv_expand_var.get().strip():
+                     v = str(float(iv_expand_var.get().strip()))
+                     os.environ["MSTOCK_IV_EXPAND_THRESHOLD_PCT"] = v
+@@ -7596,6 +8419,28 @@ class ScalperUI(tk.Tk):
+                     os.environ["MSTOCK_SUPERTREND_MODE"] = v
+                     to_persist["MSTOCK_SUPERTREND_MODE"] = v
+ 
++                
++                if dir_sl_var.get().strip():
++                    v = str(float(dir_sl_var.get().strip()))
++                    os.environ["MSTOCK_DIR_SL_ATR_MULT"] = v
++                    to_persist["MSTOCK_DIR_SL_ATR_MULT"] = v
++                if dir_tp_var.get().strip():
++                    v = str(float(dir_tp_var.get().strip()))
++                    os.environ["MSTOCK_DIR_TP_ATR_MULT"] = v
++                    to_persist["MSTOCK_DIR_TP_ATR_MULT"] = v
++                if delta_target_var.get().strip():
++                    v = str(float(delta_target_var.get().strip()))
++                    os.environ["MSTOCK_TARGET_DELTA"] = v
++                    to_persist["MSTOCK_TARGET_DELTA"] = v
++                os.environ["MSTOCK_ENABLE_DELTA_STRIKE_SELECTION"] = "1" if delta_enabled_var.get() else ""
++                to_persist["MSTOCK_ENABLE_DELTA_STRIKE_SELECTION"] = os.environ["MSTOCK_ENABLE_DELTA_STRIKE_SELECTION"]
++                os.environ["MSTOCK_ENABLE_THETA_DECAY_FILTER"] = "1" if theta_enabled_var.get() else ""
++                to_persist["MSTOCK_ENABLE_THETA_DECAY_FILTER"] = os.environ["MSTOCK_ENABLE_THETA_DECAY_FILTER"]
++                os.environ["MSTOCK_CHOPPINESS_HARD_FILTER"] = "1" if chop_hard_var.get() else ""
++                to_persist["MSTOCK_CHOPPINESS_HARD_FILTER"] = os.environ["MSTOCK_CHOPPINESS_HARD_FILTER"]
++                os.environ["MSTOCK_ENABLE_RSI_CONFLUENCE"] = "1" if rsi_conf_var.get() else ""
++                to_persist["MSTOCK_ENABLE_RSI_CONFLUENCE"] = os.environ["MSTOCK_ENABLE_RSI_CONFLUENCE"]
++
+                 if dir_be_var.get().strip():
+                     v = str(float(dir_be_var.get().strip()))
+                     os.environ["MSTOCK_DIR_BREAKEVEN_ATR_MULT"] = v
+@@ -7642,86 +8487,63 @@ class ScalperUI(tk.Tk):
+                 
+                 os.environ["MSTOCK_ENABLE_MTF_CONFIRMATION"] = "true" if mtf_enabled_var.get() else "false"
+                 to_persist["MSTOCK_ENABLE_MTF_CONFIRMATION"] = os.environ["MSTOCK_ENABLE_MTF_CONFIRMATION"]
+-                
+-                os.environ["MSTOCK_ENABLE_ROC_FILTER"] = "true" if roc_enabled_var.get() else "false"
+-                to_persist["MSTOCK_ENABLE_ROC_FILTER"] = os.environ["MSTOCK_ENABLE_ROC_FILTER"]
+-                
+-                os.environ["MSTOCK_ENABLE_CHOPPINESS_FILTER"] = "true" if chop_enabled_var.get() else "false"
+-                to_persist["MSTOCK_ENABLE_CHOPPINESS_FILTER"] = os.environ["MSTOCK_ENABLE_CHOPPINESS_FILTER"]
+-                
+-                os.environ["MSTOCK_ENABLE_CHANDELIER_EXIT"] = "true" if chan_enabled_var.get() else "false"
+-                to_persist["MSTOCK_ENABLE_CHANDELIER_EXIT"] = os.environ["MSTOCK_ENABLE_CHANDELIER_EXIT"]
+-                
+-                os.environ["MSTOCK_ENABLE_PIVOT_TARGETS"] = "true" if pivot_enabled_var.get() else "false"
+-                to_persist["MSTOCK_ENABLE_PIVOT_TARGETS"] = os.environ["MSTOCK_ENABLE_PIVOT_TARGETS"]
+-                
+-                os.environ["MSTOCK_ENABLE_LIMIT_ORDERS"] = "true" if limit_enabled_var.get() else "false"
+-                to_persist["MSTOCK_ENABLE_LIMIT_ORDERS"] = os.environ["MSTOCK_ENABLE_LIMIT_ORDERS"]
+-
+-                if pyramid_var.get().strip():
+-                    v = str(int(pyramid_var.get().strip()))
+-                    os.environ["MSTOCK_MAX_PYRAMID_LEVELS"] = v
+-                    to_persist["MSTOCK_MAX_PYRAMID_LEVELS"] = v
+-
+-                v = "true" if bool(no_signal_var.get()) else "false"
+-                os.environ["MSTOCK_DEBUG_NO_SIGNAL"] = v
+-                to_persist["MSTOCK_DEBUG_NO_SIGNAL"] = v
+-
+-
+-                persist_settings_env(to_persist, to_unset)
+-            except Exception as exc:  # noqa: BLE001
+-                messagebox.showerror("Error", f"Failed to apply settings: {exc}")
+-                return
+-
+-            # If the bot is running, offer an immediate restart so changes apply.
+-            try:
+-                running = bool(self._bot_thread and self._bot_thread.is_alive())
+-            except Exception:
+-                running = False
+-
+-            if running:
+-                do_restart = messagebox.askyesno(
+-                    "Settings updated",
+-                    "Settings saved. Restart bot now to apply changes?",
+-                )
+-                if do_restart:
+-                    self._stop_and_restart_bot()
+-                    return
+-
+-            messagebox.showinfo(
+-                "Settings updated",
+-                "Settings saved. Stop the bot (if running) and click Start Bot again for changes to take effect.",
+-            )
+-
+-        row += 1
+-        tk.Button(content, text="Apply", command=apply_changes).grid(row=row, column=0, sticky="w", padx=8, pady=(10, 8))
+-        tk.Button(content, text="Close", command=win.destroy).grid(row=row, column=1, sticky="e", padx=8, pady=(10, 8))
+-
+-        # Ensure initial scroll region is correct.
+-        _on_content_configure()
+-        canvas.yview_moveto(0.0)
++                os.environ["MSTOCK_IV_FILTER_ENABLED"] = "true" if iv_filter_enabled_var.get() else "false"
++                to_persist["MSTOCK_IV_FILTER_ENABLED"] = os.environ["MSTOCK_IV_FILTER_ENABLED"]
++                os.environ["MSTOCK_MTF_HARD_FILTER"] = "true" if mtf_hard_filter_var.get() else "false"
++                to_persist["MSTOCK_MTF_HARD_FILTER"] = os.environ["MSTOCK_MTF_HARD_FILTER"]
++                os.environ["MSTOCK_THETA_STOP_WIDEN_ENABLED"] = "true" if theta_stop_widen_var.get() else "false"
++                to_persist["MSTOCK_THETA_STOP_WIDEN_ENABLED"] = os.environ["MSTOCK_THETA_STOP_WIDEN_ENABLED"]
++                if theta_stop_max_mult_var.get().strip():
++                    try:
++                        v = str(float(theta_stop_max_mult_var.get().strip()))
++                        os.environ["MSTOCK_THETA_STOP_WIDEN_MAX_MULT"] = v
++                        to_persist["MSTOCK_THETA_STOP_WIDEN_MAX_MULT"] = v
++                    except Exception:
++                        pass
++                if theta_stop_threshold_var.get().strip():
++                    try:
++                        v = str(float(theta_stop_threshold_var.get().strip()))
++                        os.environ["MSTOCK_THETA_STOP_WIDEN_THRESHOLD"] = v
++                        to_persist["MSTOCK_THETA_STOP_WIDEN_THRESHOLD"] = v
++                    except Exception:
++                        pass
++                os.environ["MSTOCK_EXIT_LADDER_ENABLED"] = "true" if exit_ladder_enabled_var.get() else "false"
++                to_persist["MSTOCK_EXIT_LADDER_ENABLED"] = os.environ["MSTOCK_EXIT_LADDER_ENABLED"]
++                if exit_ladder_steps_var.get().strip():
++                    os.environ["MSTOCK_EXIT_LADDER_STEPS"] = exit_ladder_steps_var.get().strip()
++                    to_persist["MSTOCK_EXIT_LADDER_STEPS"] = os.environ["MSTOCK_EXIT_LADDER_STEPS"]
++                os.environ["MSTOCK_DELTA_HEDGE_VOL_ADJUST_ENABLED"] = "true" if dh_vol_adjust_var.get() else "false"
++                to_persist["MSTOCK_DELTA_HEDGE_VOL_ADJUST_ENABLED"] = os.environ["MSTOCK_DELTA_HEDGE_VOL_ADJUST_ENABLED"]
++                if dh_vol_low_factor_var.get().strip():
++                    try:
++                        v = str(float(dh_vol_low_factor_var.get().strip()))
++                        os.environ["MSTOCK_DELTA_HEDGE_VOL_LOW_TOL_FACTOR"] = v
++                        to_persist["MSTOCK_DELTA_HEDGE_VOL_LOW_TOL_FACTOR"] = v
++                    except Exception:
++                        pass
++                if dh_vol_high_factor_var.get().strip():
++                    try:
++                        v = str(float(dh_vol_high_factor_var.get().strip()))
++                        os.environ["MSTOCK_DELTA_HEDGE_VOL_HIGH_TOL_FACTOR"] = v
++                        to_persist["MSTOCK_DELTA_HEDGE_VOL_HIGH_TOL_FACTOR"] = v
++                    except Exception:
++                        pass
+ 
+-    def _set_env_from_fields(self) -> None:
+-        os.environ["MSTOCK_API_KEY"] = self.api_key_var.get().strip()
+-        os.environ["MSTOCK_USERNAME"] = self.username_var.get().strip()
+-        os.environ["MSTOCK_PASSWORD"] = self.password_var.get()
+-        token = self.access_token_var.get().strip()
+-        if token:
+-            os.environ["MSTOCK_ACCESS_TOKEN"] = token
++                os.environ["MSTOCK_ACCESS_TOKEN"] = token
+ 
+-        # Underlying token/exchange for candle fetching.
+-        if hasattr(self, "underlying_token_var"):
+-            u_tok = self.underlying_token_var.get().strip()
+-            if u_tok:
+-                os.environ["MSTOCK_UNDERLYING_TOKEN"] = u_tok
+-            else:
+-                os.environ.pop("MSTOCK_UNDERLYING_TOKEN", None)
+-        if hasattr(self, "underlying_exchange_var"):
+-            u_exch = self.underlying_exchange_var.get().strip()
+-            if u_exch:
+-                os.environ["MSTOCK_UNDERLYING_EXCHANGE"] = u_exch
+-            else:
+-                os.environ.pop("MSTOCK_UNDERLYING_EXCHANGE", None)
++                # Underlying token/exchange for candle fetching.
++                if hasattr(self, "underlying_token_var"):
++                    u_tok = self.underlying_token_var.get().strip()
++                    if u_tok:
++                        os.environ["MSTOCK_UNDERLYING_TOKEN"] = u_tok
++                    else:
++                        os.environ.pop("MSTOCK_UNDERLYING_TOKEN", None)
++                if hasattr(self, "underlying_exchange_var"):
++                    u_exch = self.underlying_exchange_var.get().strip()
++                    if u_exch:
++                        os.environ["MSTOCK_UNDERLYING_EXCHANGE"] = u_exch
++                    else:
++                        os.environ.pop("MSTOCK_UNDERLYING_EXCHANGE", None)
+ 
+         # Target options expiry for contract selection.
+         # Prefer the widget's current text so typed values are captured even if the
+@@ -7785,11 +8607,42 @@ class ScalperUI(tk.Tk):
+         os.environ["MSTOCK_SHORT_STRIKE_DISTANCE"] = self.distance_var.get().strip() or "50"
+         os.environ["MSTOCK_ENABLE_LIVE_TRADING"] = "true" if self.live_var.get() else "false"
+ 
++        if hasattr(self, "entry_spread_shock_mult_var"):
++            os.environ["MSTOCK_ENTRY_SPREAD_SHOCK_MULT"] = self.entry_spread_shock_mult_var.get().strip() or "0"
++        if hasattr(self, "entry_spread_shock_lookback_var"):
++            os.environ["MSTOCK_ENTRY_SPREAD_SHOCK_LOOKBACK"] = self.entry_spread_shock_lookback_var.get().strip() or "20"
++        if hasattr(self, "entry_spread_shock_min_samples_var"):
++            os.environ["MSTOCK_ENTRY_SPREAD_SHOCK_MIN_SAMPLES"] = (
++                self.entry_spread_shock_min_samples_var.get().strip() or "5"
++            )
++
+         if hasattr(self, "delta_hedge_scope_var"):
+             os.environ["MSTOCK_DELTA_HEDGE_SCOPE"] = (
+                 self.delta_hedge_scope_var.get().strip().lower() or "strategy_only"
+             )
+ 
++        if hasattr(self, "bt_slippage_var"):
++            os.environ["MSTOCK_BACKTEST_SLIPPAGE_PTS"] = self.bt_slippage_var.get().strip() or "0"
++        if hasattr(self, "bt_fees_var"):
++            os.environ["MSTOCK_BACKTEST_FEES_PTS"] = self.bt_fees_var.get().strip() or "0"
++        if hasattr(self, "bt_horizon_var"):
++            os.environ["MSTOCK_BACKTEST_HORIZON"] = self.bt_horizon_var.get().strip() or "3"
++        if hasattr(self, "bt_limit_var"):
++            os.environ["MSTOCK_BACKTEST_LIMIT"] = self.bt_limit_var.get().strip() or "1200"
++        if hasattr(self, "bt_date_var"):
++            d = self.bt_date_var.get().strip()
++            if d:
++                os.environ["MSTOCK_BACKTEST_DATE"] = d
++            else:
++                os.environ.pop("MSTOCK_BACKTEST_DATE", None)
++        if hasattr(self, "bt_iters_var"):
++            os.environ["MSTOCK_TUNE_ITERS"] = self.bt_iters_var.get().strip() or "120"
++        if hasattr(self, "bt_dd_penalty_var"):
++            os.environ["MSTOCK_TUNE_DD_PENALTY"] = self.bt_dd_penalty_var.get().strip() or "0.5"
++        if hasattr(self, "bt_min_expectancy_var"):
++            os.environ["MSTOCK_TUNE_MIN_EXPECTANCY"] = self.bt_min_expectancy_var.get().strip()
++        if hasattr(self, "bt_min_profit_factor_var"):
++            os.environ["MSTOCK_TUNE_MIN_PROFIT_FACTOR"] = self.bt_min_profit_factor_var.get().strip()
+ 
+ 
+     def _default_credential_path(self) -> Path:
+@@ -7849,6 +8702,13 @@ class ScalperUI(tk.Tk):
+             saved.get("short_strike_distance")
+             or os.getenv("MSTOCK_SHORT_STRIKE_DISTANCE", "50")
+         )
++        spread_shock_mult = str(saved.get("entry_spread_shock_mult") or os.getenv("MSTOCK_ENTRY_SPREAD_SHOCK_MULT", "0"))
++        spread_shock_lookback = str(
++            saved.get("entry_spread_shock_lookback") or os.getenv("MSTOCK_ENTRY_SPREAD_SHOCK_LOOKBACK", "20")
++        )
++        spread_shock_min_samples = str(
++            saved.get("entry_spread_shock_min_samples") or os.getenv("MSTOCK_ENTRY_SPREAD_SHOCK_MIN_SAMPLES", "5")
++        )
+ 
+         self.api_key_var.set(api_key)
+         self.username_var.set(username)
+@@ -7873,6 +8733,12 @@ class ScalperUI(tk.Tk):
+             self.target_expiry_var.set(target_expiry)
+         if hasattr(self, "distance_var"):
+             self.distance_var.set(short_strike_distance)
++        if hasattr(self, "entry_spread_shock_mult_var"):
++            self.entry_spread_shock_mult_var.set(spread_shock_mult)
++        if hasattr(self, "entry_spread_shock_lookback_var"):
++            self.entry_spread_shock_lookback_var.set(spread_shock_lookback)
++        if hasattr(self, "entry_spread_shock_min_samples_var"):
++            self.entry_spread_shock_min_samples_var.set(spread_shock_min_samples)
+ 
+         if saved:
+             self.remember_var.set(True)
+@@ -7934,6 +8800,18 @@ class ScalperUI(tk.Tk):
+             dist = self.distance_var.get().strip()
+             if dist:
+                 data["short_strike_distance"] = dist
++        if hasattr(self, "entry_spread_shock_mult_var"):
++            v = self.entry_spread_shock_mult_var.get().strip()
++            if v:
++                data["entry_spread_shock_mult"] = v
++        if hasattr(self, "entry_spread_shock_lookback_var"):
++            v = self.entry_spread_shock_lookback_var.get().strip()
++            if v:
++                data["entry_spread_shock_lookback"] = v
++        if hasattr(self, "entry_spread_shock_min_samples_var"):
++            v = self.entry_spread_shock_min_samples_var.get().strip()
++            if v:
++                data["entry_spread_shock_min_samples"] = v
+         if not data["api_key"] or not data["username"] or not data["password"]:
+             messagebox.showerror("Missing info", "API key, username, and password are required to save.")
+             return
+@@ -7961,6 +8839,16 @@ class ScalperUI(tk.Tk):
+     def _append_log(self, text: str) -> None:
+         self.log.configure(state=tk.NORMAL)
+         self.log.insert(tk.END, text)
++        
++        # Prevent the text widget from growing endlessly and crashing/freezing the UI after long usage.
++        # Keep approximately the last 1500 lines.
++        try:
++            line_count = int(self.log.index("end-1c").split(".")[0])
++            if line_count > 1500:
++                self.log.delete("1.0", f"{line_count - 1000}.0")
++        except Exception:
++            pass
++
+         self.log.see(tk.END)
+         self.log.configure(state=tk.DISABLED)
+ 
+@@ -8224,6 +9112,25 @@ class ScalperUI(tk.Tk):
+                             f"type={evt.position_type} name={evt.name} "
+                             f"legs={len(evt.legs)} mtm={evt.mtm} realized={evt.realized}"
+                         )
++                        try:
++                            if str(evt.event).upper() == "UPDATE" and evt.mtm is not None and abs(float(evt.mtm)) < 1e-9:
++                                now_dbg = float(time.time())
++                                last_dbg = float(getattr(self, "_zero_mtm_debug_ts", 0.0) or 0.0)
++                                if now_dbg - last_dbg >= 20.0:
++                                    self._zero_mtm_debug_ts = now_dbg
++                                    parts = []
++                                    for lg in list(evt.legs or [])[:8]:
++                                        if not isinstance(lg, dict):
++                                            continue
++                                        sym = str(lg.get("symbol") or "").strip()
++                                        entry = lg.get("entry_price")
++                                        ltp = lg.get("ltp")
++                                        tok = lg.get("token")
++                                        exch = lg.get("exchange")
++                                        parts.append(f"{exch}:{tok}:{sym} entry={entry} ltp={ltp}")
++                                    print("[UI MTM DEBUG] zero UPDATE legs: " + " | ".join(parts))
++                        except Exception:
++                            pass
+                     except Exception as exc:  # noqa: BLE001
+                         print(f"[UI] Trade event sink failed: {exc}")

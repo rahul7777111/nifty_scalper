@@ -1448,6 +1448,40 @@ class ScalperUI(tk.Tk):
             cand_txt = ", ".join(str(x) for x in list(cands or [])[:4]) if isinstance(cands, list) else "n/a"
             self._diag_router_var.set(f"Router: {sel} ({src}) | Candidates: {cand_txt}")
 
+            # GPT metrics (telemetry)
+            gpm = snap.get("gpt_metrics") if isinstance(snap.get("gpt_metrics"), dict) else None
+            if isinstance(gpm, dict):
+                try:
+                    a = int(gpm.get("attempts") or 0)
+                    r = int(gpm.get("recommendations") or 0)
+                    t = int(gpm.get("gate_take") or 0)
+                    s = int(gpm.get("gate_skip") or 0)
+                    f = int(gpm.get("fallbacks") or 0)
+                    k = int(gpm.get("skipped_required") or 0)
+                    self._diag_gpt_var.set(f"GPT: attempts={a} recs={r} take={t} skip={s} fallbacks={f} skipped={k}")
+                except Exception:
+                    self._diag_gpt_var.set("GPT: n/a")
+            else:
+                self._diag_gpt_var.set("GPT: n/a")
+
+            # Enrich router display for GPT errors/timeouts
+            try:
+                if src == "gpt_missing" or src == "gpt" or src == "gpt_fallback":
+                    # Nothing extra
+                    pass
+                else:
+                    # If router source indicates a GPT error/timeout, show short reason
+                    if src in {"gpt_timeout", "gpt_error", "gpt_missing"}:
+                        g_err = str((router or {}).get("gpt_error") or "").strip()
+                        if g_err:
+                            short = g_err[:120]
+                            # Append to last block line for visibility
+                            cur = self._diag_last_block_var.get()
+                            if "gpt:" not in cur:
+                                self._diag_last_block_var.set(f"{cur} | gpt: {short}")
+            except Exception:
+                pass
+
             lb = snap.get("last_block") if isinstance(snap.get("last_block"), dict) else {}
             lb_code = str(lb.get("code") or "n/a")
             lb_reason = str(lb.get("reason") or "n/a")
@@ -2188,6 +2222,7 @@ class ScalperUI(tk.Tk):
         self._hedge_qty_traded_today_var = tk.StringVar(value="0")
         self._margin_required_var = tk.StringVar(value="n/a")
         self._diag_router_var = tk.StringVar(value="Router: n/a")
+        self._diag_gpt_var = tk.StringVar(value="GPT: n/a")
         self._diag_last_block_var = tk.StringVar(value="Last block: n/a")
         self._diag_top_block_var = tk.StringVar(value="Top block: n/a")
         self._diag_decisions_var = tk.StringVar(value="Decisions: n/a")
@@ -2244,12 +2279,13 @@ class ScalperUI(tk.Tk):
         eng_card.grid(row=0, column=2, sticky="nsew")
         eng_card.grid_columnconfigure(0, weight=1)
         ttk.Label(eng_card, textvariable=self._diag_router_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(eng_card, textvariable=self._diag_last_block_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(eng_card, textvariable=self._diag_top_block_var).grid(row=2, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(eng_card, textvariable=self._diag_decisions_var).grid(row=3, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(eng_card, textvariable=self._diag_exec_var).grid(row=4, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(eng_card, textvariable=self._diag_risk_var).grid(row=5, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(eng_card, textvariable=self._diag_preset_req_var).grid(row=6, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(eng_card, textvariable=self._diag_gpt_var).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(eng_card, textvariable=self._diag_last_block_var).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(eng_card, textvariable=self._diag_top_block_var).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(eng_card, textvariable=self._diag_decisions_var).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(eng_card, textvariable=self._diag_exec_var).grid(row=5, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(eng_card, textvariable=self._diag_risk_var).grid(row=6, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(eng_card, textvariable=self._diag_preset_req_var).grid(row=7, column=0, sticky="w", pady=(4, 0))
 
         # --- Portfolio (live) ---
         portfolio = ttk.Frame(outer)
@@ -3127,6 +3163,31 @@ class ScalperUI(tk.Tk):
         ent_url.grid(row=2, column=1, sticky="we", padx=8, pady=4)
         add_tooltip(lbl_url, "API base URL. Default: https://api.aicredits.in/v1")
 
+        # Override checks checkbox
+        self.gpt_override_checks_var = tk.BooleanVar(value=False)
+        
+        def _on_override_checks_changed() -> None:
+            try:
+                if self._scalper is not None:
+                    override_val = bool(self.gpt_override_checks_var.get())
+                    setattr(self._scalper.cfg, "gpt_override_checks", override_val)
+                    status_msg = f"GPT override checks: {'enabled' if override_val else 'disabled'}"
+                    self._gpt_status_var.set(status_msg)
+                    print(f"[GPT] {status_msg}")
+            except Exception as e:
+                print(f"Failed to update GPT override checks: {e}")
+        
+        ttk.Checkbutton(
+            cfg, 
+            text="Override safety checks when GPT TAKE", 
+            variable=self.gpt_override_checks_var,
+            command=_on_override_checks_changed
+        ).grid(row=3, column=1, sticky="w", padx=8, pady=4)
+        add_tooltip(
+            ttk.Label(cfg, text="Override safety checks:"),
+            "When enabled and GPT gate explicitly returns TAKE, entry checks (price bounds, liquidity) are skipped for better responsiveness. Changes take effect immediately if bot is running."
+        )
+
         cfg.grid_columnconfigure(1, weight=1)
 
         # --- Actions Section ---
@@ -3295,6 +3356,12 @@ class ScalperUI(tk.Tk):
         model = str(self.gpt_model_var.get() or "").strip() or "gpt-4o-mini"
         api_key = str(self.gpt_api_key_var.get() or "").strip()
         base_url = str(self.gpt_base_url_var.get() or "").strip() or None
+        try:
+            strat_cfg = load_strategy_config()
+            analyze_timeout = float(getattr(strat_cfg, "gpt_timeout_sec", 45.0) or 45.0)
+        except Exception:
+            analyze_timeout = 45.0
+        analyze_timeout = max(analyze_timeout, 20.0)
 
         def worker() -> None:
             is_error = False
@@ -3306,6 +3373,7 @@ class ScalperUI(tk.Tk):
                     model=model,
                     api_key=api_key,
                     base_url=base_url,
+                    timeout_sec=analyze_timeout,
                 )
                 payload = {
                     "ce_pe_bias": getattr(analysis, "ce_pe_bias", None),
@@ -3326,6 +3394,16 @@ class ScalperUI(tk.Tk):
                         "detail": reason_text,
                     }
                     summary = "Error: Invalid API Key. Update GPT API key and retry."
+                elif "http 504" in reason_l or "timed out" in reason_l:
+                    is_error = True
+                    payload = {
+                        "error": "GPT advisor timeout",
+                        "detail": reason_text,
+                    }
+                    summary = (
+                        f"Advisor timed out after {analyze_timeout:g}s. "
+                        "Retry Analyze Market Snapshot or increase MSTOCK_GPT_TIMEOUT_SEC."
+                    )
                 else:
                     summary = f"Bias: {payload['ce_pe_bias']} | Strategy: {payload['recommended_strategy']} | Confidence: {payload['confidence']}"
                     if payload.get("reason"):
@@ -4657,6 +4735,61 @@ class ScalperUI(tk.Tk):
 
         try:
             self._refresh_pnl_totals()
+        except Exception:
+            pass
+
+    def _persist_completed_trade_event(self, evt: TradeLogEvent) -> None:
+        """Persist a completed trade to the DB once (idempotent).
+
+        Tests expect calling this method twice with the same event results in
+        a single DB insert. We store seen trade_ids in `self._persisted_trade_events`.
+        """
+        try:
+            db = getattr(self, "_db_manager", None)
+            if db is None:
+                return
+        except Exception:
+            return
+
+        try:
+            seen = getattr(self, "_persisted_trade_events", None)
+            if not isinstance(seen, set):
+                seen = set()
+                setattr(self, "_persisted_trade_events", seen)
+        except Exception:
+            seen = set()
+            try:
+                setattr(self, "_persisted_trade_events", seen)
+            except Exception:
+                pass
+
+        try:
+            key = str(evt.trade_id or "")
+        except Exception:
+            key = ""
+        if not key:
+            return
+        if key in seen:
+            return
+
+        try:
+            first_leg = (evt.legs or [])[0] if isinstance(evt.legs, list) and evt.legs else None
+            symbol = str(first_leg.get("symbol") if isinstance(first_leg, dict) else "") if first_leg else ""
+            qty = int(first_leg.get("quantity") or 0) if isinstance(first_leg, dict) else 0
+        except Exception:
+            symbol = ""
+            qty = 0
+
+        try:
+            db.insert_trade(trade_id=str(evt.trade_id), symbol=symbol, quantity=int(qty), realized_pnl=float(evt.realized or 0.0))
+        except Exception:
+            try:
+                db.insert_trade(**{"trade_id": str(evt.trade_id), "symbol": symbol, "quantity": int(qty), "realized_pnl": float(evt.realized or 0.0)})
+            except Exception:
+                return
+
+        try:
+            seen.add(key)
         except Exception:
             pass
 
@@ -6765,6 +6898,17 @@ class ScalperUI(tk.Tk):
         gpt_leg_target_dist_var = tk.StringVar(value=str(getattr(cfg, "gpt_leg_manage_min_target_distance_pct", 0.10)))
         tk.Entry(gpt_leg_guard_frame, textvariable=gpt_leg_target_dist_var, width=10).pack(side=tk.LEFT, padx=(8, 0))
 
+        row += 1
+        tk.Label(content, text="GPT Advisor (Enable / Require Rec / Auto Select)").grid(row=row, column=0, sticky="w", padx=8)
+        gpt_advisor_frame = tk.Frame(content)
+        gpt_advisor_frame.grid(row=row, column=1, sticky="w", padx=8)
+        gpt_enable_var = tk.BooleanVar(value=bool(getattr(cfg, "gpt_enable", False)))
+        ttk.Checkbutton(gpt_advisor_frame, text="Enable", variable=gpt_enable_var).pack(side=tk.LEFT)
+        gpt_require_rec_var = tk.BooleanVar(value=bool(getattr(cfg, "gpt_require_recommendation", False)))
+        ttk.Checkbutton(gpt_advisor_frame, text="Require Rec", variable=gpt_require_rec_var).pack(side=tk.LEFT, padx=(8, 0))
+        gpt_auto_select_var = tk.BooleanVar(value=bool(getattr(cfg, "gpt_auto_select", True)))
+        ttk.Checkbutton(gpt_advisor_frame, text="Auto Select", variable=gpt_auto_select_var).pack(side=tk.LEFT, padx=(8, 0))
+
 
         row += 1
         exit_short_var = tk.BooleanVar(value=bool(cfg.premium_exit_on_short_strike_touch))
@@ -6840,6 +6984,36 @@ class ScalperUI(tk.Tk):
         tk.Label(content, text="Dir BE / Trail x ATR (BE can be negative)").grid(row=row, column=0, sticky="w", padx=8)
         dir_trail_frame = tk.Frame(content)
         dir_trail_frame.grid(row=row, column=1, sticky="w", padx=8)
+        
+        row += 1
+        tk.Label(content, text='Initial SL / TP (ATR Mult)').grid(row=row, column=0, sticky="w", padx=8)
+        sltp_frame = tk.Frame(content)
+        sltp_frame.grid(row=row, column=1, sticky="w", padx=8)
+        dir_sl_var = tk.StringVar(value=str(getattr(cfg, "dir_sl_atr_mult", 1.5)))
+        dir_tp_var = tk.StringVar(value=str(getattr(cfg, "dir_tp_atr_mult", 3.0)))
+        tk.Entry(sltp_frame, textvariable=dir_sl_var, width=10).pack(side=tk.LEFT)
+        tk.Entry(sltp_frame, textvariable=dir_tp_var, width=10).pack(side=tk.LEFT, padx=(6, 0))
+
+        row += 1
+        tk.Label(content, text='Delta Strikes / Theta Filter').grid(row=row, column=0, sticky="w", padx=8)
+        delta_frame = tk.Frame(content)
+        delta_frame.grid(row=row, column=1, sticky="w", padx=8)
+        delta_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_delta_strike_selection", False)))
+        delta_target_var = tk.StringVar(value=str(getattr(cfg, "target_delta", 0.40)))
+        theta_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_theta_decay_filter", False)))
+        ttk.Checkbutton(delta_frame, text="Delta", variable=delta_enabled_var).pack(side=tk.LEFT)
+        tk.Entry(delta_frame, textvariable=delta_target_var, width=6).pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Checkbutton(delta_frame, text="Theta", variable=theta_enabled_var).pack(side=tk.LEFT)
+
+        row += 1
+        tk.Label(content, text='Hard CHOP / RSI Confluence').grid(row=row, column=0, sticky="w", padx=8)
+        filter_frame = tk.Frame(content)
+        filter_frame.grid(row=row, column=1, sticky="w", padx=8)
+        chop_hard_var = tk.BooleanVar(value=bool(getattr(cfg, "choppiness_hard_filter", False)))
+        rsi_conf_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_rsi_confluence", False)))
+        ttk.Checkbutton(filter_frame, text="Hard Chop", variable=chop_hard_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(filter_frame, text="RSI Conf", variable=rsi_conf_var).pack(side=tk.LEFT, padx=(6, 0))
+
         dir_be_var = tk.StringVar(value=str(cfg.dir_breakeven_atr_mult))
         tk.Entry(dir_trail_frame, textvariable=dir_be_var, width=10).pack(side=tk.LEFT)
         dir_trail_atr_var = tk.StringVar(value=str(cfg.dir_trail_atr_mult))
@@ -7543,6 +7717,13 @@ class ScalperUI(tk.Tk):
                     os.environ["MSTOCK_GPT_LEG_MANAGE_MIN_TARGET_DISTANCE_PCT"] = v
                     to_persist["MSTOCK_GPT_LEG_MANAGE_MIN_TARGET_DISTANCE_PCT"] = v
 
+                os.environ["MSTOCK_GPT_ENABLE"] = "true" if gpt_enable_var.get() else "false"
+                to_persist["MSTOCK_GPT_ENABLE"] = os.environ["MSTOCK_GPT_ENABLE"]
+                os.environ["MSTOCK_GPT_REQUIRE_RECOMMENDATION"] = "true" if gpt_require_rec_var.get() else "false"
+                to_persist["MSTOCK_GPT_REQUIRE_RECOMMENDATION"] = os.environ["MSTOCK_GPT_REQUIRE_RECOMMENDATION"]
+                os.environ["MSTOCK_GPT_AUTO_SELECT"] = "true" if gpt_auto_select_var.get() else "false"
+                to_persist["MSTOCK_GPT_AUTO_SELECT"] = os.environ["MSTOCK_GPT_AUTO_SELECT"]
+
                 v = "true" if bool(exit_short_var.get()) else "false"
                 os.environ["MSTOCK_PREMIUM_EXIT_ON_SHORT_TOUCH"] = v
                 to_persist["MSTOCK_PREMIUM_EXIT_ON_SHORT_TOUCH"] = v
@@ -7595,6 +7776,28 @@ class ScalperUI(tk.Tk):
                     v = str(supertrend_mode_var.get().strip().lower())
                     os.environ["MSTOCK_SUPERTREND_MODE"] = v
                     to_persist["MSTOCK_SUPERTREND_MODE"] = v
+
+                
+                if dir_sl_var.get().strip():
+                    v = str(float(dir_sl_var.get().strip()))
+                    os.environ["MSTOCK_DIR_SL_ATR_MULT"] = v
+                    to_persist["MSTOCK_DIR_SL_ATR_MULT"] = v
+                if dir_tp_var.get().strip():
+                    v = str(float(dir_tp_var.get().strip()))
+                    os.environ["MSTOCK_DIR_TP_ATR_MULT"] = v
+                    to_persist["MSTOCK_DIR_TP_ATR_MULT"] = v
+                if delta_target_var.get().strip():
+                    v = str(float(delta_target_var.get().strip()))
+                    os.environ["MSTOCK_TARGET_DELTA"] = v
+                    to_persist["MSTOCK_TARGET_DELTA"] = v
+                os.environ["MSTOCK_ENABLE_DELTA_STRIKE_SELECTION"] = "1" if delta_enabled_var.get() else ""
+                to_persist["MSTOCK_ENABLE_DELTA_STRIKE_SELECTION"] = os.environ["MSTOCK_ENABLE_DELTA_STRIKE_SELECTION"]
+                os.environ["MSTOCK_ENABLE_THETA_DECAY_FILTER"] = "1" if theta_enabled_var.get() else ""
+                to_persist["MSTOCK_ENABLE_THETA_DECAY_FILTER"] = os.environ["MSTOCK_ENABLE_THETA_DECAY_FILTER"]
+                os.environ["MSTOCK_CHOPPINESS_HARD_FILTER"] = "1" if chop_hard_var.get() else ""
+                to_persist["MSTOCK_CHOPPINESS_HARD_FILTER"] = os.environ["MSTOCK_CHOPPINESS_HARD_FILTER"]
+                os.environ["MSTOCK_ENABLE_RSI_CONFLUENCE"] = "1" if rsi_conf_var.get() else ""
+                to_persist["MSTOCK_ENABLE_RSI_CONFLUENCE"] = os.environ["MSTOCK_ENABLE_RSI_CONFLUENCE"]
 
                 if dir_be_var.get().strip():
                     v = str(float(dir_be_var.get().strip()))
