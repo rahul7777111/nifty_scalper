@@ -1,6 +1,20 @@
 from __future__ import annotations
 import sys
 import os
+from pathlib import Path
+
+# Load .env file explicitly so environment variables are available
+# regardless of VS Code terminal settings
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path)
+        print(f"[main] Loaded .env from {env_path}")
+    else:
+        print(f"[main] No .env file found at {env_path}")
+except ImportError:
+    print("[main] python-dotenv not installed, using existing environment")
 
 sys.path.append(os.path.abspath("pytradingapi-typeB-main"))
 

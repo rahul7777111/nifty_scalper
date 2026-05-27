@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import queue
 from types import SimpleNamespace
 
 from src.ui import ScalperUI
+from src.strategy import TradeLogEvent
 
 
 def test_compute_cached_trade_mtm_uses_cached_leg_ltps() -> None:
@@ -107,6 +109,123 @@ def test_build_live_option_update_event_refreshes_hedge_rows_when_requested() ->
     assert evt.trade_id == "T-hedge-H"
     assert [float(leg.get("ltp")) for leg in evt.legs] == [242.0, 242.0]
     assert evt.mtm == 80.0
+
+
+def test_closed_trade_display_uses_realized_not_live_mtm() -> None:
+    dummy = SimpleNamespace()
+    dummy._trade_state = {}
+    dummy._get_leg_qty = lambda leg: ScalperUI._get_leg_qty(dummy, leg)
+    dummy._split_legs_for_display = lambda legs: ScalperUI._split_legs_for_display(dummy, legs)
+    dummy._compute_cached_trade_mtm = lambda legs: ScalperUI._compute_cached_trade_mtm(dummy, legs)
+    dummy._compute_realized_from_closed_legs = lambda legs: ScalperUI._compute_realized_from_closed_legs(dummy, legs)
+    dummy._closed_trade_display_value = lambda state: ScalperUI._closed_trade_display_value(dummy, state)
+    dummy._is_closed_trade_state = lambda trade_id, state: ScalperUI._is_closed_trade_state(dummy, trade_id, state)
+
+    state = {
+        "status": "CLOSED (target)",
+        "realized": -250.25,
+        "mtm": 999.0,
+        "legs": [
+            {
+                "symbol": "NIFTY26MAY23950PE",
+                "side": "BUY",
+                "quantity": 50,
+                "entry_price": 80.0,
+                "ltp": 120.0,
+                "exit_price": 75.0,
+            }
+        ],
+    }
+
+    breakdown = ScalperUI._compute_parent_display_pnl_breakdown(dummy, "D1", state)
+
+    assert breakdown["parent_mtm"] == -250.25
+    assert breakdown["parent_realized"] == -250.25
+
+
+def test_pump_trades_ignores_late_update_for_closed_trade() -> None:
+    dummy = SimpleNamespace()
+    dummy._trade_q = queue.Queue()
+    dummy._trade_state = {
+        "D1": {
+            "opened_ts": 1.0,
+            "pos_type": "directional",
+            "strategy": "auto_ml_directional",
+            "status": "CLOSED (target)",
+            "realized": -250.25,
+            "mtm": -250.25,
+            "_closed_display_pnl": -250.25,
+            "_close_realized_applied": True,
+            "legs": [
+                {
+                    "symbol": "NIFTY26MAY23950PE",
+                    "side": "BUY",
+                    "quantity": 50,
+                    "entry_price": 80.0,
+                    "ltp": 75.0,
+                    "exit_price": 75.0,
+                }
+            ],
+        }
+    }
+    dummy._trade_rows = {"D1": "row-D1"}
+    dummy._db_manager = None
+    dummy._scalper = None
+    dummy._bot_thread = None
+    dummy.status_var = SimpleNamespace(get=lambda: "running")
+    dummy.after = lambda *_args, **_kwargs: None
+    dummy._pump_trades = lambda: None
+    dummy._refresh_pnl_totals = lambda: None
+    dummy._pump_dashboard_portfolio = lambda: None
+    dummy._render_signals_and_greeks = lambda force=False: None
+    dummy._prune_stale_open_rows_when_idle = lambda: None
+    dummy._refresh_broker_health = lambda: None
+    dummy._is_closed_trade_state = lambda trade_id, state: ScalperUI._is_closed_trade_state(dummy, trade_id, state)
+
+    class MockTree:
+        def item(self, *_args, **_kwargs):
+            raise AssertionError("closed row should not be re-rendered by late UPDATE")
+
+        def insert(self, *_args, **_kwargs):
+            raise AssertionError("closed row should not create a new row")
+
+    dummy.trade_tree = MockTree()
+    dummy._trade_q.put(
+        TradeLogEvent(
+            ts=2.0,
+            event="UPDATE",
+            trade_id="D1",
+            position_type="directional",
+            name="auto_ml_directional",
+            legs=[
+                {
+                    "symbol": "NIFTY26MAY23950PE",
+                    "side": "BUY",
+                    "quantity": 50,
+                    "entry_price": 80.0,
+                    "ltp": 110.0,
+                }
+            ],
+            mtm=1500.0,
+        )
+    )
+    dummy._trade_q.put(
+        TradeLogEvent(
+            ts=3.0,
+            event="CLOSE",
+            trade_id="D1",
+            position_type="directional",
+            name="auto_ml_directional",
+            legs=[],
+            realized=500.0,
+            reason="duplicate",
+        )
+    )
+
+    ScalperUI._pump_trades(dummy)
+
+    assert dummy._trade_state["D1"]["mtm"] == -250.25
+    assert dummy._trade_state["D1"]["realized"] == -250.25
 
 
 def test_is_leg_stop_hit_for_display_buy_and_sell() -> None:

@@ -8,20 +8,74 @@ import urllib.error
 import urllib.request
 import urllib.parse
 import re
+from pathlib import Path
 from datetime import date, datetime
 from decimal import Decimal
 from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import field, asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-def _normalize_model_name(name: str) -> str:
-    """Normalize common user typos in model identifiers.
+def _decode_env_value(raw: str) -> str:
+    v = str(raw or "").strip()
+    if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+        v = v[1:-1]
+        v = v.replace("\\n", "\n").replace("\\\\", "\\").replace('\\"', '"').replace("\\'", "'")
+    return v
 
-    OpenAI-compatible model ids use '.' for decimals. Some locales/users may
-    type 'gpt-5,0' or 'gpt 4.0 mini'. We normalize those common variants.
+
+def _load_env_file(path: Path, *, override_existing: bool = False) -> Dict[str, str]:
+    try:
+        if not path.exists():
+            return {}
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return {}
+
+    loaded: Dict[str, str] = {}
+    for line in raw.splitlines():
+        s = str(line or "").strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.lower().startswith("export "):
+            s = s[7:].strip()
+        if "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        key = k.strip()
+        if not key:
+            continue
+        val = _decode_env_value(v)
+        loaded[key] = val
+        if override_existing or key not in os.environ:
+            os.environ[key] = val
+    return loaded
+
+
+def _hydrate_gpt_env() -> None:
+    """Load repo GPT env settings without requiring python-dotenv.
+
+    Strategy/UI paths normally load config first, but direct GPT health checks and
+    tests import this module standalone. Missing base URL made valid alternate
+    provider keys get sent to OpenAI, causing misleading 401 errors.
     """
 
+    try:
+        root = Path(__file__).resolve().parent.parent
+    except Exception:
+        return
+
+    # `.scalper.env` is what the UI persists. `.env` keeps older/manual setups
+    # working. Existing process env values still win.
+    _load_env_file(root / ".scalper.env", override_existing=False)
+    _load_env_file(root / ".env", override_existing=False)
+
+
+_hydrate_gpt_env()
+
+
+def _normalize_model_name(name: str) -> str:
+    """Normalize common user typos in model identifiers."""
     s = str(name or "").strip()
     if not s:
         return s
@@ -32,7 +86,6 @@ def _normalize_model_name(name: str) -> str:
         if s_l in {"gpt 4.0 mini", "gpt-4.0-mini", "gpt 4o mini", "gpt-4o mini", "gpt4o-mini"}:
             return "gpt-4o-mini"
         s2 = re.sub(r"(\d),(\d)", r"\1.\2", s)
-        # Most GPT ids don't use a ".0" suffix (e.g. "gpt-5", not "gpt-5.0").
         s2 = re.sub(r"(gpt-\d+)\.0\b", r"\1", s2)
         return s2
     except Exception:
@@ -52,7 +105,6 @@ def _effective_model_name(model: Optional[str], url: str) -> str:
 
 def _use_max_completion_tokens(model: str) -> bool:
     """Return True when the model expects max_completion_tokens instead of max_tokens."""
-
     m = _normalize_model_name(model)
     try:
         return "gpt-5" in (m or "")
@@ -69,12 +121,7 @@ def _effective_base_url(base_url: Optional[str], api_key: str) -> Optional[str]:
 
 
 def _omit_temperature(model: str) -> bool:
-    """Return True when we should omit the temperature parameter.
-
-    Some models (notably GPT-5 family) only support the default temperature and
-    reject explicit values like 0.
-    """
-
+    """Return True when we should omit the temperature parameter."""
     try:
         return _use_max_completion_tokens(model)
     except Exception:
@@ -89,21 +136,13 @@ def health_check(
     timeout_sec: float = 45.0,
     http_post: Optional["HttpPost"] = None,
 ) -> Dict[str, object]:
-    """Best-effort connectivity/auth check for the configured chat.completions endpoint.
-
-    Returns a dict safe to print/log (never includes the raw api_key).
-    """
-
+    """Best-effort connectivity/auth check for the configured chat.completions endpoint."""
     key = (api_key if api_key is not None else (os.getenv("MSTOCK_GPT_API_KEY") or os.getenv("OPENAI_API_KEY") or "")).strip()
-
     url = _chat_completions_url(_effective_base_url(base_url, key))
-
-    # Choose a sensible default model when the user hasn't configured one.
     chosen_model = _effective_model_name(
         model if model is not None else (os.getenv("MSTOCK_GPT_MODEL") or ""),
         url,
     )
-
     if not key:
         return {
             "ok": False,
@@ -112,7 +151,6 @@ def health_check(
             "model": chosen_model,
             "detail": "Missing MSTOCK_GPT_API_KEY/OPENAI_API_KEY",
         }
-
     token_key = "max_completion_tokens" if _use_max_completion_tokens(chosen_model) else "max_tokens"
     payload: Dict[str, Any] = {
         "model": chosen_model,
@@ -124,18 +162,14 @@ def health_check(
     }
     if not _omit_temperature(chosen_model):
         payload["temperature"] = 0.0
-
     headers = _auth_headers_for_url(url, key)
-
     post = http_post or _urllib_post_json
     status, resp_text = post(url, headers, payload, float(timeout_sec))
     safe_text = _redact_secrets(resp_text or "")
-
     ok = status == 200
     detail = "OK" if ok else f"HTTP {status}: {safe_text[:200]}"
     if (not ok) and status in {401, 403}:
         detail += " (verify API key permissions and base URL)"
-
     return {
         "ok": ok,
         "status": int(status),
@@ -143,6 +177,30 @@ def health_check(
         "model": chosen_model,
         "detail": detail,
     }
+
+
+# UI integration hook
+_ui_callback: Optional[Callable] = None
+
+
+def register_ui_callback(fn: Callable) -> None:
+    """Register a UI callback to receive GPT events."""
+    global _ui_callback
+    try:
+        _ui_callback = fn
+    except Exception:
+        _ui_callback = None
+
+
+def _notify_ui(event: str, payload: dict) -> None:
+    try:
+        if _ui_callback:
+            try:
+                _ui_callback(str(event), dict(payload or {}))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def _is_github_models_url(url: str) -> bool:
@@ -162,70 +220,39 @@ def _is_azure_inference_url(url: str) -> bool:
 
 
 def _auth_headers_for_url(url: str, api_key: str) -> Dict[str, str]:
-    """Return auth + required headers for a given endpoint.
-
-    - OpenAI-compatible endpoints: Authorization: Bearer <key>
-    - Azure AI Inference endpoint (models.inference.ai.azure.com): uses api-key header.
-    """
-
+    """Return auth + required headers for a given endpoint."""
     k = str(api_key or "").strip()
     if not k:
         return {}
-
     headers: Dict[str, str] = {}
-
     if _is_azure_inference_url(url):
-        # Azure AI Inference convention.
         headers["api-key"] = k
-        # Some gateways also accept Bearer tokens; include for compatibility.
         headers["Authorization"] = f"Bearer {k}"
         return headers
-
-    # Default: OpenAI-compatible Bearer.
     headers["Authorization"] = f"Bearer {k}"
-
     if _is_github_models_url(url):
-        # Matches GitHub Models REST docs/quickstart.
         headers["Accept"] = "application/vnd.github+json"
         headers["X-GitHub-Api-Version"] = "2022-11-28"
-
     return headers
 
+
 def _redact_secrets(text: str) -> str:
-    """Best-effort redaction for key/token-like substrings in logs.
-
-    Some upstream APIs echo a partially-redacted key inside error messages.
-    This keeps console/UI logs safer without trying to be perfect.
-    """
-
+    """Best-effort redaction for key/token-like substrings in logs."""
     if not text:
         return text
-
     t = str(text)
-
-    # Common OpenAI key shapes.
     t = re.sub(r"\bsk-[A-Za-z0-9]{8,}\b", "sk-***", t)
     t = re.sub(r"\bsk-proj-[A-Za-z0-9]{8,}\b", "sk-proj-***", t)
-
-    # GitHub tokens commonly mistaken for OPENAI_API_KEY.
     t = re.sub(r"\bgithub_pat_[A-Za-z0-9_]{8,}\b", "github_pat_***", t)
     t = re.sub(r"\bghp_[A-Za-z0-9]{8,}\b", "ghp_***", t)
-
     return t
 
 
 def _chat_completions_url(base_url: Optional[str]) -> str:
-    """Return a usable chat.completions endpoint URL.
-
-    Accepts either:
-    - a base URL like "https://api.aicredits.in/v1" (we append /chat/completions)
-    - a full endpoint URL like "https://api.aicredits.in/v1/chat/completions"
-    """
-
+    """Return a usable chat.completions endpoint URL."""
     u = (base_url or os.getenv("MSTOCK_GPT_API_BASE_URL") or _default_api_base_url()).strip()
     if not u:
         u = _default_api_base_url()
-
     u = u.rstrip("/")
     u_l = u.lower()
     if u_l.endswith("/chat/completions"):
@@ -235,14 +262,10 @@ def _chat_completions_url(base_url: Optional[str]) -> str:
 
 @dataclass(frozen=True)
 class GPTAdvice:
-    decision: str  # "TAKE" | "SKIP" | "UNKNOWN"
+    decision: str
     reason: str = ""
     confidence: Optional[float] = None
     raw_text: str = ""
-
-    # Optional extra structured keys returned by the model.
-    # This allows the strategy/UI to surface richer context (e.g. CE/PE bias,
-    # suggested strategy, greeks interpretation) without changing the decision schema.
     extras: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -251,18 +274,10 @@ class GPTAdvice:
 
     @property
     def signals_not_profitable(self) -> bool:
-        """Return True when the model explicitly indicates the trade is unprofitable.
-
-        Used by strategy gating to hard-block entries that GPT flags as
-        "not profitable" / negative EV, even when confidence is low.
-        """
-
         try:
             rsn = str(self.reason or "").strip().lower()
         except Exception:
             rsn = ""
-
-        # Heuristic text patterns (keep conservative to avoid false blocks).
         if rsn:
             patterns = [
                 r"\bnot\s+profitable\b",
@@ -281,51 +296,36 @@ class GPTAdvice:
                         return True
             except Exception:
                 pass
-
         extras = self.extras if isinstance(self.extras, dict) else {}
-
-        # Structured profitability hints.
         try:
-            prof = extras.get("profitability")
-            if prof is None:
-                prof = extras.get("expected_profitability")
-            if prof is None:
-                prof = extras.get("profit")
+            prof = extras.get("profitability") or extras.get("expected_profitability") or extras.get("profit")
             if isinstance(prof, str):
                 p = prof.strip().lower()
                 if p in {"not_profitable", "unprofitable", "negative", "loss", "losing"}:
                     return True
         except Exception:
             pass
-
-        # Numeric EV/edge hints.
         for k in ("expected_value", "expected_ev", "ev", "expected_pnl", "expected_profit", "edge", "expected_edge"):
             try:
                 v = extras.get(k)
                 if v is None:
                     continue
-                vf = float(v)
-                if vf < 0:
+                if float(v) < 0:
                     return True
             except Exception:
                 continue
-
-        # Sign-only hints.
         for k in ("expected_value_sign", "ev_sign", "edge_sign"):
             try:
                 v = extras.get(k)
                 if v is None:
                     continue
                 if isinstance(v, str):
-                    vl = v.strip().lower()
-                    if vl in {"-1", "neg", "negative", "loss", "losing"}:
+                    if v.strip().lower() in {"-1", "neg", "negative", "loss", "losing"}:
                         return True
-                else:
-                    if float(v) < 0:
-                        return True
+                elif float(v) < 0:
+                    return True
             except Exception:
                 continue
-
         return False
 
 
@@ -337,23 +337,21 @@ def _bool_env(name: str, default: bool = False) -> bool:
 
 
 def _default_api_base_url() -> str:
-    return "https://api.aicredits.in/v1"
+    env_url = (os.getenv("MSTOCK_GPT_API_BASE_URL") or "").strip()
+    if env_url:
+        return env_url
+    return "https://api.openai.com/v1"
 
 
 def _extract_first_json_object(text: str) -> Optional[str]:
     if not text:
         return None
-
     s = str(text)
-
-    # Remove common markdown fences.
     s = s.replace("```json", "```").replace("```JSON", "```")
     if "```" in s:
-        # Keep everything inside the first fenced block if present.
         parts = s.split("```")
         if len(parts) >= 3:
             s = parts[1]
-
     start = s.find("{")
     end = s.rfind("}")
     if start < 0 or end < 0 or end <= start:
@@ -362,35 +360,23 @@ def _extract_first_json_object(text: str) -> Optional[str]:
 
 
 def _json_default(obj: Any) -> Any:
-    """Best-effort JSON encoding for common Python types.
-
-    The GPT advisor request payload is user-constructed and may include
-    non-JSON-native values (e.g., datetime/date). We normalize them here
-    so the advisor call doesn't crash and hard-block trading.
-    """
-
     if isinstance(obj, (datetime, date)):
         try:
             return obj.isoformat()
         except Exception:
             return str(obj)
-
     if isinstance(obj, Decimal):
         try:
             return float(obj)
         except Exception:
             return str(obj)
-
     if isinstance(obj, set):
         return list(obj)
-
     if isinstance(obj, bytes):
         try:
             return obj.decode("utf-8", errors="replace")
         except Exception:
             return str(obj)
-
-    # Last-resort: stringify to preserve information without failing serialization.
     return str(obj)
 
 
@@ -399,38 +385,25 @@ def _json_dumps(obj: Any) -> str:
 
 
 def parse_gpt_advice(text: str) -> GPTAdvice:
-    """Parse model output into a structured GPTAdvice.
-
-    Expected JSON format:
-        {"decision": "TAKE"|"SKIP", "reason": "...", "confidence": 0.0-1.0}
-
-    Robust to extra text / fenced code blocks.
-    """
-
+    """Parse model output into a structured GPTAdvice."""
     raw = str(text or "")
     blob = _extract_first_json_object(raw)
     if not blob:
         return GPTAdvice(decision="UNKNOWN", reason="No JSON found in response", raw_text=raw)
-
     try:
         obj = json.loads(blob)
     except Exception as exc:
         return GPTAdvice(decision="UNKNOWN", reason=f"Invalid JSON in response: {exc}", raw_text=raw)
-
     decision = str(obj.get("decision") or obj.get("action") or "UNKNOWN").strip().upper()
     if decision not in {"TAKE", "SKIP", "UNKNOWN"}:
         decision = "UNKNOWN"
-
     reason = str(obj.get("reason") or obj.get("rationale") or "").strip()
-
     conf = obj.get("confidence")
     confidence: Optional[float]
     try:
         confidence = float(conf) if conf is not None else None
     except Exception:
         confidence = None
-
-    # Preserve any non-core fields as extras.
     extras: Dict[str, Any] = {}
     try:
         for k, v in obj.items():
@@ -439,68 +412,35 @@ def parse_gpt_advice(text: str) -> GPTAdvice:
             extras[str(k)] = v
     except Exception:
         extras = {}
-
     return GPTAdvice(decision=decision, reason=reason, confidence=confidence, raw_text=raw, extras=extras)
 
 
 @dataclass(frozen=True)
 class GPTMarketAnalysis:
-    ce_pe_bias: str  # "CE" | "PE" | "NEUTRAL" | "UNKNOWN"
+    ce_pe_bias: str
     recommended_strategy: str = ""
-    # Optional preset request based on market conditions.
-    # One of: "aggressive", "conservative", "".
     preset_request: str = ""
     preset_reason: str = ""
-    # Optional: For directional trades, how many strike steps away from ATM to pick.
-    # Example: if strike_step=50 and directional_strike_offset_steps=2, target is 100 points OTM.
     directional_strike_offset_steps: Optional[int] = None
     greeks_interpretation: str = ""
     option_chain_analysis: str = ""
     reason: str = ""
     confidence: Optional[float] = None
-    # Optional per-strategy runtime tuning hints:
-    # {"short_strangle":{"distance":55,"theta":-7.2}, "iron_condor":{"distance":45,"wing":70}}
-    # Supported keys: distance, wing, ratio, expiry_spread, theta, delta.
     strategy_parameters: Dict[str, Dict[str, float]] = field(default_factory=dict)
     raw_text: str = ""
 
 
 def parse_gpt_market_analysis(text: str) -> GPTMarketAnalysis:
-    """Parse model output for market snapshot analysis.
-
-    Expected JSON format (keys are flexible):
-        {
-          "ce_pe_bias": "CE"|"PE"|"NEUTRAL",
-          "recommended_strategy": "directional"|...,
-          "greeks_interpretation": "...",
-          "option_chain_analysis": "...",
-          "reason": "...",
-          "confidence": 0.0-1.0
-        }
-
-    Robust to extra text / fenced code blocks.
-    """
-
+    """Parse model output for market snapshot analysis."""
     raw = str(text or "")
     blob = _extract_first_json_object(raw)
     if not blob:
         return GPTMarketAnalysis(ce_pe_bias="UNKNOWN", reason="No JSON found in response", raw_text=raw)
-
     try:
         obj = json.loads(blob)
     except Exception as exc:
         return GPTMarketAnalysis(ce_pe_bias="UNKNOWN", reason=f"Invalid JSON in response: {exc}", raw_text=raw)
-
-    bias = str(
-        obj.get("ce_pe_bias")
-        or obj.get("bias")
-        or obj.get("direction")
-        or obj.get("cepe_bias")
-        or "UNKNOWN"
-    ).strip().upper()
-    # Models sometimes respond with market-direction words instead of CE/PE.
-    # Map common synonyms into the expected CE/PE/NEUTRAL bucket so the strategy
-    # can apply GPT voting weight reliably.
+    bias = str(obj.get("ce_pe_bias") or obj.get("bias") or obj.get("direction") or obj.get("cepe_bias") or "UNKNOWN").strip().upper()
     if bias in {"BULL", "BULLISH", "UP", "UPTREND", "LONG", "BUY"}:
         bias = "CE"
     elif bias in {"BEAR", "BEARISH", "DOWN", "DOWNTREND", "SHORT", "SELL"}:
@@ -513,33 +453,16 @@ def parse_gpt_market_analysis(text: str) -> GPTMarketAnalysis:
         bias = "PE"
     if bias not in {"CE", "PE", "NEUTRAL", "UNKNOWN"}:
         bias = "UNKNOWN"
-
     rec = str(obj.get("recommended_strategy") or obj.get("strategy") or "").strip()
-    preset_raw = str(
-        obj.get("preset_request")
-        or obj.get("preset")
-        or obj.get("suggested_preset")
-        or ""
-    ).strip().lower()
+    preset_raw = str(obj.get("preset_request") or obj.get("preset") or obj.get("suggested_preset") or "").strip().lower()
     if preset_raw in {"aggressive", "aggresive"}:
         preset_raw = "aggressive"
     elif preset_raw in {"conservative", "safe", "defensive"}:
         preset_raw = "conservative"
     else:
         preset_raw = ""
-    preset_reason = str(
-        obj.get("preset_reason")
-        or obj.get("preset_change_reason")
-        or obj.get("preset_rationale")
-        or ""
-    ).strip()
-    # Optional strike guidance for directional trades.
-    raw_steps = (
-        obj.get("directional_strike_offset_steps")
-        or obj.get("strike_offset_steps")
-        or obj.get("directional_otm_steps")
-        or obj.get("otm_steps")
-    )
+    preset_reason = str(obj.get("preset_reason") or obj.get("preset_change_reason") or obj.get("preset_rationale") or "").strip()
+    raw_steps = obj.get("directional_strike_offset_steps") or obj.get("strike_offset_steps") or obj.get("directional_otm_steps") or obj.get("otm_steps")
     directional_steps: Optional[int]
     try:
         if raw_steps is None or (isinstance(raw_steps, str) and not str(raw_steps).strip()):
@@ -549,29 +472,19 @@ def parse_gpt_market_analysis(text: str) -> GPTMarketAnalysis:
     except Exception:
         directional_steps = None
     if directional_steps is not None:
-        # Keep it sane; negative doesn't make sense for this field.
         directional_steps = max(0, min(int(directional_steps), 20))
-
     greeks_txt = str(obj.get("greeks_interpretation") or obj.get("greeks") or "").strip()
     chain_txt = str(obj.get("option_chain_analysis") or obj.get("option_chain") or obj.get("chain") or "").strip()
     reason = str(obj.get("reason") or obj.get("rationale") or "").strip()
-
     conf = obj.get("confidence")
     confidence: Optional[float]
     try:
         confidence = float(conf) if conf is not None else None
     except Exception:
         confidence = None
-
-    # Optional per-strategy runtime tuning payload.
     strategy_parameters: Dict[str, Dict[str, float]] = {}
     try:
-        raw_params = (
-            obj.get("strategy_parameters")
-            or obj.get("strategy_params")
-            or obj.get("parameter_overrides")
-            or {}
-        )
+        raw_params = obj.get("strategy_parameters") or obj.get("strategy_params") or obj.get("parameter_overrides") or {}
         if isinstance(raw_params, dict):
             for k, v in raw_params.items():
                 if not isinstance(v, dict):
@@ -592,7 +505,6 @@ def parse_gpt_market_analysis(text: str) -> GPTMarketAnalysis:
                     strategy_parameters[key] = out_row
     except Exception:
         strategy_parameters = {}
-
     return GPTMarketAnalysis(
         ce_pe_bias=bias,
         recommended_strategy=rec,
@@ -608,6 +520,13 @@ def parse_gpt_market_analysis(text: str) -> GPTMarketAnalysis:
     )
 
 
+def _is_reasoning_model(model: str) -> bool:
+    """Return True if the model is a reasoning model that outputs chain-of-thought."""
+    m = str(model or "").lower()
+    reasoning_patterns = ["r1", "deepseek-r", "hy3", "qwq", "reasoning", "think", "o1", "o3", "o4"]
+    return any(p in m for p in reasoning_patterns)
+
+
 def analyze_market(
     *,
     snapshot: Dict[str, Any],
@@ -616,20 +535,20 @@ def analyze_market(
     base_url: Optional[str] = None,
     timeout_sec: float = 45.0,
     temperature: float = 0.0,
-    max_tokens: int = 450,
-    http_post: Optional[HttpPost] = None,
+    max_tokens: int = 1000,
+    http_post: Optional["HttpPost"] = None,
 ) -> GPTMarketAnalysis:
-    """Call OpenAI Chat Completions API for market snapshot analysis.
-
-    Returns GPTMarketAnalysis with robust parsing. If the API call fails,
-    returns ce_pe_bias=UNKNOWN.
-    """
-
+    """Call OpenAI Chat Completions API for market snapshot analysis."""
     if not api_key:
         return GPTMarketAnalysis(ce_pe_bias="UNKNOWN", reason="Missing API key")
-
+    effective_max_tokens = int(max_tokens)
+    if _is_reasoning_model(model):
+        # Reasoning models need more tokens because they output chain-of-thought before the final answer
+        # tencent/hy3-preview and similar models can require 8000+ tokens
+        effective_max_tokens = max(effective_max_tokens, 8192)
+        if _bool_env("MSTOCK_GPT_DEBUG", False):
+            print(f"[GPT] Reasoning model detected, using max_tokens={effective_max_tokens}")
     url = _chat_completions_url(_effective_base_url(base_url, api_key))
-
     system = (
         "You are an options trading assistant. "
         "You MUST respond with ONLY valid JSON (no markdown). "
@@ -649,19 +568,14 @@ def analyze_market(
         "Use snapshot.patterns and snapshot.pattern_groups (bullish/bearish/neutral candlestick detections) as first-class context alongside indicators/greeks. "
         "If candlestick groups conflict strongly with indicators/greeks, reduce confidence and bias toward NEUTRAL. "
         "If information is missing/ambiguous, choose NEUTRAL and be conservative. "
-        "Output schema: {\"ce_pe_bias\":string,\"recommended_strategy\":string,\"preset_request\":string,\"preset_reason\":string,\"directional_strike_offset_steps\":number,\"strategy_parameters\":object,\"greeks_interpretation\":string,\"option_chain_analysis\":string,\"reason\":string,\"confidence\":number}"
+        'Output schema: {"ce_pe_bias":string,"recommended_strategy":string,"preset_request":string,"preset_reason":string,"directional_strike_offset_steps":number,"strategy_parameters":object,"greeks_interpretation":string,"option_chain_analysis":string,"reason":string,"confidence":number}'
     )
-
-    user = {
-        "ts": int(time.time()),
-        "snapshot": snapshot,
-    }
-
+    user = {"ts": int(time.time()), "snapshot": snapshot}
     model_name = _effective_model_name(model, url)
     token_key = "max_completion_tokens" if _use_max_completion_tokens(model_name) else "max_tokens"
     payload: Dict[str, Any] = {
         "model": model_name,
-        token_key: int(max_tokens),
+        token_key: int(effective_max_tokens),
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": _json_dumps(user)},
@@ -669,42 +583,81 @@ def analyze_market(
     }
     if not _omit_temperature(model_name):
         payload["temperature"] = float(temperature)
-
     headers = _auth_headers_for_url(url, api_key)
-
     post = http_post or _urllib_post_json
     status, resp_text = post(url, headers, payload, float(timeout_sec))
-
     if _bool_env("MSTOCK_GPT_DEBUG", False):
         print(f"[GPT] market POST {url} status={status} bytes={len(resp_text or '')}")
-
+        print(f"[GPT] Using model: {model_name}")
+        print(f"[GPT] Payload messages count: {len(payload.get('messages', []))}")
+        print(f"[GPT] System prompt length: {len(system)}")
+        print(f"[GPT] User snapshot keys: {list(snapshot.keys()) if isinstance(snapshot, dict) else 'N/A'}")
     if status != 200:
         safe_text = _redact_secrets(resp_text or "")
         hint = ""
         if status in {401, 403}:
             hint = " (verify API key permissions and base URL)"
-        return GPTMarketAnalysis(
-            ce_pe_bias="UNKNOWN",
-            reason=f"HTTP {status}: {safe_text[:200]}{hint}",
-            raw_text=safe_text,
-        )
-
+        return GPTMarketAnalysis(ce_pe_bias="UNKNOWN", reason=f"HTTP {status}: {safe_text[:200]}{hint}", raw_text=safe_text)
     try:
         data = json.loads(resp_text)
     except Exception as exc:
         return GPTMarketAnalysis(ce_pe_bias="UNKNOWN", reason=f"Bad JSON from API: {exc}", raw_text=resp_text)
-
     content = None
+    finish_reason = None
+    reasoning_text = None
     try:
         choices = data.get("choices") or []
         if choices:
-            content = (choices[0].get("message") or {}).get("content")
+            first_choice = choices[0] or {}
+            msg = first_choice.get("message") or {}
+            content = msg.get("content")
+            reasoning_text = msg.get("reasoning") or msg.get("reasoning_content")
+            finish_reason = first_choice.get("finish_reason")
     except Exception:
         content = None
-
+        reasoning_text = None
+        finish_reason = None
+    if not content and reasoning_text:
+        import re as _re
+        json_match = _re.search(r'\{[^{}]*"ce_pe_bias"[^{}]*\}', str(reasoning_text))
+        if json_match:
+            content = json_match.group(0)
+            if _bool_env("MSTOCK_GPT_DEBUG", False):
+                print("[GPT] Extracted content from reasoning field")
+        elif _bool_env("MSTOCK_GPT_DEBUG", False):
+            print(f"[GPT] No JSON found in reasoning text (len={len(reasoning_text or '')})")
     if not content:
-        return GPTMarketAnalysis(ce_pe_bias="UNKNOWN", reason="Empty model response", raw_text=resp_text)
-
+        if isinstance(data, dict):
+            content = data.get("content") or data.get("text") or data.get("output")
+        if not content:
+            debug_info = f"Empty model response (status={status})"
+            if finish_reason:
+                debug_info += f", finish_reason={finish_reason}"
+                if finish_reason == "length":
+                    debug_info += " (max tokens reached - consider increasing max_tokens)"
+                elif finish_reason == "content_filter":
+                    debug_info += " (content filtered by API)"
+            if _bool_env("MSTOCK_GPT_DEBUG", False):
+                print(f"[GPT] Empty response. Full API response: {resp_text[:1000]}")
+                print(f"[GPT] Response type: {type(resp_text)}, len: {len(resp_text) if resp_text else 0}")
+                # Try to parse as JSON to see the structure
+                try:
+                    data_debug = json.loads(resp_text)
+                    print(f"[GPT] Response JSON keys: {list(data_debug.keys()) if isinstance(data_debug, dict) else 'not dict'}")
+                    if isinstance(data_debug, dict) and 'choices' in data_debug:
+                        choices = data_debug.get('choices', [])
+                        print(f"[GPT] Choices count: {len(choices)}")
+                        if choices:
+                            first = choices[0]
+                            print(f"[GPT] First choice keys: {list(first.keys())}")
+                            msg = first.get('message', {})
+                            print(f"[GPT] Message keys: {list(msg.keys()) if isinstance(msg, dict) else 'not dict'}")
+                            print(f"[GPT] Finish reason: {first.get('finish_reason')}")
+                except Exception as e:
+                    print(f"[GPT] Could not parse response as JSON: {e}")
+            else:
+                print(f"[GPT] Empty response. Response snippet: {resp_text[:200]}")
+            return GPTMarketAnalysis(ce_pe_bias="UNKNOWN", reason=debug_info, raw_text=resp_text)
     return parse_gpt_market_analysis(str(content))
 
 
@@ -719,7 +672,6 @@ def _urllib_post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any]
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "OpenAI/Python 1.x")
-
     try:
         with urllib.request.urlopen(req, timeout=float(timeout_sec)) as resp:
             status = int(getattr(resp, "status", 200) or 200)
@@ -751,24 +703,13 @@ def advise_trade(
     system_prompt: Optional[str] = None,
     timeout_sec: float = 45.0,
     temperature: float = 0.0,
-    max_tokens: int = 300,
+    max_tokens: int = 500,
     http_post: Optional[HttpPost] = None,
 ) -> GPTAdvice:
-    """Call OpenAI Chat Completions API to approve/deny a proposed trade.
-
-    This is intentionally conservative:
-    - If the API call fails or output can't be parsed, returns decision=UNKNOWN.
-    - Use your strategy's risk controls; do not rely on GPT alone.
-
-    Environment variables supported (optional):
-    - MSTOCK_GPT_DEBUG=1 : prints request/response metadata (never prints api_key)
-    """
-
+    """Call OpenAI Chat Completions API to approve/deny a proposed trade."""
     if not api_key:
         return GPTAdvice(decision="UNKNOWN", reason="Missing API key")
-
     url = _chat_completions_url(_effective_base_url(base_url, api_key))
-
     system = (
         str(system_prompt).strip()
         if system_prompt is not None and str(system_prompt).strip()
@@ -777,17 +718,12 @@ def advise_trade(
             "You MUST respond with ONLY valid JSON (no markdown). "
             "Decide whether to TAKE or SKIP the proposed trade, given the context. "
             "Be conservative: if information is missing or ambiguous, SKIP. "
-            "Output schema: {\"decision\":\"TAKE\"|\"SKIP\",\"reason\":string,\"confidence\":number}. "
+            'Output schema: {"decision":"TAKE"|"SKIP","reason":string,"confidence":number}. '
             "When relevant, include optional keys like profitability=profitable|not_profitable|unknown and expected_value_sign=-1|0|1. "
             "You MAY include extra JSON keys when helpful (e.g. side/qty/target)."
         )
     )
-
-    user = {
-        "ts": int(time.time()),
-        "proposal": proposal,
-    }
-
+    user = {"ts": int(time.time()), "proposal": proposal}
     model_name = _effective_model_name(model, url)
     token_key = "max_completion_tokens" if _use_max_completion_tokens(model_name) else "max_tokens"
     payload: Dict[str, Any] = {
@@ -800,28 +736,25 @@ def advise_trade(
     }
     if not _omit_temperature(model_name):
         payload["temperature"] = float(temperature)
-
     headers = _auth_headers_for_url(url, api_key)
-
     post = http_post or _urllib_post_json
     status, resp_text = post(url, headers, payload, float(timeout_sec))
-
     if _bool_env("MSTOCK_GPT_DEBUG", False):
         print(f"[GPT] POST {url} status={status} bytes={len(resp_text or '')}")
-
     if status != 200:
         safe_text = _redact_secrets(resp_text or "")
         hint = ""
         if status in {401, 403}:
             hint = " (verify API key permissions and base URL)"
+        try:
+            _notify_ui("gpt_advise_http_error", {"status": status, "detail": safe_text})
+        except Exception:
+            pass
         return GPTAdvice(decision="UNKNOWN", reason=f"HTTP {status}: {safe_text[:200]}{hint}", raw_text=safe_text)
-
     try:
         data = json.loads(resp_text)
     except Exception as exc:
         return GPTAdvice(decision="UNKNOWN", reason=f"Bad JSON from API: {exc}", raw_text=resp_text)
-
-    # OpenAI chat.completions format
     content = None
     try:
         choices = data.get("choices") or []
@@ -829,8 +762,16 @@ def advise_trade(
             content = (choices[0].get("message") or {}).get("content")
     except Exception:
         content = None
-
     if not content:
-        return GPTAdvice(decision="UNKNOWN", reason="Empty model response", raw_text=resp_text)
-
-    return parse_gpt_advice(str(content))
+        advice = GPTAdvice(decision="UNKNOWN", reason="Empty model response", raw_text=resp_text)
+        try:
+            _notify_ui("gpt_advise", asdict(advice))
+        except Exception:
+            pass
+        return advice
+    parsed = parse_gpt_advice(str(content))
+    try:
+        _notify_ui("gpt_advise", asdict(parsed))
+    except Exception:
+        pass
+    return parsed

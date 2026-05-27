@@ -22,13 +22,20 @@ except ImportError:  # pragma: no cover
         sys.path.insert(0, str(_sdk_root))
     from tradingapi_b.mconnect import MConnectB
 
-import yahoo_data
-from config import APIConfig
-from market_data import Candle
-from scripmaster import ScripMaster
+try:
+    from . import yahoo_data
+    from .config import APIConfig
+    from .market_data import Candle
+    from .scripmaster import ScripMaster
+except ImportError:
+    import yahoo_data
+    from config import APIConfig
+    from market_data import Candle
+    from scripmaster import ScripMaster
 
 
 # --- m.Stock valid candle intervals ---
+# Maps user-friendly interval to SDK internal format (used in mstock_client logic)
 MSTOCK_INTERVAL_MAP = {
     "1m": "ONE_MINUTE",
     "3m": "THREE_MINUTE",
@@ -44,6 +51,7 @@ _MSTOCK_ALLOWED_INTERVALS = set(MSTOCK_INTERVAL_MAP.values())
 
 # m.Stock index candles: ONE_MINUTE can be unreliable; fallback to FIVE_MINUTE.
 FALLBACK_INTERVALS = ["ONE_MINUTE", "FIVE_MINUTE"]
+
 
 
 @dataclass
@@ -95,6 +103,22 @@ class MStockTypeBClient:
         self._startup_ts: float = float(time.time())
         self._startup_historical_bootstrap_done: bool = False
         self._startup_historical_bootstrap_logged: bool = False
+
+    def _ensure_valid_token(self) -> None:
+        """Sync and push any fresh/changed MSTOCK_ACCESS_TOKEN directly into the SDK."""
+        token = os.getenv("MSTOCK_ACCESS_TOKEN", "").strip()
+        if not token:
+            return
+
+        # Check if the token has changed or is not set in raw SDK client
+        raw_token = getattr(self._raw, "access_token", None)
+        if raw_token != token:
+            self._raw.access_token = token
+            if hasattr(self._raw, "set_access_token"):
+                try:
+                    self._raw.set_access_token(token)
+                except Exception:
+                    pass
 
     def _log_intraday_failure(self, key: str, msg: str) -> None:
         """Log intraday failures only when explicitly debugging.
@@ -437,6 +461,86 @@ class MStockTypeBClient:
                 pass
 
         return candles
+
+    def _fetch_historical_chart_direct(
+        self,
+        *,
+        exchange: str,
+        symboltoken: str,
+        interval: str,
+        from_date: str,
+        to_date: str,
+    ) -> Any:
+        """Bypass the SDK's get_historical_chart and call the endpoint directly.
+
+        The SDK's GET request lacks Content-Type: application/json, causing
+        HTTP 415 on the m.Stock API. This method uses POST with the correct
+        headers — matching the pattern already used by _fetch_intraday_chart.
+
+        Returns parsed JSON (dict or list). Raises RuntimeError on HTTP errors.
+        """
+
+        api_key = str(self.cfg.api_key or "").strip()
+        access_token = str(os.getenv("MSTOCK_ACCESS_TOKEN", "")).strip()
+        if not (api_key and access_token):
+            raise RuntimeError("Missing api_key or MSTOCK_ACCESS_TOKEN for historical chart")
+
+        url = os.getenv(
+            "MSTOCK_HISTORICAL_URL",
+            "https://api.mstock.trade/openapi/typeb/instruments/historical",
+        ).strip()
+
+        try:
+            timeout = float(os.getenv("MSTOCK_HISTORICAL_TIMEOUT", "15"))
+        except Exception:
+            timeout = 15.0
+
+        headers = {
+            "X-Mirae-Version": "1",
+            "X-PrivateKey": api_key,
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        payload = {
+            "exchange": exchange,
+            "symboltoken": symboltoken,
+            "interval": interval,
+            "fromdate": from_date,
+            "todate": to_date,
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                text = raw.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = (exc.read() or b"")[:400].decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            raise RuntimeError(
+                f"get_historical_chart failed with HTTP {exc.code}. "
+                f"request=POST {url}. headers=. Body preview: {body!r}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"get_historical_chart request failed: {exc}") from exc
+
+        try:
+            return json.loads(text)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"get_historical_chart returned non-JSON: {text[:300]!r}"
+            ) from exc
 
     def _intraday_available(self) -> bool:
         try:
@@ -842,6 +946,7 @@ class MStockTypeBClient:
 
     def _get_option_chain_from_api(self) -> List[Dict[str, Any]]:
         """Existing option-chain API integration (kept as-is, env-configured)."""
+        self._ensure_valid_token()
         exchange_id = os.getenv("MSTOCK_OPTION_EXCHANGE_ID", "").strip()
         expiry = os.getenv("MSTOCK_OPTION_EXPIRY", "").strip()
         token = os.getenv("MSTOCK_OPTION_TOKEN", "").strip()
@@ -945,6 +1050,7 @@ class MStockTypeBClient:
         return "".join(ch for ch in (s or "").upper() if ch.isalnum())
 
     def _load_instruments(self) -> List[Dict[str, Any]]:
+        self._ensure_valid_token()
         if self._instruments_cache is not None:
             return self._instruments_cache
 
@@ -1591,6 +1697,15 @@ class MStockTypeBClient:
                         max_tr = tr
                     prev_close = cl
 
+                # Sync with underlying SDK if needed
+                if getattr(self._raw, "access_token", None) != os.getenv("MSTOCK_ACCESS_TOKEN"):
+                    self._raw.access_token = os.getenv("MSTOCK_ACCESS_TOKEN")
+                    if hasattr(self._raw, "set_access_token"):
+                        try:
+                            self._raw.set_access_token(os.getenv("MSTOCK_ACCESS_TOKEN"))
+                        except Exception:
+                            pass
+
                 if max_tr <= 0.0:
                     return True
         except Exception:
@@ -1780,6 +1895,7 @@ class MStockTypeBClient:
         ``symbol`` should be in the format expected by the SDK's
         "market LTP" endpoint, for example ``"NSE:ACC"``.
         """
+        self._ensure_valid_token()
         # Type-B SDK exposes get_market_quote(mode, exchangeTokens).
         # The quote endpoint requires numeric instrument tokens.
         exch, token = self._resolve_token_for_quote(symbol)
@@ -1928,6 +2044,7 @@ class MStockTypeBClient:
         exchange_hint: Optional[str] = None,
     ) -> tuple[Optional[float], Optional[float], Optional[float]]:
         """Return (best_bid, best_ask, ltp) when available; otherwise (None, None, None)."""
+        self._ensure_valid_token()
         try:
             exch, token = self._resolve_token_for_quote(symbol, exchange_hint=exchange_hint)
             if not (exch and token):
@@ -2315,12 +2432,19 @@ class MStockTypeBClient:
                 from_s = from_dt.strftime(fmt)
                 to_s = now.strftime(fmt)
 
+                # Interval is already in SDK format (e.g., ONE_MINUTE), no conversion needed
+                api_interval = str(interval)
+                
+                # API expects dates with time component
+                from_s_with_time = f"{from_s} 09:15" if len(from_s) <= 10 else from_s
+                to_s_with_time = f"{to_s} 15:30" if len(to_s) <= 10 else to_s
+
                 payload = {
                     "exchange": hist_exchange,
                     "instrumentToken": token,
-                    "interval": interval,
-                    "fromDate": from_s,
-                    "toDate": to_s,
+                    "interval": api_interval,
+                    "fromDate": from_s_with_time,
+                    "toDate": to_s_with_time,
                 }
 
                 print(
@@ -2330,14 +2454,13 @@ class MStockTypeBClient:
                 )
 
                 try:
-                    resp = self._raw.get_historical_chart(
-                        payload["exchange"],
-                        payload["instrumentToken"],
-                        payload["interval"],
-                        payload["fromDate"],
-                        payload["toDate"],
+                    data = self._fetch_historical_chart_direct(
+                        exchange=payload["exchange"],
+                        symboltoken=payload["instrumentToken"],
+                        interval=payload["interval"],
+                        from_date=payload["fromDate"],
+                        to_date=payload["toDate"],
                     )
-                    data = self._safe_json(resp, context="get_historical_chart")
                     candles = self._parse_candles_payload(data, limit=limit)
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
@@ -3140,6 +3263,7 @@ class MStockTypeBClient:
         - ``MSTOCK_SYMBOL_TOKEN`` – numeric token for the instrument
         - ``MSTOCK_EXCHANGE`` – exchange string (e.g. ``"NSE"``)
         """
+        self._ensure_valid_token()
         exchange_val = (exchange or os.getenv("MSTOCK_EXCHANGE", "NSE")).strip() or "NSE"
 
         # Normalize "EXCH:TRADINGSYMBOL" into raw trading symbol.
@@ -3215,6 +3339,7 @@ class MStockTypeBClient:
         )
 
     def cancel_order(self, order_id: str) -> None:
+        self._ensure_valid_token()
         variety = "NORMAL"
         self._raw.cancel_order(variety, order_id)
 
@@ -3234,7 +3359,7 @@ class MStockTypeBClient:
         This calls the TypeB `calculate_order_margin` endpoint via the official SDK.
         Response schemas can vary; parsing is best-effort and may return None.
         """
-
+        self._ensure_valid_token()
         try:
             exchange_val = str(exchange or "").strip().upper() or "NSE"
             symbol_val = str(symbol or "").strip()
@@ -3516,6 +3641,7 @@ class MStockTypeBClient:
         return extract_any(root)
 
     def get_open_positions(self) -> List[Dict[str, Any]]:
+        self._ensure_valid_token()
         resp = self._raw.get_net_position()
         payload = self._safe_json(resp, context="get_net_position")
         if isinstance(payload, dict) and "data" in payload:
@@ -3534,6 +3660,7 @@ class MStockTypeBClient:
         common response shapes and returns an empty list on missing/None payload.
         """
 
+        self._ensure_valid_token()
         resp = self._raw.get_holdings()
         payload = self._safe_json(resp, context="get_holdings")
         if isinstance(payload, dict):

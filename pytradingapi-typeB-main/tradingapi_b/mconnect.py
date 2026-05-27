@@ -12,14 +12,15 @@ default_log.addHandler(logging.FileHandler("mconnect.log", mode='a'))
 class MConnectB:
     _default_timeout = 7
 
-    def __init__(self,api_key=None,access_Token=None,pool=None,timeout=None,debug=True,logger=default_log,disable_ssl=True): 
-        self.api_key=api_key
-        self.access_token=access_Token
+    def __init__(self, api_key=None, access_Token=None, access_token=None, pool=None, timeout=None, debug=True, logger=default_log, disable_ssl=True): 
+        self.api_key = api_key
+        # Accept both access_Token (capital T) and access_token (lowercase) for compatibility
+        self.access_token = access_token if access_token is not None else access_Token
         self.session_expiry_hook = None
         self.timeout = timeout or self._default_timeout
         self.disable_ssl = disable_ssl
-        self.debug=debug
-        self.logger=logger
+        self.debug = debug
+        self.logger = logger
 
         #Read config.json and assign
         
@@ -277,13 +278,29 @@ class MConnectB:
         return get_holdings
     
     def get_historical_chart(self,_exchange,_security_token,_interval,_fromDate,_toDate):
-        request_packet={"exchange": _exchange,"symboltoken": _security_token,"interval": _interval,"fromdate": _fromDate,"todate": _toDate}
+        """Fetch historical candle data via GET with Content-Type header.
+        
+        Args:
+            _exchange: Exchange name (e.g., "NSE")
+            _security_token: Symbol token (e.g., "26000")
+            _interval: Interval - use "1m", "5m", "15m", "1h", "1d" (NOT "ONE_MINUTE")
+            _fromDate: From date with time (e.g., "2026-05-25 09:15")
+            _toDate: To date with time (e.g., "2026-05-26 15:30")
+        """
+        # API expects camelCase field names, passed as query parameters
+        request_params = {
+            "exchange": _exchange,
+            "symbolToken": _security_token,  # camelCase
+            "interval": _interval,
+            "fromDate": _fromDate,  # camelCase with time (YYYY-MM-DD HH:MM)
+            "toDate": _toDate  # camelCase with time (YYYY-MM-DD HH:MM)
+        }
         try:
-            #Using session request
-            get_hist_chart=self._post(
+            # m.Stock historical API uses GET with Content-Type: application/json header
+            # to avoid HTTP 415 Unsupported Media Type errors
+            get_hist_chart = self._get(
                 route="historical_chart",
-                params=request_packet,
-                is_json=True,
+                params=request_params,
                 content_type="application/json"
             )
         except Exception as e:
@@ -538,21 +555,21 @@ class MConnectB:
     
     def _get(self, route, url_args=None, content_type=None, params=None, is_json=False):
         """Alias for sending a GET request."""
-        return self._request(route, "GET", url_args=url_args,content_type=content_type, params=params, is_json=is_json)
+        return self._request(route, "GET", url_args=url_args, content_type=content_type, params=params, is_json=is_json)
 
     def _post(self, route, url_args=None, content_type=None, params=None, is_json=False, query_params=None):
         """Alias for sending a POST request."""
-        return self._request(route, "POST", url_args=url_args,content_type=content_type, params=params, is_json=is_json, query_params=query_params)
+        return self._request(route, "POST", url_args=url_args, content_type=content_type, params=params, is_json=is_json, query_params=query_params)
 
     def _put(self, route, url_args=None, content_type=None, params=None, is_json=False, query_params=None):
         """Alias for sending a PUT request."""
-        return self._request(route, "PUT", url_args=url_args,content_type=content_type, params=params, is_json=is_json, query_params=query_params)
+        return self._request(route, "PUT", url_args=url_args, content_type=content_type, params=params, is_json=is_json, query_params=query_params)
 
     def _delete(self, route, url_args=None, content_type=None, params=None, is_json=False):
         """Alias for sending a DELETE request."""
-        return self._request(route, "DELETE", url_args=url_args,content_type=content_type, params=params, is_json=is_json)
+        return self._request(route, "DELETE", url_args=url_args, content_type=content_type, params=params, is_json=is_json)
     
-    def _request(self, route, method, url_args=None, content_type="application/json",params=None, is_json=False, query_params=None):
+    def _request(self, route, method, url_args=None, content_type="application/json", params=None, is_json=False, query_params=None):
         """Make an HTTP request."""
         # Form a restful URL
         if url_args:
@@ -577,9 +594,9 @@ class MConnectB:
         #Adding to debug logs if flag set to true
         if self.debug:
             if is_json:
-                self.logger.debug("Request: {method} {url} {json} {headers}".format(method=method, url=url, json=params, headers=headers))
+                self.logger.debug("Request: method={method} url={url} json={json} headers={headers}".format(method=method, url=url, json=params, headers=headers))
             else:
-                self.logger.debug("Request: {method} {url} {data} {headers}".format(method=method, url=url, data=params, headers=headers))
+                self.logger.debug("Request: method={method} url={url} data={data} headers={headers}".format(method=method, url=url, data=params, headers=headers))
         
         # prepare url query params
         if method == "GET" or (method == "DELETE" and not is_json):

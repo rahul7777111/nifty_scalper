@@ -7,7 +7,7 @@ later without changing the strategy selection contract.
 """
 from __future__ import annotations
 
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 def detect_regime(
     atr_values: Iterable[float], adx_values: Iterable[float], rsi_values: Iterable[float]
@@ -49,7 +49,60 @@ _REGIME_TO_STRATEGY: Dict[str, str] = {
     "quiet": "short_strangle",
 }
 
+_REGIME_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "trending": {
+        "trend_mult": 1.20,
+        "ml_threshold": 0.58,
+        "preferred": ["bull_call_spread", "call_ratio_backspread", "long_call", "short_put"],
+    },
+    "volatile": {
+        "trend_mult": 0.90,
+        "ml_threshold": 0.62,
+        "preferred": ["long_straddle", "long_strangle", "iron_condor"],
+    },
+    "mean_reverting": {
+        "trend_mult": 0.75,
+        "ml_threshold": 0.55,
+        "preferred": ["iron_condor", "iron_fly", "short_straddle"],
+    },
+    "quiet": {
+        "trend_mult": 0.65,
+        "ml_threshold": 0.57,
+        "preferred": ["short_strangle", "iron_condor", "short_straddle"],
+    },
+}
 
-def select_strategy_for_regime(regime: str) -> str:
+
+def get_regime_tuning(regime: str, cfg: Optional[Any] = None) -> Dict[str, Any]:
+    key = str(regime or "").strip().lower() or "quiet"
+    tuning = dict(_REGIME_TUNING_DEFAULTS.get(key, _REGIME_TUNING_DEFAULTS["quiet"]))
+    if cfg is None:
+        tuning["regime"] = key
+        return tuning
+
+    attr_prefix = f"regime_{key}_"
+    for attr, out_key in (("trend_mult", "trend_mult"), ("ml_threshold", "ml_threshold")):
+        try:
+            v = getattr(cfg, f"{attr_prefix}{attr}", None)
+            if v is not None:
+                tuning[out_key] = float(v)
+        except Exception:
+            pass
+    try:
+        pref = getattr(cfg, f"{attr_prefix}preferred_strategy", "")
+        if str(pref or "").strip():
+            tuning["preferred"] = [str(pref).strip()]
+    except Exception:
+        pass
+    tuning["regime"] = key
+    return tuning
+
+
+def select_strategy_for_regime(regime: str, cfg: Optional[Any] = None) -> str:
     """Map regime to an implemented strategy key used by the router."""
-    return _REGIME_TO_STRATEGY.get(str(regime or "").lower(), "directional")
+    key = str(regime or "").lower()
+    tuning = get_regime_tuning(key, cfg=cfg)
+    preferred = list(tuning.get("preferred") or [])
+    if preferred:
+        return str(preferred[0])
+    return _REGIME_TO_STRATEGY.get(key, "directional")

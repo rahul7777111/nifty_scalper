@@ -3,15 +3,14 @@ from __future__ import annotations
 import sys
 import types
 from datetime import datetime
+import importlib
 
 from src.config import StrategyConfig
 from src.market_data import Candle
 
 
 if "gpt_advisor" not in sys.modules:
-    sys.modules["gpt_advisor"] = types.SimpleNamespace()
-    # Also ensure module is available as imported by src.strategy (which does a local import)
-    sys.modules["src.gpt_advisor"] = sys.modules["gpt_advisor"]
+    sys.modules["gpt_advisor"] = importlib.import_module("src.gpt_advisor")
 
 from src import strategy as strategy_mod
 from src.strategy import NiftyScalper, TradeState
@@ -468,4 +467,4 @@ def test_gpt_require_recommendation_fallback(monkeypatch) -> None:
     bot.cfg.gpt_require_recommendation = False
     bot._decide_entries()
     assert len(bot.state.open_directional) == 1
-    assert bot.state.open_directional[0]["name"] == "long_call"
+    assert bot.state.open_directional[0]["name"] == "long_call"

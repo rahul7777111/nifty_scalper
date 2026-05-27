@@ -4,8 +4,9 @@ import calendar
 import os
 import re
 import time
+import math
 from datetime import date
-from datetime import datetime as dt_datetime, time as dt_time
+from datetime import datetime as dt_datetime, time as dt_time, timedelta
 from dataclasses import dataclass, replace
 from threading import Event
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -56,11 +57,11 @@ from indicators import adx, atr, ema, rsi, sma, supertrend, roc, choppiness_inde
 from market_data import Candle
 from mstock_client import MStockTypeBClient, Order
 from volatility import forecast_volatility
-from strategy_allocator import detect_regime, select_strategy_for_regime
+from strategy_allocator import detect_regime, get_regime_tuning, select_strategy_for_regime
 from risk_cvar import compute_cvar
 from greeks_manager import GreeksManager
 from exit_optimizer import ExitOptimizer
-from ml_signals import load_model, predict
+from ml_signals import feature_vector_from_candles, load_model, predict
 from position_sizing import volatility_target_size, kelly_fraction
 from trailing import atr_trailing_stop
 from backtest_harness import simulate_simple
@@ -226,7 +227,8 @@ class NiftyScalper:
         self._cached_atr: Optional[float] = None
 
         # Win-rate tracker state
-        self._strategy_winrates: Dict[str, Dict[str, object]] = {}
+        self._strategy_winrate: Dict[str, Dict[str, object]] = {}
+        self._entries_paused: bool = False
         self._disabled_strategies: Dict[str, float] = {}
         
         # Throttle entry evaluation to candle boundaries to avoid repeated
@@ -242,10 +244,6 @@ class NiftyScalper:
         self._portfolio_hedge_trade: Optional[Dict[str, object]] = None
 
         # Runtime diagnostics / observability.
-        # Strategy win-rate tracker: maps strategy_name -> {wins, losses, results}
-        self._strategy_winrate: Dict[str, Dict[str, object]] = {}
-        # Strategies temporarily disabled by the win-rate tracker.
-        self._disabled_strategies: Dict[str, float] = {}
 
         self._entry_block_counts: Dict[str, int] = {}
         self._last_entry_block: Dict[str, object] = {"code": "", "reason": "", "ts": 0.0}
@@ -263,6 +261,9 @@ class NiftyScalper:
         self._auto_gpt_strategy_parameters: Dict[str, Dict[str, float]] = {}
         self._auto_gpt_directional_steps: Optional[int] = None
         self._auto_gpt_strike_context: Dict[str, object] = {}
+        self._last_ml_feature_names: List[str] = []
+        self._last_ml_features: List[float] = []
+        self._last_regime_profile: Dict[str, object] = {}
 
         # ---- P1: GPT Exit Management state ----
         self._gpt_exit_mgmt_last_run: float = 0.0
@@ -365,6 +366,41 @@ class NiftyScalper:
                     out["ml_signal_prob"] = None
             except Exception:
                 out["ml_signal_prob"] = None
+
+            # Walk-forward smoke test using a deterministic synthetic candle set.
+            try:
+                from ml_pipeline import build_supervised_dataset, walk_forward_backtest
+
+                base = 100.0
+                candles: List[Candle] = []
+                now = dt_datetime.now()
+                for idx in range(72):
+                    drift = 0.18 * float(idx)
+                    swing = math.sin(float(idx) / 4.0) * 1.5
+                    close = base + drift + swing
+                    candles.append(
+                        Candle(
+                            time=now + timedelta(minutes=idx),
+                            open=close - 0.35,
+                            high=close + 0.65,
+                            low=close - 0.75,
+                            close=close,
+                            volume=1000.0 + float(idx) * 5.0,
+                        )
+                    )
+
+                X, y, _feature_names = build_supervised_dataset(candles, lookback=12, horizon=1)
+                if X and y:
+                    wf = walk_forward_backtest(X, y, n_splits=4, threshold=0.5)
+                    out["walk_forward_smoke"] = {
+                        "ok": bool(wf.get("ok")),
+                        "fold_count": int(float(wf.get("aggregate", {}).get("fold_count", 0.0) or 0.0)),
+                        "aggregate": dict(wf.get("aggregate") or {}),
+                    }
+                else:
+                    out["walk_forward_smoke"] = {"ok": False, "reason": "insufficient_synthetic_data"}
+            except Exception as exc:
+                out["walk_forward_smoke"] = {"ok": False, "error": str(exc)}
         except Exception as exc:  # pragma: no cover - diagnostics should never crash
             out["diagnostics_error"] = str(exc)
         return out
@@ -384,33 +420,225 @@ class NiftyScalper:
             self._cached_atr = float(atr_val or 0.0)
             # regime
             regime = detect_regime([self._cached_atr] * 30, [20.0] * 30, [r or 50.0] * 30)
-            suggested = select_strategy_for_regime(regime)
+            regime_profile = get_regime_tuning(regime, self.cfg)
+            self._last_regime_profile = dict(regime_profile)
+            suggested = select_strategy_for_regime(regime, self.cfg)
 
             ml_prob = 0.0
             if getattr(self.cfg, "enable_ml_signals", False) and self.ml_model is not None:
-                feat = [[float(r or 50.0), 0.0, float(self._cached_atr or 0.01)]]
-                ml_pred = predict(self.ml_model, feat)
+                current_iv = None
+                try:
+                    iv_watch = self._iv_watch if isinstance(getattr(self, "_iv_watch", None), dict) else {}
+                    current_iv = float(iv_watch.get("value")) if iv_watch.get("value") is not None else None
+                except Exception:
+                    current_iv = None
+                greeks = None
+                try:
+                    if self.greeks_mgr is not None:
+                        greeks = self.greeks_mgr.portfolio_exposure()
+                except Exception:
+                    greeks = None
+                ctx = {
+                    "regime": regime,
+                    "iv": current_iv,
+                    "delta": float(getattr(greeks, "delta", 0.0) or 0.0) if greeks is not None else 0.0,
+                    "gamma": float(getattr(greeks, "gamma", 0.0) or 0.0) if greeks is not None else 0.0,
+                    "vega": float(getattr(greeks, "vega", 0.0) or 0.0) if greeks is not None else 0.0,
+                    "theta": float(getattr(greeks, "theta", 0.0) or 0.0) if greeks is not None else 0.0,
+                    "spot": float(latest.close or 0.0),
+                    "trend_strength": float(self._trend_strength(float(ema([c.close for c in candles], period=self.cfg.ema_fast) or 0.0), float(ema([c.close for c in candles], period=self.cfg.ema_slow) or 0.0), float(latest.close or 0.0))),
+                }
+                feat_vec, feat_names = feature_vector_from_candles(candles, context=ctx)
+                self._last_ml_features = list(feat_vec)
+                self._last_ml_feature_names = list(feat_names)
+                ml_pred = predict(self.ml_model, [feat_vec])
                 ml_prob = float(ml_pred[0]) if ml_pred else 0.0
                 self._last_ml_pred = ml_prob
+            else:
+                self._last_ml_features = []
+                self._last_ml_feature_names = []
 
-            # Simple gating: require ml_prob>0.6 to take in AUTO, else use threshold 0.5
+            try:
+                ml_threshold = float(regime_profile.get("ml_threshold") if isinstance(regime_profile, dict) else 0.55)
+            except Exception:
+                ml_threshold = 0.55
+
+            # Regime-specific gating: use per-regime ML thresholds before falling back.
             take = False
             reason = ""
             if getattr(self.cfg, "strategy_name", "directional") == "auto":
-                if getattr(self.cfg, "gpt_require_recommendation", False):
-                    # Require GPT — defer to GPT advisor in production. For now, require ml_prob
-                    if ml_prob >= 0.6:
-                        take = True
-                        reason = "ml_gate"
-                else:
-                    if ml_prob >= 0.55:
-                        take = True
-                        reason = "ml_gate"
-                    else:
-                        # fall back to technical rule: rsi oversold/overbought
-                        if (r or 50.0) < 30 or (r or 50.0) > 70:
+                # If GPT auto-selection is enabled, consult it for strategy choice.
+                try:
+                    if bool(getattr(self.cfg, "gpt_enable", False)) and bool(getattr(self.cfg, "gpt_auto_select", True)):
+                        try:
+                            gpt_rec = self._gpt_auto_select_strategy(
+                                chain=[],
+                                spot=float(latest.close or 0.0),
+                                atr_val=float(self._cached_atr or 0.0),
+                                rsi_val=float(r) if r is not None else None,
+                                trend_strength=float(self._trend_strength(float(ema([c.close for c in candles], period=self.cfg.ema_fast) or 0.0), float(ema([c.close for c in candles], period=self.cfg.ema_slow) or 0.0), float(latest.close or 0.0))),
+                                vwap_val=None,
+                                call_atm=None,
+                                put_atm=None,
+                            )
+                        except Exception:
+                            gpt_rec = None
+                        if gpt_rec:
+                            suggested = str(self._normalize_strategy_name(str(gpt_rec)))
+                            # GPT has supplied an explicit auto-mode choice, so treat it
+                            # as a valid trade signal instead of only a branch label.
                             take = True
-                            reason = "technical_fallback"
+                            reason = "gpt_auto_select"
+                        else:
+                            # If GPT recommendation is required, block entry when missing.
+                            if bool(getattr(self.cfg, "gpt_require_recommendation", False)):
+                                return {"take": False, "reason": "gpt_missing", "size": 0, "ml_prob": float(ml_prob), "suggested_strategy": None}
+                except Exception:
+                    pass
+
+                # Use ML gating as before (GPT only chooses the strategy). Fall back
+                # to ML/technical checks for entry approval.
+                if ml_prob >= ml_threshold:
+                    take = True
+                    reason = "ml_gate"
+                else:
+                    # fall back to technical rule: rsi oversold/overbought
+                    if (r or 50.0) < 30 or (r or 50.0) > 70:
+                        take = True
+                        reason = "technical_fallback"
+
+                # If GPT is enabled, optionally ask GPT to approve/deny the proposed trade.
+                try:
+                    if bool(getattr(self.cfg, "gpt_enable", False)) and bool(getattr(self.cfg, "gpt_auto_select", True)):
+                        # AUTO mode should still give GPT a chance to originate a trade.
+                        # Otherwise GPT can only veto trades that a local gate already accepted.
+                        consult_gpt = bool(take) or bool(getattr(self.cfg, "gpt_require_recommendation", False))
+                        if str(getattr(self.cfg, "strategy_name", "directional") or "").strip().lower() == "auto":
+                            consult_gpt = True
+                        if consult_gpt:
+                            try:
+                                import gpt_advisor as _ga  # type: ignore
+                                advice_model = os.getenv("MSTOCK_GPT_MODEL", "") or "gpt-4o-mini"
+                                advice_key = (os.getenv("MSTOCK_GPT_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+                                # Enrich proposal with contextual market data to help GPT make a better judgment.
+                                proposal = {
+                                    "strategy": suggested,
+                                    "ml_prob": float(ml_prob),
+                                    "size": int(size or 0),
+                                    "reason": reason,
+                                    "latest_close": float(latest.close or 0.0),
+                                    "timestamp": int(time.time()),
+                                }
+                                try:
+                                    # Recent candles (last 5) simplified as dicts
+                                    recent = []
+                                    for c in (candles[-5:] if len(candles) >= 1 else candles):
+                                        recent.append({
+                                            "time": int(getattr(c, "time", time.time())),
+                                            "open": float(getattr(c, "open", 0.0) or 0.0),
+                                            "high": float(getattr(c, "high", 0.0) or 0.0),
+                                            "low": float(getattr(c, "low", 0.0) or 0.0),
+                                            "close": float(getattr(c, "close", 0.0) or 0.0),
+                                        })
+                                    proposal["recent_candles"] = recent
+                                except Exception:
+                                    pass
+                                try:
+                                    proposal["atr"] = float(self._cached_atr or 0.0)
+                                except Exception:
+                                    proposal["atr"] = None
+                                try:
+                                    iv_val = None
+                                    if isinstance(getattr(self, "_iv_watch", None), dict):
+                                        iv_val = self._iv_watch.get("value")
+                                    proposal["iv"] = float(iv_val) if iv_val is not None else None
+                                except Exception:
+                                    proposal["iv"] = None
+                                try:
+                                    if getattr(self, "greeks_mgr", None) is not None:
+                                        g = self.greeks_mgr.portfolio_exposure()
+                                        proposal["greeks"] = {
+                                            "delta": float(getattr(g, "delta", 0.0) or 0.0),
+                                            "gamma": float(getattr(g, "gamma", 0.0) or 0.0),
+                                            "vega": float(getattr(g, "vega", 0.0) or 0.0),
+                                            "theta": float(getattr(g, "theta", 0.0) or 0.0),
+                                        }
+                                except Exception:
+                                    proposal["greeks"] = None
+                                try:
+                                    # Small option chain sample near ATM (best-effort, limited size)
+                                    chain_sample = []
+                                    chain = []
+                                    try:
+                                        chain = list(self.client.get_option_chain(self.cfg.underlying) or [])
+                                    except Exception:
+                                        chain = []
+                                    if chain:
+                                        # Attempt to pick nearest strikes around ATM by strike if present.
+                                        # Normalise to list of dicts with symbol/strike/option_type/iv
+                                        simplified = []
+                                        for row in chain:
+                                            try:
+                                                simplified.append({
+                                                    "symbol": str(row.get("symbol") or ""),
+                                                    "strike": float(row.get("strike") or 0.0),
+                                                    "option_type": str(row.get("option_type") or ""),
+                                                    "iv": float(row.get("iv") or 0.0) if row.get("iv") not in (None, "") else None,
+                                                })
+                                            except Exception:
+                                                continue
+                                        # Sort by strike and pick the middle 8 if possible
+                                        try:
+                                            simplified.sort(key=lambda x: float(x.get("strike") or 0.0))
+                                            mid = len(simplified) // 2
+                                            start = max(0, mid - 4)
+                                            chain_sample = simplified[start : start + 8]
+                                        except Exception:
+                                            chain_sample = simplified[:8]
+                                    proposal["option_chain_sample"] = chain_sample
+                                except Exception:
+                                    proposal["option_chain_sample"] = []
+                                parsed = _ga.advise_trade(proposal=proposal, model=advice_model, api_key=advice_key)
+                            except Exception:
+                                parsed = None
+                            # parsed is a GPTAdvice dataclass-like with .decision in {TAKE, SKIP, UNKNOWN}
+                            if parsed is not None:
+                                try:
+                                    decision = str(getattr(parsed, "decision", "UNKNOWN") or "UNKNOWN").upper()
+                                except Exception:
+                                    decision = "UNKNOWN"
+                                # Record recent GPT advice for UI enrichment of the next emitted event.
+                                try:
+                                    self._pending_gpt_advice = {
+                                        "ts": time.time(),
+                                        "decision": decision,
+                                        "reason": str(getattr(parsed, "reason", "") or ""),
+                                        "confidence": float(getattr(parsed, "confidence", 0.0) or 0.0),
+                                    }
+                                except Exception:
+                                    try:
+                                        self._pending_gpt_advice = {"ts": time.time(), "decision": decision}
+                                    except Exception:
+                                        self._pending_gpt_advice = None
+                                if decision == "SKIP":
+                                    take = False
+                                    reason = f"gpt_skip:{getattr(parsed, 'reason', '') or ''}"
+                                elif decision == "TAKE":
+                                    take = True
+                                    reason = f"gpt_take:{getattr(parsed, 'reason', '') or ''}"
+                                else:
+                                    # UNKNOWN: if GPT recommendation is required, block; else keep prior decision
+                                    if bool(getattr(self.cfg, "gpt_require_recommendation", False)):
+                                        take = False
+                                        reason = f"gpt_unknown:{getattr(parsed, 'reason', '') or ''}"
+                            else:
+                                # No parsed advice (API failure): if GPT required, block; else continue
+                                if bool(getattr(self.cfg, "gpt_require_recommendation", False)):
+                                    take = False
+                                    reason = "gpt_missing_api"
+                        # end consult_gpt
+                except Exception:
+                    pass
             else:
                 # non-auto: use ml as supplement
                 if ml_prob >= 0.6:
@@ -445,8 +673,169 @@ class NiftyScalper:
             if not take or size <= 0:
                 return None
             latest = candles[-1] if candles else None
-            price = float(latest.close) if latest is not None else 0.0
+            spot = float(latest.close) if latest is not None else 0.0
+            if spot <= 0:
+                return None
+
+            # Calculate ATM strike for Nifty options (50 point interval)
+            strike_interval = 50
+            atm_strike = round(spot / strike_interval) * strike_interval
+
+            # Get expiry string (format: DDMMM, e.g., 22MAY)
+            expiry = getattr(self.cfg, "expiry", None)
+            if not expiry:
+                # Try MSTOCK_TARGET_EXPIRY first
+                target_expiry_raw = str(getattr(self.cfg, "target_expiry", "") or "").strip()
+                if target_expiry_raw:
+                    try:
+                        parsed_date = self._parse_any_date(target_expiry_raw)
+                        if parsed_date:
+                            expiry = parsed_date.strftime("%d%b").upper()
+                    except Exception:
+                        pass
+            if not expiry:
+                # Try getting it from nearest weekly expiry in the option chain
+                try:
+                    chain = self.get_option_chain(self.cfg.underlying)
+                    nearest = self._filter_nearest_weekly_expiry(chain)
+                    if nearest:
+                        exp_date = self._row_expiry_date(nearest[0])
+                        if exp_date:
+                            expiry = exp_date.strftime("%d%b").upper()
+                except Exception:
+                    pass
+            if not expiry:
+                from datetime import datetime
+                now = datetime.now()
+                expiry = now.strftime("%d%b").upper()
+
+            # Determine option type (CE for bullish, PE for bearish)
+            option_type = "CE"  # Default to Call for bullish directional
+            try:
+                closes = [c.close for c in candles]
+                ema_fast_val = ema(closes, period=int(getattr(self.cfg, "ema_fast", 9)))
+                ema_slow_val = ema(closes, period=int(getattr(self.cfg, "ema_slow", 21)))
+                if ema_fast_val is not None and ema_slow_val is not None:
+                    if ema_fast_val < ema_slow_val:
+                        option_type = "PE"
+            except Exception:
+                pass
+
+            # Override via reason search if specified
+            r_lower = str(reason or "").lower()
+            if "bear" in r_lower or "put" in r_lower or "short" in r_lower or "sell" in r_lower:
+                option_type = "PE"
+            elif "bull" in r_lower or "call" in r_lower or "long" in r_lower or "buy" in r_lower:
+                option_type = "CE"
+
+            option_symbol = f"{self.cfg.underlying}{expiry}{atm_strike}{option_type}"
+
+            # Parse resolved expiry string back to datetime.date object for greeks/portfolio risk snapshot
+            parsed_exp = None
+            try:
+                from datetime import datetime
+                # expiry is a string in DDMMM format like '25MAY'
+                # Use current year for parsing
+                parsed_exp = datetime.strptime(f"{expiry}{datetime.now().year}", "%d%b%Y").date()
+            except Exception:
+                try:
+                    # fallback
+                    parsed_exp = self._parse_any_date(expiry)
+                except Exception:
+                    from datetime import date
+                    parsed_exp = date.today()
+
+            # Fetch option contract LTP
+            try:
+                option_ltp = self.client.get_ltp(option_symbol)
+                if option_ltp is None:
+                    print(f"[ERROR] No LTP available for option {option_symbol}")
+                    return None
+                price = float(option_ltp)
+            except Exception as e:
+                print(f"[ERROR] Failed to fetch LTP for {option_symbol}: {e}")
+                return None
             name = "auto_ml_directional"
+            target_symbol = option_symbol if not bool(getattr(self.cfg, "enable_live_trading", False)) else str(getattr(self.cfg, "delta_hedge_symbol", "") or self.cfg.underlying)
+
+            # Pyramiding: check for existing open position first
+            existing = None
+            max_pyr = 0
+            try:
+                max_pyr = self._dynamic_pyramid_max_level()
+            except Exception:
+                max_pyr = 0
+
+            if max_pyr > 0:
+                for t in self.state.open_directional:
+                    if t.get("name") == name:
+                        t_sym = str(t.get("symbol") or "").strip().upper()
+                        new_sym = str(target_symbol).strip().upper()
+                        if t_sym == new_sym:
+                            existing = t
+                            break
+                if existing is not None:
+                    try:
+                        lev = int(existing.get("pyramid_level", 0) or 0)
+                    except Exception:
+                        lev = 0
+                    if lev >= max_pyr:
+                        print(f"[PYRAMID] Max pyramiding reached for {name} (level={lev}, max={max_pyr}); skipping add")
+                        return existing
+
+            if existing is not None:
+                lev = int(existing.get("pyramid_level", 0))
+                existing["pyramid_level"] = lev + 1
+                existing["quantity"] = int(existing.get("quantity", 0)) + int(size)
+                legs_existing = existing.get("legs")
+                if isinstance(legs_existing, list) and legs_existing and isinstance(legs_existing[0], dict):
+                    legs_existing[0]["quantity"] = int(existing.get("quantity", 0))
+
+                # Count this add as a trade for daily limits.
+                self.state.trades_today += 1
+                self.state.last_entry_ts = time.time()
+                try:
+                    self._note_opened_trade_type(position_type="directional", name=str(name))
+                except Exception:
+                    pass
+
+                # If live trading, place the order
+                if bool(getattr(self.cfg, "enable_live_trading", False)):
+                    try:
+                        hedge_sym = str(getattr(self.cfg, "delta_hedge_symbol", "") or self.cfg.underlying)
+                        print(f"[LIVE][AUTO][PYRAMID] placing market BUY {hedge_sym} x{size} as underlying proxy for {name}")
+                        self.client.place_order(symbol=hedge_sym, side="BUY", quantity=int(size), order_type="MARKET")
+                    except Exception as exc:
+                        print(f"[LIVE][AUTO][PYRAMID] failed to place underlying order: {exc}")
+                        # Rollback qty on failure
+                        existing["quantity"] = int(existing.get("quantity", 0)) - int(size)
+                        if isinstance(legs_existing, list) and legs_existing and isinstance(legs_existing[0], dict):
+                            legs_existing[0]["quantity"] = int(existing.get("quantity", 0))
+                        return None
+                else:
+                    print(f"[PAPER][AUTO][PYRAMID] {name}: added size={size} @ price={price}")
+
+                if self._has_event_sink():
+                    try:
+                        trade_id_existing = str(existing.get("trade_id") or "(unknown)")
+                        name_existing = str(existing.get("name") or name)
+                        legs_evt = [dict(l) for l in legs_existing if isinstance(l, dict)] if isinstance(legs_existing, list) else []
+                        self._emit(
+                            TradeLogEvent(
+                                ts=time.time(),
+                                event="UPDATE",
+                                trade_id=trade_id_existing,
+                                position_type="directional",
+                                name=name_existing,
+                                legs=legs_evt,
+                                mtm=self._compute_legs_mtm(legs_evt),
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                print(f"[PYRAMID] Incremented {name} level to {lev + 1}")
+                return existing
 
             # Paper mode: just print and append a minimal trade record
             if not bool(getattr(self.cfg, "enable_live_trading", False)):
@@ -454,18 +843,21 @@ class NiftyScalper:
                 tr = {
                     "trade_id": self._new_trade_id("D"),
                     "name": name,
-                    "symbol": self.cfg.underlying,
+                    "symbol": option_symbol,
                     "side": "BUY",
                     "quantity": int(size),
-                    "entry_spot": float(price),
+                    "entry_spot": float(spot),
                     "entry_price": float(price),
                     "atr": float(self._cached_atr or 0.0),
                     "legs": [
                         {
-                            "symbol": self.cfg.underlying,
+                            "symbol": option_symbol,
                             "quantity": int(size),
                             "side": "BUY",
                             "entry_price": float(price),
+                            "strike": float(atm_strike),
+                            "option_type": option_type,
+                            "expiry": parsed_exp,
                         }
                     ],
                     "meta": {"simulated": True, "reason": reason},
@@ -503,6 +895,9 @@ class NiftyScalper:
                         "quantity": int(size),
                         "side": "BUY",
                         "entry_price": float(price),
+                        "strike": float(atm_strike),
+                        "option_type": option_type,
+                        "expiry": parsed_exp,
                     }
                 ],
                 "meta": {"simulated": False, "reason": reason},
@@ -1229,6 +1624,11 @@ class NiftyScalper:
 
     def _gpt_generate_equity_watchlist(self, *, timeframe: str, max_symbols: int, is_paper: bool) -> List[Dict[str, object]]:
         if not self._equity_gpt_watchlist_enabled(is_paper=bool(is_paper)):
+            return []
+        try:
+            if str(getattr(self.cfg, "strategy_name", "") or "").strip().lower() == "auto":
+                return []
+        except Exception:
             return []
 
         cache = self._gpt_equity_watchlist_cache if isinstance(self._gpt_equity_watchlist_cache, dict) else {}
@@ -2331,6 +2731,11 @@ class NiftyScalper:
         root = None
         if isinstance(legs, list):
             root = self._infer_underlying_root_from_legs(legs)
+        if not root:
+            try:
+                root = self._normalize_root(str(getattr(self.cfg, "underlying", "") or ""))
+            except Exception:
+                root = None
 
         # 2) Per-underlying config (if root inferred).
         if root == "NIFTY":
@@ -3119,6 +3524,69 @@ class NiftyScalper:
                     time.sleep(delay)
         raise RuntimeError(f"place_order failed after {attempts} attempts: {last_exc}")
 
+    def _build_bracket_levels(self, *, entry_price: Optional[float], side: str, quantity: int = 0) -> Dict[str, object]:
+        try:
+            px = float(entry_price) if entry_price is not None else None
+        except Exception:
+            px = None
+        if px is None or px <= 0:
+            return {}
+
+        side_u = str(side or "").strip().upper()
+        if side_u not in {"BUY", "SELL"}:
+            return {}
+
+        try:
+            stop_pct = float(getattr(self.cfg, "premium_mtm_stop_pct", 0.30) or 0.30)
+        except Exception:
+            stop_pct = 0.30
+        try:
+            target_pct = float(getattr(self.cfg, "premium_mtm_target_pct", 0.18) or 0.18)
+        except Exception:
+            target_pct = 0.18
+        try:
+            trail_start_pct = float(getattr(self.cfg, "premium_mtm_trail_start_pct", 0.05) or 0.05)
+        except Exception:
+            trail_start_pct = 0.05
+        try:
+            trail_stop_pct = float(getattr(self.cfg, "premium_mtm_trail_stop_pct", 0.05) or 0.05)
+        except Exception:
+            trail_stop_pct = 0.05
+
+        if side_u == "BUY":
+            prem_stop = max(0.0, float(px) * (1.0 - float(stop_pct)))
+            prem_target = max(0.0, float(px) * (1.0 + float(target_pct)))
+        else:
+            prem_stop = max(0.0, float(px) * (1.0 + float(stop_pct)))
+            prem_target = max(0.0, float(px) * (1.0 - float(target_pct)))
+
+        return {
+            "prem_stop": float(prem_stop),
+            "prem_target": float(prem_target),
+            "trail_start": float(trail_start_pct),
+            "trail_stop": float(trail_stop_pct),
+            "stoploss": float(prem_stop),
+            "targetPrice": float(prem_target),
+            "trailingStopLoss": float(trail_stop_pct),
+            "bracket_enabled": True,
+            "entry_price": float(px),
+            "quantity": int(quantity),
+        }
+
+    def _annotate_leg_brackets(self, leg: Dict[str, object]) -> Dict[str, object]:
+        leg_copy = dict(leg)
+        bracket = self._build_bracket_levels(
+            entry_price=leg_copy.get("entry_price"),
+            side=str(leg_copy.get("side") or ""),
+            quantity=int(leg_copy.get("quantity") or 0),
+        )
+        if bracket:
+            for key in ("prem_stop", "prem_target", "trail_start", "trail_stop", "stoploss", "targetPrice", "trailingStopLoss"):
+                if key in bracket:
+                    leg_copy[key] = bracket[key]
+            leg_copy["bracket"] = {k: v for k, v in bracket.items() if k != "quantity"}
+        return leg_copy
+
     def _portfolio_risk_snapshot(self, spot: float) -> Dict[str, object]:
         """Approximate portfolio risk from open option legs."""
         out: Dict[str, object] = {
@@ -3225,6 +3693,139 @@ class NiftyScalper:
 
         return out
 
+    def _projected_portfolio_risk_snapshot(self, spot: float, new_legs: List[dict]) -> Dict[str, object]:
+        """Return the portfolio risk snapshot after hypothetically adding legs.
+
+        This is used as a pre-trade gate so the bot can block orders that would
+        breach configured portfolio caps before the broker sees them.
+        """
+
+        base = self._portfolio_risk_snapshot(spot)
+        projected = dict(base)
+        if spot <= 0:
+            return projected
+
+        extra_notional = 0.0
+        extra_delta_abs = 0.0
+        extra_delta_net = 0.0
+        extra_gamma_net = 0.0
+        extra_vega_net = 0.0
+        legs_count = int(projected.get("legs_count") or 0)
+
+        today = date.today()
+        for lg in list(new_legs or []):
+            if not isinstance(lg, dict) or bool(lg.get("is_hedge")):
+                continue
+
+            side = str(lg.get("side") or "").strip().upper()
+            if side not in {"BUY", "SELL"}:
+                continue
+
+            try:
+                qty = int(lg.get("quantity") or 0)
+            except Exception:
+                qty = 0
+            if qty <= 0:
+                continue
+
+            sign = 1.0 if side == "BUY" else -1.0
+
+            try:
+                ltp = float(lg.get("ltp") or lg.get("entry_price") or 0.0)
+            except Exception:
+                ltp = 0.0
+            if ltp > 0:
+                extra_notional += abs(float(ltp) * float(qty))
+
+            try:
+                strike = float(lg.get("strike") or 0.0)
+            except Exception:
+                strike = 0.0
+            if strike <= 0:
+                continue
+
+            ot = str(lg.get("option_type") or "").strip().upper()
+            if ot in {"CALL", "C"}:
+                ot = "CE"
+            elif ot in {"PUT", "P"}:
+                ot = "PE"
+            if ot not in {"CE", "PE"}:
+                continue
+
+            iv_val = None
+            try:
+                iv_raw = lg.get("iv")
+                if iv_raw is not None:
+                    iv_f = float(iv_raw)
+                    iv_val = (iv_f / 100.0) if iv_f > 1.5 else iv_f
+            except Exception:
+                iv_val = None
+            if iv_val is None or iv_val <= 0:
+                iv_val = 0.20
+
+            t_years = 1.0 / 252.0
+            try:
+                exp_raw = lg.get("expiry")
+                exp_d = self._parse_any_date(str(exp_raw)) if exp_raw else None
+                if exp_d is not None:
+                    dte = max(1, int((exp_d - today).days))
+                    t_years = float(dte) / 365.0
+            except Exception:
+                t_years = 1.0 / 252.0
+
+            try:
+                d = float(delta(float(spot), strike, float(t_years), 0.06, float(iv_val), ot)) * float(sign) * float(qty)
+                g = float(gamma(float(spot), strike, float(t_years), 0.06, float(iv_val))) * float(sign) * float(qty)
+                v = float(vega(float(spot), strike, float(t_years), 0.06, float(iv_val))) * float(sign) * float(qty)
+            except Exception:
+                continue
+
+            extra_delta_net += d
+            extra_delta_abs += abs(d)
+            extra_gamma_net += g
+            extra_vega_net += v
+            legs_count += 1
+
+        projected["option_notional_abs"] = float(projected.get("option_notional_abs") or 0.0) + float(extra_notional)
+        projected["delta_abs"] = float(projected.get("delta_abs") or 0.0) + float(extra_delta_abs)
+        projected["delta_net"] = float(projected.get("delta_net") or 0.0) + float(extra_delta_net)
+        projected["gamma_net"] = float(projected.get("gamma_net") or 0.0) + float(extra_gamma_net)
+        projected["vega_net"] = float(projected.get("vega_net") or 0.0) + float(extra_vega_net)
+        projected["legs_count"] = int(legs_count)
+        return projected
+
+    def _portfolio_caps_allow_legs(self, spot: float, legs: List[dict], *, context: str = "") -> bool:
+        """Block trades that would breach portfolio caps after adding `legs`."""
+
+        try:
+            max_notional = float(getattr(self.cfg, "max_portfolio_option_notional", 0.0) or 0.0)
+        except Exception:
+            max_notional = 0.0
+        try:
+            max_delta_abs = float(getattr(self.cfg, "max_portfolio_delta_abs", 0.0) or 0.0)
+        except Exception:
+            max_delta_abs = 0.0
+        if max_notional <= 0 and max_delta_abs <= 0:
+            return True
+
+        projected = self._projected_portfolio_risk_snapshot(float(spot), list(legs or []))
+        notional_abs = float(projected.get("option_notional_abs") or 0.0)
+        delta_abs_now = float(projected.get("delta_abs") or 0.0)
+
+        if max_notional > 0 and notional_abs >= max_notional:
+            print(
+                f"[RISK] Portfolio option notional cap would be exceeded after {context or 'trade'} "
+                f"({notional_abs:.0f} >= {max_notional:.0f})"
+            )
+            return False
+        if max_delta_abs > 0 and delta_abs_now >= max_delta_abs:
+            print(
+                f"[RISK] Portfolio abs-delta cap would be exceeded after {context or 'trade'} "
+                f"({delta_abs_now:.1f} >= {max_delta_abs:.1f})"
+            )
+            return False
+        return True
+
     def _strategy_router(
         self,
         *,
@@ -3236,6 +3837,8 @@ class NiftyScalper:
         atr_threshold: float,
         fast_ema: Optional[float],
         slow_ema: Optional[float],
+        regime: Optional[str] = None,
+        regime_profile: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         """Deterministic policy router used before/alongside GPT."""
         mode = str(getattr(self.cfg, "strategy_router_mode", "balanced") or "balanced").strip().lower()
@@ -3276,6 +3879,16 @@ class NiftyScalper:
 
         if str(chosen) not in candidates:
             candidates.insert(0, str(chosen))
+
+        try:
+            if regime_profile and isinstance(regime_profile, dict):
+                preferred = [str(x) for x in list(regime_profile.get("preferred") or []) if str(x).strip()]
+                if preferred:
+                    ordered_pref = [s for s in preferred if s in candidates]
+                    ordered_rest = [s for s in candidates if s not in ordered_pref]
+                    candidates = ordered_pref + ordered_rest
+        except Exception:
+            pass
         # Keep deterministic and compact.
         ordered: List[str] = []
         for s in candidates:
@@ -3401,6 +4014,23 @@ class NiftyScalper:
             # can render live risk thresholds.
             try:
                 evt = self._enrich_evt_for_ui(evt)
+            except Exception:
+                pass
+            # If we have a recent GPT advice recorded, attach it to the next OPEN event
+            try:
+                pending = getattr(self, "_pending_gpt_advice", None)
+                if pending and isinstance(pending, dict) and (time.time() - float(pending.get("ts", 0.0) or 0.0)) < 6.0:
+                    if str(evt.event).upper() == "OPEN":
+                        try:
+                            note = f"gpt:{str(pending.get('decision') or '')}:{str(pending.get('reason') or '')}"
+                            evt = replace(evt, reason=note)
+                        except Exception:
+                            pass
+                        try:
+                            # Clear after attaching once.
+                            self._pending_gpt_advice = None
+                        except Exception:
+                            pass
             except Exception:
                 pass
             self._event_sink(evt)
@@ -5069,6 +5699,11 @@ class NiftyScalper:
         Resume when GPT returns risk_level=normal.
         """
         try:
+            if str(getattr(self.cfg, "strategy_name", "") or "").strip().lower() == "auto":
+                return
+        except Exception:
+            return
+        try:
             enabled = bool(getattr(self.cfg, "gpt_regime_monitor_enabled", False))
         except Exception:
             enabled = False
@@ -5262,6 +5897,11 @@ class NiftyScalper:
     # ---------------------------------------------------------------------------
     def _gpt_whatif_analysis(self) -> None:
         """Periodic GPT call: analyze risk of +/-1%, +/-2% moves on open positions."""
+        try:
+            if str(getattr(self.cfg, "strategy_name", "") or "").strip().lower() == "auto":
+                return
+        except Exception:
+            return
         try:
             enabled = bool(getattr(self.cfg, "gpt_whatif_enabled", False))
         except Exception:
@@ -6199,8 +6839,11 @@ class NiftyScalper:
             if max_pyr > 0:
                 for t in self.state.open_directional:
                     if t.get("name") == name:
-                        existing = t
-                        break
+                        t_sym = str(t.get("symbol") or "").strip().upper()
+                        new_sym = str(opt.get("symbol") or "").strip().upper()
+                        if t_sym == new_sym:
+                            existing = t
+                            break
                 if existing is not None:
                     try:
                         lev = int(existing.get("pyramid_level", 0) or 0)
@@ -6219,7 +6862,31 @@ class NiftyScalper:
         elif str(exchange).strip().upper() in {"NSEFO", "NFO"}:
             exchange = "NFO"
         token = opt.get("token")
+        strike = opt.get("strike")
+        opt_type = str(opt.get("option_type") or "CE" if "call" in str(name).lower() else "PE").strip().upper()
+        if opt_type in {"CALL", "C"}:
+            opt_type = "CE"
+        elif opt_type in {"PUT", "P"}:
+            opt_type = "PE"
+        expiry = opt.get("expiry")
         entry_price = self._try_get_ltp(symbol, exchange=exchange)
+        projected_legs = [
+            {
+                "symbol": symbol,
+                "token": token,
+                "exchange": exchange,
+                "side": entry_side,
+                "quantity": int(qty),
+                "entry_price": entry_price,
+                "strike": strike,
+                "option_type": opt_type,
+                "expiry": expiry,
+                "iv": opt.get("iv"),
+            }
+        ]
+        projected_legs = [self._annotate_leg_brackets(lg) for lg in projected_legs]
+        if not self._portfolio_caps_allow_legs(float(spot), projected_legs, context=f"directional {name}"):
+            return None
         # Optional: allow GPT gate TAKE to override price / liquidity checks
         gpt_forced_take = False
         try:
@@ -6318,6 +6985,7 @@ class NiftyScalper:
             p_price = f" @ {limit_price:.2f}" if limit_price else ""
             print(f"[PAPER] {entry_side} {symbol} x{qty} {order_type}{p_price}")
         else:
+            bracket = self._build_bracket_levels(entry_price=entry_price, side=entry_side, quantity=qty)
             self._place_order_with_retry(
                 symbol=symbol,
                 side=entry_side,
@@ -6326,6 +6994,9 @@ class NiftyScalper:
                 price=limit_price,
                 exchange=exchange,
                 symbol_token=str(token or "") or None,
+                stoploss=bracket.get("stoploss"),
+                target_price=bracket.get("targetPrice"),
+                trailing_stop_loss=bracket.get("trailingStopLoss"),
             )
 
         # IMPORTANT: Handle pyramiding BEFORE allocating a new trade_id.
@@ -6368,28 +7039,7 @@ class NiftyScalper:
             return existing
 
         trade_id = self._new_trade_id("D")
-        strike = opt.get("strike")
-        opt_type = str(opt.get("option_type") or "").strip().upper() or ("CE" if "call" in name else "PE")
-        if opt_type in {"CALL", "C"}:
-            opt_type = "CE"
-        elif opt_type in {"PUT", "P"}:
-            opt_type = "PE"
-        expiry = opt.get("expiry")
-
-        legs_for_trade: List[Dict[str, object]] = [
-            {
-                "symbol": symbol,
-                "token": token,
-                "exchange": exchange,
-                "side": entry_side,
-                "quantity": int(qty),
-                "entry_price": entry_price,
-                "strike": strike,
-                "option_type": opt_type,
-                "expiry": expiry,
-                "iv": opt.get("iv"),
-            }
-        ]
+        legs_for_trade: List[Dict[str, object]] = [dict(lg) for lg in projected_legs]
 
         tr: Dict[str, object] = {
             "trade_id": trade_id,
@@ -6419,19 +7069,17 @@ class NiftyScalper:
         self._note_opened_trade_type(position_type="directional", name=str(name))
 
         if self._has_event_sink():
-            legs = [
-                {
-                    "symbol": symbol,
-                    "token": token,
-                    "exchange": exchange,
-                    "side": entry_side,
-                    "quantity": int(qty),
-                    "entry_price": entry_price,
-                    "strike": strike,
-                    "option_type": opt_type,
-                    "expiry": expiry,
-                }
-            ]
+            legs = [self._annotate_leg_brackets({
+                "symbol": symbol,
+                "token": token,
+                "exchange": exchange,
+                "side": entry_side,
+                "quantity": int(qty),
+                "entry_price": entry_price,
+                "strike": strike,
+                "option_type": opt_type,
+                "expiry": expiry,
+            })]
             self._emit(
                 TradeLogEvent(
                     ts=time.time(),
@@ -6958,11 +7606,11 @@ class NiftyScalper:
                 root_hint = str(inferred_root or meta.get("delta_hedge_underlying") or "").strip().upper()
                 if root_hint in {"NIFTY", "BANKNIFTY"}:
                     print(
-                        f"[DELTA HEDGE] No hedge symbol configured for {root_hint}; set MSTOCK_DELTA_HEDGE_SYMBOL_{root_hint} or MSTOCK_DELTA_HEDGE_SYMBOL. Skipping hedging."
+                        f"[DELTA HEDGE] Using default hedge fallback for {root_hint}; set MSTOCK_DELTA_HEDGE_SYMBOL_{root_hint} or MSTOCK_DELTA_HEDGE_SYMBOL to override."
                     )
                 else:
                     print(
-                        "[DELTA HEDGE] No hedge symbol configured; set MSTOCK_DELTA_HEDGE_SYMBOL or an underlying-specific hedge symbol. Skipping hedging."
+                        "[DELTA HEDGE] No hedge symbol configured; delta hedge skipped because the underlying could not be inferred."
                     )
                 meta["delta_hedge_missing_warned"] = True
                 trade["meta"] = meta
@@ -8694,13 +9342,65 @@ class NiftyScalper:
             exchange = "NFO"
         if not symbol:
             raise RuntimeError("Option leg missing symbol; adjust option chain mapping.")
+        bracket = self._build_bracket_levels(
+            entry_price=opt.get("entry_price"),
+            side=side,
+            quantity=quantity,
+        )
         return self._place_order_with_retry(
             symbol=symbol,
             side=side,
             quantity=quantity,
             exchange=exchange,
             symbol_token=token,
+            stoploss=bracket.get("stoploss"),
+            target_price=bracket.get("targetPrice"),
+            trailing_stop_loss=bracket.get("trailingStopLoss"),
         )
+
+    def _place_multi_leg_transactional(
+        self,
+        legs_to_place: List[Tuple[dict, str, int]],
+        trade_name: str,
+        raw_legs: List[dict],
+        meta: Dict[str, Any],
+    ) -> None:
+        if not self.cfg.enable_live_trading:
+            print(f"[PAPER] Enter {trade_name}: " + ", ".join([f"{side} {leg.get('symbol')}" for leg, side, _ in legs_to_place]))
+            self._record_multi_trade_with_meta(trade_name, raw_legs, meta)
+            return
+
+        filled = []
+        try:
+            for leg_dict, side, qty in legs_to_place:
+                self._leg_order(leg_dict, side, qty)
+                filled.append((leg_dict, side, qty))
+            self._record_multi_trade_with_meta(trade_name, raw_legs, meta)
+        except Exception as exc:
+            print(f"[FATAL] Multi-leg placement failed for {trade_name} due to: {exc}")
+            print("[FAIL-SAFE] Triggering rollback execution to flatten filled legs...")
+            for leg_dict, original_side, qty in reversed(filled):
+                rollback_side = "SELL" if original_side == "BUY" else "BUY"
+                try:
+                    symbol = str(leg_dict.get("symbol") or "")
+                    exchange = str(leg_dict.get("exchange") or "").strip() or None
+                    if not exchange and str(symbol).strip().upper().endswith(("CE", "PE")):
+                        exchange = "NFO"
+                    elif str(exchange or "").strip().upper() in {"NSEFO", "NFO"}:
+                        exchange = "NFO"
+                    token = str(leg_dict.get("token") or "").strip() or None
+                    print(f"[FAIL-SAFE] EMERGENCY UNWIND: placing {rollback_side} market order for {symbol}")
+                    self.client.place_order(
+                        symbol=symbol,
+                        side=rollback_side,
+                        quantity=qty,
+                        exchange=exchange,
+                        symbol_token=token,
+                        order_type="MARKET",
+                    )
+                except Exception as unwind_exc:
+                    print(f"[FATAL WARNING] Failed to unwind {leg_dict.get('symbol')} during rollback: {unwind_exc}")
+            raise RuntimeError(f"Multi-leg transaction failed: {exc}")
 
     def _apply_delta_hedge_scope(self, trade: Dict[str, object], *, position_type: str) -> Dict[str, object]:
         """Enable/prepare delta-hedging meta based on cfg.delta_hedge_scope.
@@ -8765,6 +9465,7 @@ class NiftyScalper:
 
     def _record_multi_trade_with_meta(self, name: str, legs: List[dict], meta: Optional[Dict[str, object]]) -> None:
         trade_id = self._new_trade_id("M")
+        legs = [self._annotate_leg_brackets(dict(lg)) for lg in legs if isinstance(lg, dict)]
         payload: Dict[str, object] = {
             "trade_id": trade_id,
             "name": name,
@@ -8786,8 +9487,13 @@ class NiftyScalper:
             existing = None
             for t in self.state.open_multi:
                 if t.get("name") == name:
-                    existing = t
-                    break
+                    t_legs = t.get("legs") or []
+                    if isinstance(t_legs, list) and len(t_legs) == len(legs):
+                        t_syms = sorted([str(lg.get("symbol") or "").strip().upper() for lg in t_legs if isinstance(lg, dict)])
+                        new_syms = sorted([str(lg.get("symbol") or "").strip().upper() for lg in legs if isinstance(lg, dict)])
+                        if t_syms == new_syms:
+                            existing = t
+                            break
             if existing is not None:
                 try:
                     lev = int(existing.get("pyramid_level", 0) or 0)
@@ -9065,16 +9771,7 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: BUY {call.get('symbol')} + BUY {put.get('symbol')} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            return
-
-        self._leg_order(call, "BUY", qty)
-        self._leg_order(put, "BUY", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([(call, "BUY", qty), (put, "BUY", qty)], trade_name, legs, meta)
 
     def _get_dynamic_strike_distance(self, atr_val: Optional[float]) -> float:
         """Calculate dynamic strike distance based on ATR and configured multipliers.
@@ -9302,17 +9999,7 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: SELL {call.get('symbol')} + SELL {put.get('symbol')} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            return
-
-        # Live: place legs sequentially (not atomic).
-        self._leg_order(call, "SELL", qty)
-        self._leg_order(put, "SELL", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([(call, "SELL", qty), (put, "SELL", qty)], trade_name, legs, meta)
 
     def _enter_long_strangle(
         self,
@@ -9419,16 +10106,7 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: BUY {call.get('symbol')} @+{d} / BUY {put.get('symbol')} @-{d} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            return
-
-        self._leg_order(call, "BUY", qty)
-        self._leg_order(put, "BUY", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([(call, "BUY", qty), (put, "BUY", qty)], trade_name, legs, meta)
 
     def _enter_bull_call_spread(
         self,
@@ -9542,17 +10220,7 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: BUY {long_call.get('symbol')} / SELL {short_call.get('symbol')} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            return
-
-        # Live: buy long leg first, then sell short leg.
-        self._leg_order(long_call, "BUY", qty)
-        self._leg_order(short_call, "SELL", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([(long_call, "BUY", qty), (short_call, "SELL", qty)], trade_name, legs, meta)
 
     def _enter_bull_put_spread(
         self,
@@ -9670,17 +10338,7 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: BUY {long_put.get('symbol')} / SELL {short_put.get('symbol')} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            return
-
-        # Live: buy protection first, then sell short.
-        self._leg_order(long_put, "BUY", qty)
-        self._leg_order(short_put, "SELL", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([(long_put, "BUY", qty), (short_put, "SELL", qty)], trade_name, legs, meta)
 
     def _enter_call_ratio_backspread(
         self,
@@ -9792,17 +10450,7 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: BUY 2x {long_call.get('symbol')} / SELL {short_call.get('symbol')} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            return
-
-        # Live: buy long legs first, then sell short.
-        self._leg_order(long_call, "BUY", qty2)
-        self._leg_order(short_call, "SELL", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([(long_call, "BUY", qty2), (short_call, "SELL", qty)], trade_name, legs, meta)
 
     def _enter_put_ratio_backspread(
         self,
@@ -9914,16 +10562,7 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: BUY 2x {long_put.get('symbol')} / SELL {short_put.get('symbol')} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            return
-
-        self._leg_order(long_put, "BUY", qty2)
-        self._leg_order(short_put, "SELL", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([(long_put, "BUY", qty2), (short_put, "SELL", qty)], trade_name, legs, meta)
 
     def _enter_short_strangle(
         self,
@@ -10031,16 +10670,7 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: SELL {call.get('symbol')} @+{d} / SELL {put.get('symbol')} @-{d} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            return
-
-        self._leg_order(call, "SELL", qty)
-        self._leg_order(put, "SELL", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([(call, "SELL", qty), (put, "SELL", qty)], trade_name, legs, meta)
 
     def _enter_iron_condor(
         self,
@@ -10236,20 +10866,12 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: SELL {short_call.get('symbol')}, SELL {short_put.get('symbol')}, "
-                f"BUY {long_call.get('symbol')}, BUY {long_put.get('symbol')} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            return
-
-        # Live: place hedges first, then shorts (slightly safer).
-        self._leg_order(long_call, "BUY", qty)
-        self._leg_order(long_put, "BUY", qty)
-        self._leg_order(short_call, "SELL", qty)
-        self._leg_order(short_put, "SELL", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([
+            (long_call, "BUY", qty),
+            (long_put, "BUY", qty),
+            (short_call, "SELL", qty),
+            (short_put, "SELL", qty)
+        ], trade_name, legs, meta)
 
     def _enter_delta_hedged_long_straddle(
         self,
@@ -10355,22 +10977,7 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: BUY {call.get('symbol')} + BUY {put.get('symbol')} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            # Best-effort immediate hedge in paper mode.
-            try:
-                tr = self.state.open_multi[-1]
-                self._rebalance_delta_hedge(tr, spot=float(spot), force=True)
-            except Exception:
-                pass
-            return
-
-        self._leg_order(call, "BUY", qty)
-        self._leg_order(put, "BUY", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([(call, "BUY", qty), (put, "BUY", qty)], trade_name, legs, meta)
         try:
             tr = self.state.open_multi[-1]
             self._rebalance_delta_hedge(tr, spot=float(spot), force=True)
@@ -10482,21 +11089,7 @@ class NiftyScalper:
         ):
             return
 
-        if not self.cfg.enable_live_trading:
-            print(
-                f"[PAPER] Enter {trade_name}: SELL {call.get('symbol')} + SELL {put.get('symbol')} (spot={spot:.1f})"
-            )
-            self._record_multi_trade_with_meta(trade_name, legs, meta)
-            try:
-                tr = self.state.open_multi[-1]
-                self._rebalance_delta_hedge(tr, spot=float(spot), force=True)
-            except Exception:
-                pass
-            return
-
-        self._leg_order(call, "SELL", qty)
-        self._leg_order(put, "SELL", qty)
-        self._record_multi_trade_with_meta(trade_name, legs, meta)
+        self._place_multi_leg_transactional([(call, "SELL", qty), (put, "SELL", qty)], trade_name, legs, meta)
         try:
             tr = self.state.open_multi[-1]
             self._rebalance_delta_hedge(tr, spot=float(spot), force=True)
@@ -11084,21 +11677,7 @@ class NiftyScalper:
         if atr_val is not None and float(atr_val) > 0:
             self._cached_atr = float(atr_val)
 
-        # ---- #1: Apply IV percentile strategy bias to scores ----
-        try:
-            iv_biased = bool(getattr(self.cfg, "iv_filter_enabled", False))
-        except Exception:
-            iv_biased = False
-        if iv_biased:
-            iv_strat_bias = self._iv_percentile_strategy_bias()
-            if iv_strat_bias == "short_premium":
-                # High IV favors premium selling - reduce directional aggression
-                bull_score = max(0, bull_score - 1)
-                bear_score = max(0, bear_score - 1)
-            elif iv_strat_bias == "long_premium":
-                # Low IV favors premium buying - slight directional boost
-                bull_score = bull_score + 1
-                bear_score = bear_score + 1
+
 
         # Feed ATR into IV percentile history for position sizing.
         if atr_val is not None and float(atr_val) > 0:
@@ -11481,40 +12060,38 @@ class NiftyScalper:
             else:
                 range_bound = trend_strength <= float(ts_limit)
 
+            try:
+                if trend_strength > float(ts_limit):
+                    auto_regime = "trending"
+                elif float(atr_val) >= float(getattr(self.cfg, "straddle_atr_threshold", 0.0) or 0.0) and float(getattr(self.cfg, "straddle_atr_threshold", 0.0) or 0.0) > 0:
+                    auto_regime = "volatile"
+                elif rsi_val is not None and abs(float(rsi_val) - 50.0) < 8:
+                    auto_regime = "mean_reverting"
+                else:
+                    auto_regime = "quiet"
+            except Exception:
+                auto_regime = "quiet"
+            regime = auto_regime
+            regime_profile = get_regime_tuning(regime, self.cfg)
+
             router = self._strategy_router(
                 chain_available=bool(chain),
                 range_bound=bool(range_bound),
                 trend_strength=float(trend_strength),
-                ts_limit=float(ts_limit),
+                ts_limit=float(ts_limit) * float(regime_profile.get("trend_mult", 1.0) if isinstance(regime_profile, dict) else 1.0),
                 atr_val=float(atr_val),
                 atr_threshold=float(getattr(self.cfg, "straddle_atr_threshold", 0.0) or 0.0),
                 fast_ema=float(fast_ema) if fast_ema is not None else None,
                 slow_ema=float(slow_ema) if slow_ema is not None else None,
+                regime=regime,
+                regime_profile=regime_profile,
             )
             try:
                 self._note_strategy_considered([str(x) for x in list(router.get("candidates") or [])])
             except Exception:
                 pass
 
-            # P2: Multi-call strategy voting (override GPT auto-select when enabled)
-            try:
-                if getattr(self.cfg, "gpt_strategy_voting_enabled", False):
-                    vote_snapshot = {
-                        "open_trades": len(self.state.open_directional) + len(self.state.open_multi),
-                        "today_trades": int(self.state.trades_today),
-                        "stopouts_today": int(self.state.stopouts_today),
-                    }
-                    vote_result = self._gpt_multi_call_vote(
-                        candidates=list(self._gpt_allowed_strategies_for_auto()),
-                        snapshot=vote_snapshot,
-                    )
-                    if vote_result is not None:
-                        gpt_rec = vote_result
-            except Exception:
-                pass
-
-            # AUTO mode uses GPT strategy selection only. If GPT is unavailable,
-            # disabled, or returns an invalid strategy, skip the entry.
+            # AUTO mode prefers GPT strategy selection if active.
             try:
                 gpt_rec = self._gpt_auto_select_strategy(
                     chain=list(chain or []),
@@ -11525,127 +12102,37 @@ class NiftyScalper:
                     vwap_val=float(vwap_val) if vwap_val is not None else None,
                     call_atm=call,
                     put_atm=put,
-                    adx_val=adx_val,
-                    vol_sma=vol_sma,
-                    current_vol=current_vol,
                 )
             except Exception:
                 gpt_rec = None
 
-            if not gpt_rec:
-                # No GPT recommendation. Try to fall back to router's heuristic if available.
-                fallback = None
+            if gpt_rec:
                 try:
-                    fallback = router.get("selected") or (list(router.get("candidates") or [])[:1] or [None])[0]
+                    effective_strat = str(self._normalize_strategy_name(str(gpt_rec)))
                 except Exception:
-                    fallback = None
-
-                # If the user requires GPT recommendation, do not fall back.
+                    effective_strat = str(gpt_rec)
                 try:
-                    require_gpt = bool(getattr(self.cfg, "gpt_require_recommendation", False))
+                    self._last_auto_fallback_note = ""
                 except Exception:
-                    require_gpt = False
-
-                # Only enforce GPT-required behavior when GPT was actually enabled
-                # and an API key appears configured (i.e. we attempted a GPT call).
-                try:
-                    gpt_enabled = bool(getattr(self.cfg, "gpt_enable", False))
-                except Exception:
-                    gpt_enabled = False
-                try:
-                    api_key_env = (os.getenv("MSTOCK_GPT_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
-                except Exception:
-                    api_key_env = ""
-                attempted_gpt = bool(gpt_enabled and api_key_env)
-                # Inspect last GPT error to provide clearer router sources.
-                try:
-                    last_gpt_err = str(getattr(self, "_last_gpt_error", "") or "").strip()
-                except Exception:
-                    last_gpt_err = ""
-
-                if attempted_gpt and last_gpt_err:
+                    pass
+                self._last_router_snapshot = {
+                    "source": "gpt",
+                    "range_bound": bool(range_bound),
+                    "trend_strength": float(trend_strength),
+                    "ts_limit": float(ts_limit),
+                    "atr": float(atr_val),
+                    "selected": str(effective_strat),
+                    "candidates": list(router.get("candidates") or []),
+                }
+            else:
+                # No GPT recommendation.
+                # If we require a GPT recommendation, block entry here!
+                if bool(getattr(self.cfg, "gpt_enable", False)) and bool(getattr(self.cfg, "gpt_auto_select", True)) and bool(getattr(self.cfg, "gpt_require_recommendation", False)):
                     try:
-                        reason = last_gpt_err[:180]
-                        if str(getattr(self, "_last_auto_fallback_note", "") or "") != "gpt_error":
-                            print(f"[AUTO][GPT] analyze_market error; falling back to router: {reason}")
-                            self._last_auto_fallback_note = "gpt_error"
-                    except Exception:
-                        pass
-
-                if require_gpt and attempted_gpt and not last_gpt_err:
-                    try:
-                        # GPT successfully completed but returned no recommendation: enforce requirement and skip entry.
-                        note = "gpt_required_missing"
+                        note = "gpt_rec_required_but_missing"
                         if note != str(getattr(self, "_last_auto_fallback_note", "") or ""):
-                            print("[AUTO][GPT] no recommendation and gpt_require_recommendation enabled; skipping entry")
+                            print("[AUTO] GPT recommendation required but missing; skipping entry")
                             self._last_auto_fallback_note = str(note)
-                        try:
-                            self._gpt_skipped_required = int(getattr(self, "_gpt_skipped_required", 0)) + 1
-                        except Exception:
-                            pass
-                        # Record router snapshot indicating missing recommendation and block.
-                        try:
-                            self._last_router_snapshot = {
-                                "source": "gpt_required_missing",
-                                "range_bound": bool(range_bound),
-                                "trend_strength": float(trend_strength),
-                                "ts_limit": float(ts_limit),
-                                "atr": float(atr_val),
-                                "selected": None,
-                                "candidates": list(router.get("candidates") or []),
-                            }
-                        except Exception:
-                            pass
-                        return
-                    except Exception:
-                        pass
-                if require_gpt and not attempted_gpt:
-                    try:
-                        # GPT is required by config but not actually configured; fall back.
-                        print("[AUTO][GPT] gpt_require_recommendation set but GPT not configured; falling back to router heuristic")
-                    except Exception:
-                        pass
-
-                if fallback:
-                    try:
-                        if attempted_gpt:
-                            self._gpt_fallbacks = int(getattr(self, "_gpt_fallbacks", 0)) + 1
-                    except Exception:
-                        pass
-                    try:
-                        effective_strat = str(self._normalize_strategy_name(fallback))
-                    except Exception:
-                        effective_strat = str(fallback)
-                    try:
-                        note = f"gpt_fallback:{effective_strat}"
-                        if note != str(getattr(self, "_last_auto_fallback_note", "") or ""):
-                            print(f"[AUTO][GPT] no recommendation; falling back to {effective_strat}")
-                            self._last_auto_fallback_note = str(note)
-                    except Exception:
-                        pass
-                    self._last_router_snapshot = {
-                        "source": "gpt_fallback",
-                        "range_bound": bool(range_bound),
-                        "trend_strength": float(trend_strength),
-                        "ts_limit": float(ts_limit),
-                        "atr": float(atr_val),
-                        "selected": str(effective_strat),
-                        "candidates": list(router.get("candidates") or []),
-                    }
-                else:
-                    try:
-                        note = "gpt_missing"
-                        if note != str(getattr(self, "_last_auto_fallback_note", "") or ""):
-                            if attempted_gpt:
-                                print("[AUTO] No active trade signals found (GPT: no recommendation, Heuristics: no signal); skipping entry")
-                            else:
-                                print("[AUTO] No active trade signals found (Heuristics: no signal); skipping entry")
-                            self._last_auto_fallback_note = str(note)
-                    except Exception:
-                        pass
-                    try:
-                        if attempted_gpt and require_gpt:
-                            self._gpt_skipped_required = int(getattr(self, "_gpt_skipped_required", 0)) + 1
                     except Exception:
                         pass
                     self._last_router_snapshot = {
@@ -11658,23 +12145,41 @@ class NiftyScalper:
                         "candidates": list(router.get("candidates") or []),
                     }
                     return
-            else:
-                # Normalize GPT recommendation to an internal strategy key.
+
                 try:
-                    resolved = self._resolve_auto_strategy_candidate(str(gpt_rec or ""))
-                    if resolved:
-                        effective_strat = str(resolved)
-                    else:
-                        # Fall back to normalization for safety
-                        effective_strat = str(self._normalize_strategy_name(str(gpt_rec or "")))
+                    fallback = router.get("selected") or (list(router.get("candidates") or [])[:1] or [None])[0]
                 except Exception:
-                    effective_strat = str(gpt_rec)
+                    fallback = None
+
+                if not fallback:
+                    try:
+                        note = "router_missing"
+                        if note != str(getattr(self, "_last_auto_fallback_note", "") or ""):
+                            print("[AUTO] No active trade signals found (router: no signal); skipping entry")
+                            self._last_auto_fallback_note = str(note)
+                    except Exception:
+                        pass
+                    self._last_router_snapshot = {
+                        "source": "router_missing",
+                        "range_bound": bool(range_bound),
+                        "trend_strength": float(trend_strength),
+                        "ts_limit": float(ts_limit),
+                        "atr": float(atr_val),
+                        "selected": None,
+                        "candidates": list(router.get("candidates") or []),
+                    }
+                    return
+
+                try:
+                    effective_strat = str(self._normalize_strategy_name(str(fallback)))
+                except Exception:
+                    effective_strat = str(fallback)
                 try:
                     self._last_auto_fallback_note = ""
                 except Exception:
                     pass
                 self._last_router_snapshot = {
-                    "source": "gpt",
+                    "source": "router",
                     "range_bound": bool(range_bound),
                     "trend_strength": float(trend_strength),
                     "ts_limit": float(ts_limit),
@@ -12329,6 +12834,22 @@ class NiftyScalper:
                         # Choppy -> penalize both scores
                         bull_score = max(0, bull_score - 1)
                         bear_score = max(0, bear_score - 1)
+
+            # Apply IV percentile strategy bias to scores
+            try:
+                iv_biased = bool(getattr(self.cfg, "iv_filter_enabled", False))
+            except Exception:
+                iv_biased = False
+            if iv_biased:
+                iv_strat_bias = self._iv_percentile_strategy_bias()
+                if iv_strat_bias == "short_premium":
+                    # High IV favors premium selling - reduce directional aggression
+                    bull_score = max(0, bull_score - 1)
+                    bear_score = max(0, bear_score - 1)
+                elif iv_strat_bias == "long_premium":
+                    # Low IV favors premium buying - slight directional boost
+                    bull_score = bull_score + 1
+                    bear_score = bear_score + 1
 
             # Re-evaluate signals with new scores
             # Win-rate tracker check for strategy
@@ -13087,7 +13608,7 @@ class NiftyScalper:
             win = float(realized_pnl or 0.0) > 0.0
             
             # Get or create tracker for this strategy
-            tracker = dict(self._strategy_winrates.get(key, {}) or {})
+            tracker = dict(self._strategy_winrate.get(key, {}) or {})
             streak = int(tracker.get("streak", 0) or 0)
             wins = int(tracker.get("wins", 0) or 0)
             losses = int(tracker.get("losses", 0) or 0)
@@ -13106,7 +13627,7 @@ class NiftyScalper:
             tracker["losses"] = losses
             tracker["total"] = total
             tracker["last_ts"] = float(time.time())
-            self._strategy_winrates[key] = tracker
+            self._strategy_winrate[key] = tracker
             
             # Auto-disable on consecutive losses
             max_losses = int(getattr(self.cfg, "winrate_tracker_max_losses", 3) or 3)
@@ -14535,6 +15056,13 @@ class NiftyScalper:
 
                 self._manage_open_trades()
                 self._emit_paper_mtm_updates()
+
+                try:
+                    import json
+                    with open(".engine_diagnostics.json", "w") as f:
+                        json.dump(self.get_runtime_diagnostics(), f)
+                except Exception:
+                    pass
             except Exception as exc:  # noqa: BLE001
                 print(f"Error in strategy loop: {exc}")
 

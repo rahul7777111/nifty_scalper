@@ -4,7 +4,24 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
-print("ui.py script started...")
+# Load .env file explicitly so environment variables are available
+# regardless of VS Code terminal settings
+# Using override=True to ensure .env values take precedence over existing env vars
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path, override=True)
+        print(f"[ui] Loaded .env from {env_path} (with override)")
+    else:
+        print(f"[ui] No .env file found at {env_path}")
+except ImportError:
+    print("[ui] python-dotenv not installed, using existing environment")
+
+from logger_setup import setup_logging, get_logger
+
+logger = get_logger("ui")
+logger.info("ui.py script started...")
 
 import os
 import queue
@@ -21,13 +38,29 @@ from datetime import timedelta
 from tkinter import filedialog
 from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
+from collections import deque
 
 from pathlib import Path
 
-from auth import request_sms_otp, verify_sms_otp
+from auth import login_with_totp
 from config import load_api_config, load_persisted_env, load_strategy_config, persist_settings_env
 from mstock_client import MStockTypeBClient
 from strategy import NiftyScalper, TradeLogEvent
+
+# Backtest harness for Live Harness tab
+try:
+    from backtest_harness import (
+        BacktestResult, MultiLegTrade, TransactionCosts,
+        simulate_multi_leg, simulate_with_exit_optimizer,
+        calculate_sharpe_ratio, calculate_sortino_ratio, calculate_max_drawdown
+    )
+except ImportError:
+    # Fallback for direct script execution
+    from src.backtest_harness import (
+        BacktestResult, MultiLegTrade, TransactionCosts,
+        simulate_multi_leg, simulate_with_exit_optimizer,
+        calculate_sharpe_ratio, calculate_sortino_ratio, calculate_max_drawdown
+    )
 
 # Optional analytics + GPT integrations (kept best-effort so UI stays usable
 # even if the user hasn't configured GPT keys yet).
@@ -285,6 +318,12 @@ class ScalperUI(tk.Tk):
         self.access_token_var = tk.StringVar(value=os.getenv("MSTOCK_ACCESS_TOKEN", ""))
         self._dash_token_var = tk.StringVar(value="(set)" if self.access_token_var.get().strip() else "(not set)")
         self._app_status_var = tk.StringVar(value="Ready.")
+        
+        # Throttling intervals (in milliseconds) for adaptive API polling
+        self._throttle_option_ltp = 250
+        self._throttle_spot_ltp = 500
+        self._throttle_portfolio = 500
+        self._throttle_margin = 1000
 
         try:
             def _sync_dash_token(*_a: object) -> None:
@@ -301,6 +340,7 @@ class ScalperUI(tk.Tk):
         self._trade_state: dict[str, dict[str, object]] = {}
         self._client: MStockTypeBClient | None = None
         self._scalper: NiftyScalper | None = None
+        self._scripmaster_cache: dict[str, tuple[float | None, object]] = {}
 
         # Live dashboard portfolio snapshot.
         self._dash_portfolio_snapshot: dict[str, object] = {}
@@ -388,6 +428,8 @@ class ScalperUI(tk.Tk):
         self._login_state = _LoginState()
         self._bot_thread: threading.Thread | None = None
         self._bot_stop = threading.Event()
+        self._bot_start_ts: float = 0.0
+        self._engine_diag_last_snapshot: dict[str, object] = {}
 
         # Live analytics snapshots (fed via Strategy on_tick callback).
         self._latest_candles: list[Candle] = []
@@ -407,6 +449,16 @@ class ScalperUI(tk.Tk):
         self._load_prefilled_credentials()
         self._sync_credential_editability()
         self._sync_trade_log_visibility()
+        # Register UI callback for GPT advisor (best-effort)
+        try:
+            import gpt_advisor
+
+            try:
+                gpt_advisor.register_ui_callback(self._on_gpt_event)
+            except Exception:
+                pass
+        except Exception:
+            pass
         self.after(100, self._pump_logs)
         self.after(150, self._pump_trades)
         self.after(1000, self._pump_margin_required)
@@ -445,6 +497,21 @@ class ScalperUI(tk.Tk):
         self.live_var.trace_add("write", lambda *_: self._sync_trade_log_visibility())
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Debug helper: auto-start the bot when MSTOCK_AUTO_START is set (useful
+        # for reproducing trade population issues without manual clicks).
+        try:
+            if str(os.getenv("MSTOCK_AUTO_START", "") or "").strip().lower() in {"1", "true", "yes", "y"}:
+                # Give the UI a short moment to finish setup before starting.
+                try:
+                    self.after(1500, self._on_start)
+                except Exception:
+                    try:
+                        threading.Thread(target=self._on_start, daemon=True).start()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _refresh_pnl_totals(self) -> None:
         profit = 0.0
@@ -626,7 +693,7 @@ class ScalperUI(tk.Tk):
             threading.Thread(target=_worker, daemon=True).start()
         finally:
             # Keep the spot fairly fresh even when candles are slow.
-            self.after(500, self._pump_spot_ltp)
+            self.after(getattr(self, "_throttle_spot_ltp", 500), self._pump_spot_ltp)
 
     def _collect_open_legs_for_margin(self) -> list[dict]:
         legs_out: list[dict] = []
@@ -654,8 +721,18 @@ class ScalperUI(tk.Tk):
 
     def _is_closed_trade_state(self, trade_id: object, state: object) -> bool:
         try:
-            if str(trade_id).endswith("-H"):
-                return True
+            tid_s = str(trade_id or "")
+            if tid_s.endswith("-H"):
+                parent_id = tid_s[:-2]
+                trade_state = getattr(self, "_trade_state", {})
+                if parent_id in trade_state:
+                    parent_state = trade_state[parent_id]
+                    if isinstance(parent_state, dict):
+                        parent_status = str(parent_state.get("status") or "").strip().upper()
+                        if parent_status.startswith("CLOSED"):
+                            return True
+                        else:
+                            return False
         except Exception:
             pass
         if not isinstance(state, dict):
@@ -671,6 +748,17 @@ class ScalperUI(tk.Tk):
         exchange_raw = str(leg.get("exchange") or "").strip().upper()
         symbol = str(leg.get("symbol") or "").strip()
 
+        # Normalize "EXCH:TRADINGSYMBOL" into raw trading symbol.
+        if ":" in symbol:
+            try:
+                maybe_exch, maybe_sym = symbol.split(":", 1)
+                if maybe_exch.strip().upper() in {"NSE", "BSE", "NFO", "NSEFO", "NSECM", "BSECM"} and maybe_sym.strip():
+                    symbol = maybe_sym.strip()
+                    if not exchange_raw:
+                        exchange_raw = maybe_exch.strip().upper()
+            except Exception:
+                pass
+
         # Infer exchange for option legs when missing.
         if not exchange_raw:
             try:
@@ -682,7 +770,29 @@ class ScalperUI(tk.Tk):
             exchange_raw = "NFO"
         exchange = exchange_raw.strip()
 
-        if token.isdigit():
+        # If token is missing or not numeric, try to resolve it from symbol.
+        if (not token or not token.isdigit()) and symbol:
+            try:
+                if hasattr(client, "resolve_exchange_token"):
+                    resolved_exch, resolved_tok = client.resolve_exchange_token(symbol, exchange_hint=exchange)
+                    if resolved_tok is not None and str(resolved_tok).strip():
+                        token = str(resolved_tok).strip()
+                        try:
+                            leg["token"] = token
+                        except Exception:
+                            pass
+                    if resolved_exch is not None and str(resolved_exch).strip():
+                        exchange = str(resolved_exch).strip().upper()
+                        if exchange in {"NSEFO", "NFO"}:
+                            exchange = "NFO"
+                        try:
+                            leg["exchange"] = exchange
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        if token and token.isdigit():
             try:
                 key = f"{exchange}:{token}" if exchange else token
                 return float(client.get_ltp(key))
@@ -706,8 +816,8 @@ class ScalperUI(tk.Tk):
                 continue
             try:
                 side = str(leg.get("side") or "").strip().upper()
-                qty = int(leg.get("quantity") or 0)
-                entry = float(leg.get("entry_price")) if leg.get("entry_price") is not None else None
+                qty = self._get_leg_qty(leg) if hasattr(self, "_get_leg_qty") else ScalperUI._get_leg_qty(self, leg)
+                entry = float(leg.get("entry_price") if leg.get("entry_price") is not None else leg.get("entry", 0.0))
                 ltp = float(leg.get("ltp")) if leg.get("ltp") is not None else None
             except Exception:
                 continue
@@ -717,6 +827,58 @@ class ScalperUI(tk.Tk):
             sign = 1.0 if side == "BUY" else -1.0
             mtm += (float(ltp) - float(entry)) * sign * float(abs(qty))
         return float(mtm) if any_price else None
+
+    def _compute_realized_from_closed_legs(self, legs: list[dict]) -> float | None:
+        realized = 0.0
+        any_price = False
+        for leg in legs or []:
+            if not isinstance(leg, dict):
+                continue
+            try:
+                side = str(leg.get("side") or "").strip().upper()
+                qty = self._get_leg_qty(leg) if hasattr(self, "_get_leg_qty") else ScalperUI._get_leg_qty(self, leg)
+                entry = float(leg.get("entry_price") if leg.get("entry_price") is not None else leg.get("entry", 0.0))
+                exit_price = float(leg.get("exit_price")) if leg.get("exit_price") is not None else None
+            except Exception:
+                continue
+            if entry is None or exit_price is None or qty <= 0 or side not in {"BUY", "SELL"}:
+                continue
+            any_price = True
+            sign = 1.0 if side == "BUY" else -1.0
+            realized += (float(exit_price) - float(entry)) * sign * float(abs(qty))
+        return float(realized) if any_price else None
+
+    def _closed_trade_display_value(self, state: dict[str, object]) -> float | None:
+        for key in ("_closed_display_pnl", "realized"):
+            try:
+                raw = state.get(key)
+            except Exception:
+                raw = None
+            if raw is None:
+                continue
+            try:
+                return float(raw)
+            except Exception:
+                continue
+        try:
+            legs = state.get("legs") if isinstance(state.get("legs"), list) else []
+            realized = self._compute_realized_from_closed_legs(legs)
+            if realized is not None:
+                return realized
+        except Exception:
+            pass
+        for key in ("_closed_mtm", "mtm"):
+            try:
+                raw = state.get(key)
+            except Exception:
+                raw = None
+            if raw is None:
+                continue
+            try:
+                return float(raw)
+            except Exception:
+                continue
+        return None
 
     def _compute_parent_display_pnl_breakdown(self, trade_id: str, state: dict[str, object]) -> dict[str, float | None]:
         base_mtm: float | None
@@ -730,10 +892,28 @@ class ScalperUI(tk.Tk):
         if not isinstance(trade_state, dict):
             trade_state = {}
 
+        if self._is_closed_trade_state(trade_id, state):
+            closed_value = self._closed_trade_display_value(state)
+            return {
+                "base_mtm": closed_value,
+                "hedge_mtm": None,
+                "parent_mtm": closed_value,
+                "base_realized": closed_value,
+                "hedge_realized": None,
+                "parent_realized": closed_value,
+            }
+
         try:
             base_mtm = float(state.get("mtm")) if state.get("mtm") is not None else None
         except Exception:
             base_mtm = None
+        if base_mtm is None:
+            try:
+                legs_all = state.get("legs") if isinstance(state.get("legs"), list) else []
+                main_legs, hedge_opt_legs, _ = self._split_legs_for_display(legs_all)
+                base_mtm = self._compute_cached_trade_mtm(main_legs + hedge_opt_legs)
+            except Exception:
+                base_mtm = None
         try:
             base_realized = float(state.get("realized")) if state.get("realized") is not None else None
         except Exception:
@@ -778,6 +958,361 @@ class ScalperUI(tk.Tk):
             "parent_realized": parent_realized,
         }
 
+    # ---------------- GPT UI helpers ----------------
+    def _on_gpt_event(self, event: str, payload: dict) -> None:
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            line = f"[{ts}] {event}: {json.dumps(payload, ensure_ascii=False)[:1000]}\n"
+            try:
+                self._gpt_log_buf.append(line)
+            except Exception:
+                pass
+
+            # Update diagnostic variable briefly for visibility
+            try:
+                self._diag_gpt_var.set(f"GPT: {event} ({str(payload.get('status') or payload.get('model') or '')})")
+            except Exception:
+                pass
+
+            # Append to scrolled text widget (thread-safe via after)
+            def _append() -> None:
+                try:
+                    if self._gpt_text_widget is None:
+                        return
+                    self._gpt_text_widget.configure(state=tk.NORMAL)
+                    self._gpt_text_widget.insert(tk.END, line)
+                    self._gpt_text_widget.see(tk.END)
+                    self._gpt_text_widget.configure(state=tk.DISABLED)
+                except Exception:
+                    pass
+
+            try:
+                self.after(0, _append)
+            except Exception:
+                _append()
+        except Exception:
+            pass
+
+    def _clear_gpt_log(self) -> None:
+        try:
+            self._gpt_log_buf.clear()
+            if self._gpt_text_widget is not None:
+                self._gpt_text_widget.configure(state=tk.NORMAL)
+                self._gpt_text_widget.delete("1.0", tk.END)
+                self._gpt_text_widget.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    def _build_live_harness_tab(self) -> None:
+        """Build the Live Harness tab for backtesting and strategy optimization."""
+        parent = self.live_harness_frame
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_columnconfigure(0, weight=1)
+
+        # Main container
+        main_container = ttk.Frame(parent)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Parameters Section
+        param_labelframe = ttk.Labelframe(main_container, text="Backtest Parameters", padding=10)
+        param_labelframe.pack(fill=tk.X, pady=(0, 10))
+
+        # Strategy Type
+        ttk.Label(param_labelframe, text="Strategy:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        self.live_strategy_var = tk.StringVar(value="bull_call_spread")
+        strategy_cb = ttk.Combobox(
+            param_labelframe,
+            textvariable=self.live_strategy_var,
+            values=_STRATEGY_CHOICES,
+            width=30,
+        )
+        strategy_cb.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+
+        # Slippage
+        ttk.Label(param_labelframe, text="Slippage (bps):").grid(row=0, column=2, padx=(20, 5), pady=5, sticky=tk.W)
+        self.live_slippage_var = tk.StringVar(value="2.0")
+        ttk.Entry(param_labelframe, textvariable=self.live_slippage_var, width=10).grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
+
+        # Fee per order
+        ttk.Label(param_labelframe, text="Fee/order:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+        self.live_fee_var = tk.StringVar(value="0.0")
+        ttk.Entry(param_labelframe, textvariable=self.live_fee_var, width=10).grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
+
+        # Partial fill rate
+        ttk.Label(param_labelframe, text="Partial fill %:").grid(row=1, column=2, padx=(20, 5), pady=5, sticky=tk.W)
+        self.live_fill_var = tk.StringVar(value="1.0")
+        ttk.Entry(param_labelframe, textvariable=self.live_fill_var, width=10).grid(row=1, column=3, padx=5, pady=5, sticky=tk.W)
+
+        # Price series input
+        ttk.Label(param_labelframe, text="Price series (CSV or comma values):").grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
+        self.live_series_var = tk.StringVar(value="")
+        ttk.Entry(param_labelframe, textvariable=self.live_series_var, width=60).grid(row=2, column=1, columnspan=3, padx=5, pady=5, sticky=tk.W)
+
+        # Signals input
+        ttk.Label(param_labelframe, text="Signals (0/1 comma list):").grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
+        self.live_signals_var = tk.StringVar(value="")
+        ttk.Entry(param_labelframe, textvariable=self.live_signals_var, width=60).grid(row=3, column=1, columnspan=3, padx=5, pady=5, sticky=tk.W)
+
+        # Buttons
+        btn_frame = ttk.Frame(param_labelframe)
+        btn_frame.grid(row=4, column=0, columnspan=4, padx=5, pady=(10, 5))
+        ttk.Button(btn_frame, text="Load Live Candles", command=self._on_load_live_candles_lh).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="Run Backtest", command=self._on_run_live_backtest).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Clear", command=self._on_clear_live_harness).pack(side=tk.LEFT, padx=5)
+
+        # Results Section
+        results_labelframe = ttk.Labelframe(main_container, text="Results", padding=10)
+        results_labelframe.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        self.live_result_var = tk.StringVar(value="Run a backtest to see results...")
+        ttk.Label(results_labelframe, textvariable=self.live_result_var, wraplength=600).pack(anchor=tk.W, padx=5, pady=5)
+
+        # Results treeview
+        cols = ("metric", "value")
+        self.live_results_tree = ttk.Treeview(results_labelframe, columns=cols, show="headings", height=8)
+        self.live_results_tree.heading("metric", text="Metric")
+        self.live_results_tree.heading("value", text="Value")
+        self.live_results_tree.column("metric", width=200, stretch=False, anchor="w")
+        self.live_results_tree.column("value", width=300, stretch=True, anchor="w")
+        self.live_results_tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Optimization Section
+        opt_labelframe = ttk.Labelframe(main_container, text="Strategy Optimization", padding=10)
+        opt_labelframe.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(opt_labelframe, text="Optimize parameters for selected strategy using live market data.").grid(row=0, column=0, columnspan=3, padx=5, pady=5, sticky=tk.W)
+        ttk.Button(opt_labelframe, text="Run Optimization", command=self._on_run_optimization).grid(row=1, column=0, padx=5, pady=5)
+        ttk.Button(opt_labelframe, text="Apply Best Parameters", command=self._on_apply_optimization).grid(row=1, column=1, padx=5, pady=5)
+
+        self.live_opt_result_var = tk.StringVar(value="")
+        ttk.Label(opt_labelframe, textvariable=self.live_opt_result_var, wraplength=600).grid(row=2, column=0, columnspan=3, padx=5, pady=5, sticky=tk.W)
+
+    # ---------------- Live Harness Callbacks ----------------
+
+    def _on_load_live_candles_lh(self) -> None:
+        """Load live candles for backtesting."""
+        try:
+            from market_data import get_nifty_candles
+            candles = get_nifty_candles(interval="5min", days=1)
+            if not candles:
+                messagebox.showwarning("Load Live Candles", "No candle data available.")
+                return
+            prices = [c.close for c in candles if c.close > 0]
+            if not prices:
+                messagebox.showwarning("Load Live Candles", "No valid prices in candle data.")
+                return
+            self.live_series_var.set(", ".join(str(p) for p in prices))
+            messagebox.showinfo("Load Live Candles", f"Loaded {len(prices)} candles.")
+        except Exception as e:
+            messagebox.showerror("Load Live Candles", f"Failed to load candles: {e}")
+
+    def _on_run_live_backtest(self) -> None:
+        """Run backtest with current parameters."""
+        try:
+            import csv
+            from io import StringIO
+            # Parse inputs
+            series_str = str(self.live_series_var.get() or "").strip()
+            signals_str = str(self.live_signals_var.get() or "").strip()
+            strategy = str(self.live_strategy_var.get() or "bull_call_spread").strip()
+            slippage = float(str(self.live_slippage_var.get() or "2.0").strip())
+            fee = float(str(self.live_fee_var.get() or "0.0").strip())
+            fill_rate = float(str(self.live_fill_var.get() or "1.0").strip())
+
+            # Parse price series
+            prices = []
+            if series_str.endswith(".csv"):
+                with open(series_str, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        try:
+                            prices.append(float(row.get("close") or row.get("price") or 0))
+                        except Exception:
+                            continue
+            else:
+                prices = [float(x.strip()) for x in series_str.split(",") if x.strip()]
+
+            if len(prices) < 10:
+                messagebox.showwarning("Run Backtest", "Need at least 10 price points.")
+                return
+
+            # Parse signals if provided
+            signals = None
+            if signals_str:
+                signals = [int(x.strip()) for x in signals_str.split(",") if x.strip()]
+                if len(signals) < len(prices):
+                    signals = signals + [0] * (len(prices) - len(signals))
+                signals = signals[:len(prices)]
+
+            # Build transaction costs
+            costs = TransactionCosts(
+                brokerage_per_order=fee,
+                slippage_bps=slippage,
+            )
+
+            # Run simulation
+            result = simulate_with_exit_optimizer(
+                prices=prices,
+                signals=signals,
+                strategy_type=strategy,
+                costs=costs,
+                partial_fill_rate=fill_rate / 100.0,
+            )
+
+            # Display results
+            self.live_results_tree.delete(*self.live_results_tree.get_children())
+            metrics = [
+                ("Total P&L", f"{result.total_pnl:.2f}"),
+                ("Gross P&L", f"{result.gross_pnl:.2f}"),
+                ("Total Costs", f"{result.total_costs:.2f}"),
+                ("Num Trades", f"{result.num_trades}"),
+                ("Win Rate", f"{result.win_rate:.2%}"),
+                ("Sharpe Ratio", f"{result.sharpe_ratio:.2f}"),
+                ("Sortino Ratio", f"{result.sortino_ratio:.2f}"),
+                ("Max Drawdown", f"{result.max_drawdown:.2f}"),
+                ("Max DD %", f"{result.max_drawdown_pct:.2%}"),
+                ("Calmar Ratio", f"{result.calmar_ratio:.2f}"),
+            ]
+            for metric, value in metrics:
+                self.live_results_tree.insert("", tk.END, values=(metric, value))
+
+            self.live_result_var.set(f"Backtest complete: {result.num_trades} trades, P&L: {result.total_pnl:.2f}")
+
+        except Exception as e:
+            messagebox.showerror("Run Backtest", f"Backtest failed: {e}")
+            logger.exception("Live Harness backtest failed")
+
+    def _on_clear_live_harness(self) -> None:
+        """Clear Live Harness inputs and results."""
+        try:
+            self.live_series_var.set("")
+            self.live_signals_var.set("")
+            self.live_slippage_var.set("2.0")
+            self.live_fee_var.set("0.0")
+            self.live_fill_var.set("1.0")
+            self.live_results_tree.delete(*self.live_results_tree.get_children())
+            self.live_result_var.set("Run a backtest to see results...")
+            self.live_opt_result_var.set("")
+        except Exception:
+            pass
+
+    def _on_run_optimization(self) -> None:
+        """Run strategy parameter optimization."""
+        try:
+            from backtest_harness import ParameterGrid
+            series_str = str(self.live_series_var.get() or "").strip()
+            if not series_str:
+                messagebox.showwarning("Optimization", "Load price series first.")
+                return
+
+            prices = [float(x.strip()) for x in series_str.split(",") if x.strip()]
+            if len(prices) < 20:
+                messagebox.showwarning("Optimization", "Need at least 20 price points.")
+                return
+
+            # Define parameter grid for optimization
+            param_grid = ParameterGrid(
+                strategy_types=["bull_call_spread", "bear_put_spread", "iron_condor"],
+                slippage_bps=[1.0, 2.0, 5.0],
+                partial_fill_rates=[0.5, 0.8, 1.0],
+            )
+
+            best_result = None
+            best_sharpe = -float("inf")
+
+            for params in param_grid:
+                try:
+                    result = simulate_with_exit_optimizer(
+                        prices=prices,
+                        strategy_type=params["strategy_type"],
+                        costs=TransactionCosts(slippage_bps=params["slippage_bps"]),
+                        partial_fill_rate=params["partial_fill_rates"],
+                    )
+                    if result.sharpe_ratio > best_sharpe:
+                        best_sharpe = result.sharpe_ratio
+                        best_result = (params, result)
+                except Exception:
+                    continue
+
+            if best_result:
+                params, result = best_result
+                self.live_opt_result_var.set(
+                    f"Best: {params['strategy_type']}, "
+                    f"Sharpe: {result.sharpe_ratio:.2f}, "
+                    f"P&L: {result.total_pnl:.2f}"
+                )
+                self._live_best_params = params
+                messagebox.showinfo("Optimization", "Optimization complete. Apply best parameters?")
+            else:
+                self.live_opt_result_var.set("Optimization failed.")
+        except Exception as e:
+            messagebox.showerror("Optimization", f"Optimization failed: {e}")
+            logger.exception("Live Harness optimization failed")
+
+    def _on_apply_optimization(self) -> None:
+        """Apply best parameters from optimization."""
+        try:
+            if not hasattr(self, "_live_best_params") or not self._live_best_params:
+                messagebox.showwarning("Apply Optimization", "Run optimization first.")
+                return
+            params = self._live_best_params
+            self.live_strategy_var.set(params.get("strategy_type", "bull_call_spread"))
+            self.live_slippage_var.set(str(params.get("slippage_bps", 2.0)))
+            # Note: partial_fill_rates is a list, use first value
+            pfr = params.get("partial_fill_rates", 1.0)
+            if isinstance(pfr, list):
+                pfr = pfr[0] if pfr else 1.0
+            self.live_fill_var.set(str(float(pfr) * 100.0))
+            self.live_opt_result_var.set("Best parameters applied.")
+            messagebox.showinfo("Apply Optimization", "Best parameters applied.")
+        except Exception as e:
+            messagebox.showerror("Apply Optimization", f"Failed to apply: {e}")
+
+    def _export_gpt_log(self) -> None:
+        try:
+            fn = filedialog.asksaveasfilename(defaultextension=".log", filetypes=[("Log files", "*.log"), ("Text files", "*.txt" )], title="Save GPT log")
+            if not fn:
+                return
+            with open(fn, "w", encoding="utf-8") as f:
+                for l in list(self._gpt_log_buf):
+                    f.write(l)
+        except Exception as e:
+            try:
+                messagebox.showerror("Export GPT Log", f"Failed: {e}")
+            except Exception:
+                pass
+
+    # ---------------- Export trade log ----------------
+    def _export_trade_log(self) -> None:
+        try:
+            fn = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")], title="Export trade log")
+            if not fn:
+                return
+            import csv
+
+            with open(fn, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["trade_id", "status", "strategy", "margin_required", "mtm", "realized", "legs"])
+                for tid, st in (self._trade_state or {}).items():
+                    try:
+                        legs = json.dumps(st.get("legs") or [])
+                        writer.writerow([
+                            tid,
+                            str(st.get("status") or ""),
+                            str(st.get("strategy") or ""),
+                            str(st.get("margin_required") or ""),
+                            str(st.get("mtm") or ""),
+                            str(st.get("realized") or ""),
+                            legs,
+                        ])
+                    except Exception:
+                        continue
+        except Exception as e:
+            try:
+                messagebox.showerror("Export Trades", f"Failed to export trades: {e}")
+            except Exception:
+                pass
+
     def _compute_parent_display_pnl(
         self,
         trade_id: str,
@@ -786,6 +1321,439 @@ class ScalperUI(tk.Tk):
         """Return parent-display (mtm, realized), including hedge-underlying contribution."""
         breakdown = self._compute_parent_display_pnl_breakdown(trade_id, state)
         return breakdown.get("parent_mtm"), breakdown.get("parent_realized")
+
+    # ---------------- Trade Builder helpers (promoted to class methods) ----------------
+    def _tb_add_leg(self) -> None:
+        try:
+            typ = str(self._tb_leg_type_var.get() or "CE").strip().upper()
+            strike = float(str(self._tb_strike_var.get() or "0").strip())
+            side = str(self._tb_side_var.get() or "SELL").strip().upper()
+            qty = int(float(str(self._tb_qty_var.get() or "1").strip()))
+            price = float(str(self._tb_price_var.get() or "0").strip())
+            entry = {
+                "option_type": typ,
+                "strike": strike,
+                "side": side,
+                "quantity": qty,
+                "entry_price": price,
+                "underlying": str(self._tb_underlying_var.get() or "NIFTY").strip().upper(),
+                "expiry": str(self._tb_expiry_var.get() or "").strip(),
+                "symbol": f"{typ}_{int(strike)}",
+            }
+            entry = self._tb_resolve_leg_meta(entry)
+            self._tb_legs_listbox.insert(tk.END, f"{side} {typ} {int(strike)} x{qty} @ {price}")
+            legs = getattr(self, "_tb_legs", [])
+            legs.append(entry)
+            setattr(self, "_tb_legs", legs)
+            self._tb_recompute_preview()
+        except Exception:
+            pass
+
+    def _tb_remove_selected(self) -> None:
+        try:
+            sel = self._tb_legs_listbox.curselection()
+            if not sel:
+                return
+            idx = int(sel[0])
+            self._tb_legs_listbox.delete(idx)
+            legs = getattr(self, "_tb_legs", [])
+            if 0 <= idx < len(legs):
+                legs.pop(idx)
+            setattr(self, "_tb_legs", legs)
+            self._tb_recompute_preview()
+        except Exception:
+            pass
+
+    def _tb_clear(self) -> None:
+        try:
+            self._tb_legs_listbox.delete(0, tk.END)
+            setattr(self, "_tb_legs", [])
+            self._tb_recompute_preview()
+        except Exception:
+            pass
+
+    def _tb_resolve_leg_meta(self, entry: dict[str, object]) -> dict[str, object]:
+        try:
+            sc = getattr(self, "_scalper", None)
+            client = getattr(sc, "client", None) if sc is not None else None
+        except Exception:
+            client = None
+        if client is None:
+            return entry
+
+        try:
+            underlying = str(entry.get("underlying") or self._tb_underlying_var.get() or "").strip().upper()
+            expiry_raw = str(entry.get("expiry") or self._tb_expiry_var.get() or "").strip()
+            strike = float(entry.get("strike") or 0.0)
+            option_type = str(entry.get("option_type") or "").strip().upper()
+            chain = client._get_option_chain_from_csv(underlying)
+            if chain:
+                for row in chain:
+                    try:
+                        if str(row.get("option_type") or "").strip().upper() != option_type:
+                            continue
+                        if abs(float(row.get("strike") or 0.0) - strike) > 0.1:
+                            continue
+                        if expiry_raw:
+                            row_exp = row.get("expiry")
+                            if row_exp is None or str(row_exp).split(" ", 1)[0].strip() != expiry_raw:
+                                continue
+                        entry["exchange"] = str(row.get("exchange") or "NFO")
+                        entry["token"] = str(row.get("token") or "")
+                        entry["symbol"] = str(row.get("symbol") or entry.get("symbol") or "")
+                        entry["tradingsymbol"] = entry["symbol"]
+                        entry["broker_margin_capable"] = True
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return entry
+
+    def _tb_recompute_preview(self) -> None:
+        try:
+            legs = getattr(self, "_tb_legs", []) or []
+            net = 0.0
+            notional = 0.0
+            lot = 1
+            try:
+                import config as _cfg
+                lot = int(getattr(_cfg.load_strategy_config(), "lot_size", 65) or 65)
+            except Exception:
+                try:
+                    lot = int(os.getenv("MSTOCK_LOT_SIZE") or 65)
+                except Exception:
+                    lot = 65
+
+            for lg in legs:
+                try:
+                    p = float(lg.get("entry_price") or 0.0)
+                    q = int(lg.get("quantity") or 0)
+                    s = str(lg.get("side") or "SELL").strip().upper()
+                    sign = 1.0 if s == "SELL" else -1.0
+                    net += sign * p * float(q) * float(lot)
+                    notional += abs(p * float(q) * float(lot))
+                except Exception:
+                    continue
+
+            est_margin = None
+            try:
+                sc = getattr(self, "_scalper", None)
+                client = getattr(sc, "client", None) if sc is not None else None
+            except Exception:
+                client = None
+            if client is not None and hasattr(client, "estimate_trade_margin_required"):
+                try:
+                    est_margin = client.estimate_trade_margin_required(legs)
+                except Exception:
+                    est_margin = None
+            if est_margin is None:
+                est_margin = max(0.10 * notional, 500.0)
+            try:
+                self._tb_net_premium_var.set(f"₹{net:.2f}")
+                self._tb_est_margin_var.set(f"₹{est_margin:.2f}" + (" (broker)" if client is not None else ""))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _tb_simulate_trade(self) -> None:
+        try:
+            legs = getattr(self, "_tb_legs", []) or []
+            if not legs:
+                try:
+                    messagebox.showwarning("Trade Builder", "Add at least one leg before simulating")
+                except Exception:
+                    pass
+                return
+            sc = getattr(self, "_scalper", None)
+            if sc is None:
+                tid = f"M{int(time.time())}"
+            else:
+                try:
+                    tid = sc._new_trade_id("M")
+                except Exception:
+                    tid = f"M{int(time.time())}"
+
+            trade = {"trade_id": tid, "name": f"ui_{self._tb_strategy_var.get()}", "strategy": self._tb_strategy_var.get(), "opened_ts": time.time(), "meta": {"simulated": True}, "legs": list(legs)}
+            if sc is not None and hasattr(sc, "state") and hasattr(sc.state, "open_multi"):
+                sc.state.open_multi.append(trade)
+            try:
+                self._trade_state[trade["trade_id"]] = {"status": "OPEN", "strategy": trade.get("strategy"), "legs": trade.get("legs"), "mtm": 0.0, "margin_required": 0.0}
+            except Exception:
+                pass
+            try:
+                messagebox.showinfo("Trade Builder", f"Simulated trade {trade['trade_id']} added")
+            except Exception:
+                pass
+            self._tb_clear()
+        except Exception:
+            pass
+
+    # ---------------- Greeks actions ----------------
+    def _on_suggest_hedge(self) -> None:
+        try:
+            sc = getattr(self, "_scalper", None)
+            if sc is None or not hasattr(sc, "greeks_mgr"):
+                try:
+                    messagebox.showwarning("Greeks", "Strategy not running or GreeksManager unavailable")
+                except Exception:
+                    pass
+                return
+            try:
+                target = float(str(self._greeks_target_delta_var.get() or "0").strip())
+            except Exception:
+                target = 0.0
+            delta_needed = sc.greeks_mgr.suggest_delta_rebalance(target)
+            try:
+                messagebox.showinfo("Greeks", f"Suggested delta to trade: {delta_needed:.2f} (positive -> buy underlying)")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_apply_hedge(self) -> None:
+        try:
+            sc = getattr(self, "_scalper", None)
+            if sc is None or not hasattr(sc, "greeks_mgr"):
+                try:
+                    messagebox.showwarning("Greeks", "Strategy not running or GreeksManager unavailable")
+                except Exception:
+                    pass
+                return
+            try:
+                target = float(str(self._greeks_target_delta_var.get() or "0").strip())
+            except Exception:
+                target = 0.0
+            delta_needed = sc.greeks_mgr.suggest_delta_rebalance(target)
+            sign = "BUY" if delta_needed > 0 else "SELL"
+            qty = int(abs(round(delta_needed)))
+            if qty <= 0:
+                try:
+                    messagebox.showinfo("Greeks", "No hedge required (delta close to target)")
+                except Exception:
+                    pass
+                return
+            try:
+                tid = sc._new_trade_id("H") if hasattr(sc, "_new_trade_id") else f"H{int(time.time())}"
+            except Exception:
+                tid = f"H{int(time.time())}"
+            hedge_trade = {"trade_id": tid, "name": f"delta_hedge_{tid}", "strategy": "delta_hedge", "opened_ts": time.time(), "meta": {"simulated": True}, "legs": [{"symbol": f"UNDERLYING", "side": sign, "quantity": qty, "entry_price": None}]}
+            try:
+                if hasattr(sc, "state") and hasattr(sc.state, "open_multi"):
+                    sc.state.open_multi.append(hedge_trade)
+            except Exception:
+                pass
+            try:
+                self._trade_state[hedge_trade["trade_id"]] = {"status": "OPEN", "strategy": "delta_hedge", "legs": hedge_trade.get("legs"), "mtm": 0.0}
+            except Exception:
+                pass
+            try:
+                messagebox.showinfo("Greeks", f"Simulated hedge {tid} added: {sign} {qty} underlying units")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # ---------------- Backtest runner ----------------
+    def _on_load_live_candles(self) -> None:
+        try:
+            candles = list(self._latest_candles or [])
+            if not candles:
+                try:
+                    messagebox.showwarning("Live Simulation", "No active broker candle stream found. Please start the Bot first to begin streaming real-time candles.")
+                except Exception:
+                    pass
+                return
+            
+            prices = [float(c.close) for c in candles]
+            if len(prices) < 2:
+                try:
+                    messagebox.showwarning("Live Simulation", "Need at least 2 candle ticks to simulate.")
+                except Exception:
+                    pass
+                return
+            
+            # Compute a robust automated signal overlay (EMA Fast > EMA Slow crossover)
+            signals = []
+            try:
+                ema_fast = []
+                ema_slow = []
+                alpha_fast = 2.0 / (9.0 + 1.0)
+                alpha_slow = 2.0 / (20.0 + 1.0)
+                
+                curr_fast = prices[0]
+                curr_slow = prices[0]
+                
+                for p in prices:
+                    curr_fast = p * alpha_fast + curr_fast * (1.0 - alpha_fast)
+                    curr_slow = p * alpha_slow + curr_slow * (1.0 - alpha_slow)
+                    ema_fast.append(curr_fast)
+                    ema_slow.append(curr_slow)
+                    
+                for i in range(len(prices)):
+                    signals.append(1 if ema_fast[i] > ema_slow[i] else 0)
+            except Exception:
+                signals = [1 if i % 2 == 0 else 0 for i in range(len(prices))]
+                
+            self._bt_series_var.set(",".join(f"{p:.2f}" for p in prices))
+            self._bt_signals_var.set(",".join(str(s) for s in signals))
+            
+            try:
+                messagebox.showinfo("Live Simulation", f"Successfully synced {len(prices)} live candles and generated EMA crossover signals dynamically from the broker connection!")
+            except Exception:
+                pass
+            
+            # Automatically run the unified backtest & optimization immediately!
+            self._bt_run()
+        except Exception as e:
+            try:
+                messagebox.showerror("Live Simulation", f"Failed to sync live candles: {e}")
+            except Exception:
+                pass
+
+    def _bt_run(self) -> None:
+        try:
+            series_text = str(self._bt_series_var.get() or "").strip()
+            sig_text = str(self._bt_signals_var.get() or "").strip()
+            if not series_text or not sig_text:
+                try:
+                    messagebox.showwarning("Backtest", "Provide both price series and signals")
+                except Exception:
+                    pass
+                return
+            try:
+                if os.path.exists(series_text):
+                    import pandas as _pd
+                    df = _pd.read_csv(series_text, header=None)
+                    series = df.iloc[:, 0].astype(float).tolist()
+                else:
+                    series = [float(x) for x in series_text.replace("\n", ",").split(",") if str(x).strip()]
+            except Exception:
+                try:
+                    series = [float(x) for x in series_text.split(",") if str(x).strip()]
+                except Exception:
+                    messagebox.showerror("Backtest", "Invalid price series")
+                    return
+            try:
+                signals = [int(x) for x in sig_text.replace("\n", ",").split(",") if str(x).strip()]
+            except Exception:
+                try:
+                    signals = [int(x) for x in sig_text.split(",") if str(x).strip()]
+                except Exception:
+                    messagebox.showerror("Backtest", "Invalid signals")
+                    return
+            try:
+                slippage_bps = float(self._bt_slippage_var.get() or 0.0)
+            except Exception:
+                slippage_bps = 0.0
+            try:
+                fee_per_order = float(self._bt_fee_var.get() or 0.0)
+            except Exception:
+                fee_per_order = 0.0
+            try:
+                partial_fill_rate = float(self._bt_fill_var.get() or 1.0)
+            except Exception:
+                partial_fill_rate = 1.0
+            from backtest_harness import simulate_simple
+
+            pnl, trades = simulate_simple(
+                series,
+                signals,
+                slippage_bps=slippage_bps,
+                fee_per_order=fee_per_order,
+                partial_fill_rate=partial_fill_rate,
+                return_trades=True,
+            )
+            self._bt_last_trades = trades
+            gross = 0.0
+            fees = 0.0
+            slippage_cost = 0.0
+            for trade in trades:
+                try:
+                    gross += float(trade.get("gross_pnl", 0.0) or 0.0)
+                    fees += float(trade.get("fees", 0.0) or 0.0)
+                    slippage_cost += float(trade.get("slippage_cost", 0.0) or 0.0)
+                except Exception:
+                    continue
+            try:
+                self._bt_result_var.set(f"PnL {float(pnl):.2f} trades={len(trades)} gross={gross:.2f} fees={fees:.2f} slip={slippage_cost:.2f}")
+            except Exception:
+                pass
+
+            # --- AUTOMATED MULTI-SCENARIO OPTIMIZATION GRID SWEEP ---
+            try:
+                if hasattr(self, "unified_opt_results_tree"):
+                    for item in list(self.unified_opt_results_tree.get_children()):
+                        self.unified_opt_results_tree.delete(item)
+                    
+                    grid = [
+                        (slippage_bps, fee_per_order, partial_fill_rate),
+                        (max(0.0, slippage_bps - 1.0), fee_per_order, min(1.0, partial_fill_rate)),
+                        (slippage_bps + 1.0, fee_per_order * 1.5, max(0.25, partial_fill_rate - 0.25)),
+                    ]
+                    
+                    for slip, fee_val, fill_val in grid:
+                        opt_pnl, opt_trades = simulate_simple(
+                            series,
+                            signals,
+                            slippage_bps=slip,
+                            fee_per_order=fee_val,
+                            partial_fill_rate=fill_val,
+                            return_trades=True,
+                        )
+                        trade_count = len(opt_trades)
+                        winrate = 0.0
+                        try:
+                            wins_count = sum(1 for t in opt_trades if float(t.get("net_pnl", 0.0) or 0.0) > 0)
+                            winrate = (wins_count / trade_count * 100.0) if trade_count else 0.0
+                        except Exception:
+                            winrate = 0.0
+                        slip_cost = sum(float(t.get("slippage_cost", 0.0) or 0.0) for t in opt_trades) if opt_trades else 0.0
+                        
+                        tag = "neutral"
+                        try:
+                            opt_pnl_f = float(opt_pnl)
+                            if opt_pnl_f > 0:
+                                tag = "profit"
+                            elif opt_pnl_f < 0:
+                                tag = "loss"
+                        except Exception:
+                            tag = "neutral"
+                            
+                        self.unified_opt_results_tree.insert(
+                            "",
+                            tk.END,
+                            values=(
+                                f"{slip:.2f}",
+                                f"{fee_val:.2f}",
+                                f"{fill_val:.2f}",
+                                f"{float(opt_pnl):.2f}",
+                                trade_count,
+                                f"{winrate:.1f}%",
+                                f"{slip_cost:.2f}",
+                            ),
+                            tags=() if tag == "neutral" else (tag,),
+                        )
+            except Exception as grid_exc:
+                logger.error(f"Unified grid optimization sweep failed: {grid_exc}")
+
+            # --- SYNCHRONIZE STANDALONE OPTIMIZER TAB ---
+            try:
+                self._opt_series_var.set(series_text)
+                self._opt_signals_var.set(sig_text)
+                self._opt_slippage_var.set(str(slippage_bps))
+                self._opt_fee_var.set(str(fee_per_order))
+                self._opt_fill_var.set(str(partial_fill_rate))
+                self._run_backtest_comparison()
+            except Exception as sync_exc:
+                logger.debug(f"Syncing standalone optimizer tab failed: {sync_exc}")
+
+        except Exception as exc:
+            try:
+                messagebox.showerror("Backtest", f"Backtest failed: {exc}")
+            except Exception:
+                pass
 
     def _is_leg_stop_hit_for_display(self, *, side: str, ltp: float | None, stop_price: float | None) -> bool:
         try:
@@ -832,7 +1800,7 @@ class ScalperUI(tk.Tk):
                 continue
             leg_copy = dict(leg)
             try:
-                qty_live = int(leg_copy.get("quantity") or 0)
+                qty_live = self._get_leg_qty(leg_copy) if hasattr(self, "_get_leg_qty") else ScalperUI._get_leg_qty(self, leg_copy)
             except Exception:
                 qty_live = 0
             if qty_live <= 0:
@@ -893,7 +1861,7 @@ class ScalperUI(tk.Tk):
                 if not any(
                     isinstance(leg, dict)
                     and self._is_option_leg(leg)
-                    and int(leg.get("quantity") or 0) > 0
+                    and (self._get_leg_qty(leg) if hasattr(self, "_get_leg_qty") else ScalperUI._get_leg_qty(self, leg)) > 0
                     for leg in legs
                 ):
                     continue
@@ -935,7 +1903,7 @@ class ScalperUI(tk.Tk):
 
             threading.Thread(target=_worker, daemon=True).start()
         finally:
-            self.after(250, self._pump_option_ltp)
+            self.after(getattr(self, "_throttle_option_ltp", 250), self._pump_option_ltp)
 
     def _calc_live_margin_required(self, client: MStockTypeBClient, legs: list[dict]) -> float | None:
         total = 0.0
@@ -948,7 +1916,7 @@ class ScalperUI(tk.Tk):
                 exchange_raw = str(leg.get("exchange") or "").strip().upper()
                 symbol_raw = str(leg.get("symbol") or "").strip()
                 side = str(leg.get("side") or "").strip().upper() or None
-                quantity = int(leg.get("quantity") or 0)
+                quantity = self._get_leg_qty(leg) if hasattr(self, "_get_leg_qty") else ScalperUI._get_leg_qty(self, leg)
             except Exception:
                 continue
 
@@ -1095,7 +2063,7 @@ class ScalperUI(tk.Tk):
 
             threading.Thread(target=_worker, daemon=True).start()
         finally:
-            self.after(1000, self._pump_margin_required)
+            self.after(getattr(self, "_throttle_margin", 1000), self._pump_margin_required)
 
     def _pump_dashboard_portfolio(self) -> None:
         try:
@@ -1183,18 +2151,18 @@ class ScalperUI(tk.Tk):
                         except Exception:
                             pass
 
-                    eq_rows.append(
-                        {
-                            "symbol": symbol,
-                            "side": side,
-                            "qty": qty,
-                            "entry": entry,
-                            "ltp": ltp,
-                            "pnl": pnl,
-                            "stop": stop,
-                            "target": target,
-                        }
-                    )
+                    row = {
+                        "symbol": symbol,
+                        "side": side,
+                        "qty": qty,
+                        "entry": entry,
+                        "ltp": ltp,
+                        "pnl": pnl,
+                        "stop": stop,
+                        "target": target,
+                    }
+                    if self._is_meaningful_trade_row(row, equity=True):
+                        eq_rows.append(row)
 
                 opt_rows: list[dict[str, object]] = []
                 opt_exposure = 0.0
@@ -1377,26 +2345,52 @@ class ScalperUI(tk.Tk):
                                 pass
 
                         opt_leg_count += 1
-                        opt_rows.append(
-                            {
-                                "trade_id": trade_id,
-                                "strategy": str(st.get("strategy") or ""),
-                                "status": row_status,
-                                "symbol": sym,
-                                "side": side,
-                                "qty": qty,
-                                "entry": entry,
-                                "ltp": ltp,
-                                "mtm": trade_mtm_display,
-                                "base_mtm": base_mtm_display,
-                                "hedge_mtm": hedge_mtm_display,
-                                "leg_mtm": leg_mtm,
-                                "stop": stop_s,
-                                "target": tgt_s,
-                            }
-                        )
+                        row = {
+                            "trade_id": trade_id,
+                            "strategy": str(st.get("strategy") or ""),
+                            "status": row_status,
+                            "symbol": sym,
+                            "side": side,
+                            "qty": qty,
+                            "entry": entry,
+                            "ltp": ltp,
+                            "mtm": trade_mtm_display,
+                            "base_mtm": base_mtm_display,
+                            "hedge_mtm": hedge_mtm_display,
+                            "leg_mtm": leg_mtm,
+                            "stop": stop_s,
+                            "target": tgt_s,
+                        }
+                        if self._is_meaningful_trade_row(row, equity=False):
+                            opt_rows.append(row)
 
                 opt_trade_count = len(seen_trade_ids)
+
+                total_unrealized = 0.0
+                try:
+                    for r in eq_rows:
+                        if r.get("pnl") is not None:
+                            total_unrealized += float(r.get("pnl"))
+                    for tid_key, st_dict in trade_state_items:
+                        trade_id_str = str(tid_key or "").strip()
+                        if not trade_id_str:
+                            continue
+                        if trade_id_str.endswith("-H"):
+                            continue
+                        status_str = str(st_dict.get("status") or "").strip()
+                        if status_str.upper().startswith("CLOSED"):
+                            continue
+                        legs_list = st_dict.get("legs") or []
+                        any_open_leg = False
+                        for lg_item in legs_list:
+                            if isinstance(lg_item, dict) and self._get_leg_qty(lg_item) > 0:
+                                any_open_leg = True
+                                break
+                        if any_open_leg:
+                            pnl_break = self._compute_parent_display_pnl_breakdown(trade_id_str, st_dict)
+                            total_unrealized += float(pnl_break.get("parent_mtm") or 0.0)
+                except Exception:
+                    pass
 
                 total_exposure = float(eq_exposure + opt_exposure)
                 eq_ratio = (float(eq_exposure) / total_exposure) if total_exposure > 0 else 0.0
@@ -1413,6 +2407,7 @@ class ScalperUI(tk.Tk):
                     "equity_count": int(len(eq_rows)),
                     "option_leg_count": int(opt_leg_count),
                     "option_trade_count": int(opt_trade_count),
+                    "total_unrealized": float(total_unrealized),
                 }
 
                 def _apply() -> None:
@@ -1427,19 +2422,86 @@ class ScalperUI(tk.Tk):
 
             threading.Thread(target=_worker, daemon=True).start()
         finally:
-            self.after(500, self._pump_dashboard_portfolio)
+            self.after(getattr(self, "_throttle_portfolio", 500), self._pump_dashboard_portfolio)
 
     def _pump_engine_diagnostics(self) -> None:
         try:
             scalper = getattr(self, "_scalper", None)
-            if scalper is None:
-                return
-            getter = getattr(scalper, "get_runtime_diagnostics", None)
-            if not callable(getter):
-                return
-            snap = getter()
+            thread_alive = bool(self._bot_thread and self._bot_thread.is_alive())
+
+            ext_snap = None
+            try:
+                import json
+                if os.path.exists(".engine_diagnostics.json"):
+                    if time.time() - os.path.getmtime(".engine_diagnostics.json") < 300.0:
+                        with open(".engine_diagnostics.json", "r") as f:
+                            ext_snap = json.load(f)
+            except Exception:
+                pass
+
+            if scalper is None and ext_snap is None:
+                cached = getattr(self, "_engine_diag_last_snapshot", {})
+                if isinstance(cached, dict) and cached:
+                    snap = dict(cached)
+                else:
+                    start_ts = float(getattr(self, "_bot_start_ts", 0.0) or 0.0)
+                    start_age = time.time() - start_ts if start_ts > 0.0 else 0.0
+                    last_error = str(getattr(self, "_bot_last_error", "") or "").strip()
+                    if last_error:
+                        self._diag_router_var.set(f"Router: bot crashed ({last_error})")
+                        self._diag_gpt_var.set(f"GPT: bot crashed ({last_error})")
+                        self._diag_last_block_var.set(f"Last block: bot crashed ({last_error})")
+                        self._diag_top_block_var.set(f"Top block: bot crashed ({last_error})")
+                        self._diag_decisions_var.set(f"Decisions: bot crashed ({last_error})")
+                        self._diag_exec_var.set(f"Executed: bot crashed ({last_error})")
+                        self._diag_risk_var.set(f"Risk: bot crashed ({last_error})")
+                        self._diag_preset_req_var.set(f"GPT preset request: bot crashed ({last_error})")
+                        return
+                    if thread_alive or start_ts > 0.0:
+                        status = "starting" if start_age < 30.0 else "starting (no engine snapshot yet)"
+                    else:
+                        status = "not running"
+                    self._diag_router_var.set(f"Router: bot {status}")
+                    self._diag_gpt_var.set(f"GPT: bot {status}")
+                    self._diag_last_block_var.set(f"Last block: bot {status}")
+                    self._diag_top_block_var.set(f"Top block: bot {status}")
+                    self._diag_decisions_var.set(f"Decisions: bot {status}")
+                    self._diag_exec_var.set(f"Executed: bot {status}")
+                    self._diag_risk_var.set(f"Risk: bot {status}")
+                    self._diag_preset_req_var.set(f"GPT preset request: bot {status}")
+                    return
+
+            snap = None
+            if scalper is not None:
+                getter = getattr(scalper, "get_runtime_diagnostics", None)
+                if callable(getter):
+                    try:
+                        snap = getter()
+                    except Exception as _diag_exc:
+                        print(f"[UI] get_runtime_diagnostics failed: {_diag_exc}")
+
+            if not isinstance(snap, dict) and ext_snap is not None:
+                snap = dict(ext_snap)
+
             if not isinstance(snap, dict):
-                return
+                cached = getattr(self, "_engine_diag_last_snapshot", {})
+                if isinstance(cached, dict) and cached:
+                    snap = dict(cached)
+                else:
+                    self._diag_router_var.set("Router: waiting for first snapshot")
+                    self._diag_gpt_var.set("GPT: waiting for first snapshot")
+                    self._diag_last_block_var.set("Last block: waiting for first snapshot")
+                    self._diag_top_block_var.set("Top block: waiting for first snapshot")
+                    self._diag_decisions_var.set("Decisions: waiting for first snapshot")
+                    self._diag_exec_var.set("Executed: waiting for first snapshot")
+                    self._diag_risk_var.set("Risk: waiting for first snapshot")
+                    self._diag_preset_req_var.set("GPT preset request: waiting for first snapshot")
+                    return
+
+            try:
+                self._engine_diag_last_snapshot = dict(snap)
+            except Exception:
+                pass
 
             router = snap.get("router") if isinstance(snap.get("router"), dict) else {}
             sel = str(router.get("selected") or "n/a")
@@ -1462,7 +2524,7 @@ class ScalperUI(tk.Tk):
                 except Exception:
                     self._diag_gpt_var.set("GPT: n/a")
             else:
-                self._diag_gpt_var.set("GPT: n/a")
+                self._diag_gpt_var.set("GPT: attempts=0 recs=0 take=0 skip=0 fallbacks=0 skipped=0")
 
             # Enrich router display for GPT errors/timeouts
             try:
@@ -1488,7 +2550,10 @@ class ScalperUI(tk.Tk):
             alt_trade = str(lb.get("suggested_trade") or "").strip()
             alt_source = str(lb.get("suggestion_source") or "").strip()
             alt_suffix = f" | alt: {alt_trade} ({alt_source or 'policy'})" if alt_trade else ""
-            self._diag_last_block_var.set(f"Last block: {lb_code} | {lb_reason[:120]}{alt_suffix}")
+            if lb_code == "n/a" and lb_reason == "n/a":
+                self._diag_last_block_var.set("Last block: none yet")
+            else:
+                self._diag_last_block_var.set(f"Last block: {lb_code} | {lb_reason[:120]}{alt_suffix}")
 
             top_blocks = snap.get("top_block_codes")
             if isinstance(top_blocks, list) and top_blocks:
@@ -1501,7 +2566,7 @@ class ScalperUI(tk.Tk):
                         continue
                 self._diag_top_block_var.set("Top block: " + (", ".join(parts) if parts else "n/a"))
             else:
-                self._diag_top_block_var.set("Top block: n/a")
+                self._diag_top_block_var.set("Top block: none yet")
 
             top_dec = snap.get("top_decisions")
             if isinstance(top_dec, list) and top_dec:
@@ -1514,7 +2579,7 @@ class ScalperUI(tk.Tk):
                         continue
                 self._diag_decisions_var.set("Decisions: " + (", ".join(parts) if parts else "n/a"))
             else:
-                self._diag_decisions_var.set("Decisions: n/a")
+                self._diag_decisions_var.set("Decisions: none yet")
 
             top_exec = snap.get("top_selected")
             if isinstance(top_exec, list) and top_exec:
@@ -1527,7 +2592,7 @@ class ScalperUI(tk.Tk):
                         continue
                 self._diag_exec_var.set("Executed: " + (", ".join(parts) if parts else "n/a"))
             else:
-                self._diag_exec_var.set("Executed: n/a")
+                self._diag_exec_var.set("Executed: none yet")
 
             pr = snap.get("portfolio_risk") if isinstance(snap.get("portfolio_risk"), dict) else {}
             try:
@@ -1557,11 +2622,36 @@ class ScalperUI(tk.Tk):
                     f"GPT preset request: {req} (current={cur}, conf={conf:.2f}) | {reason[:110]}"
                 )
             else:
-                self._diag_preset_req_var.set("GPT preset request: n/a")
+                self._diag_preset_req_var.set("GPT preset request: none yet")
         except Exception:
             pass
         finally:
             self.after(1000, self._pump_engine_diagnostics)
+
+    def _bt_export_results(self) -> None:
+        try:
+            if not getattr(self, "_bt_last_trades", None):
+                try:
+                    messagebox.showwarning("Backtest", "No backtest results to export")
+                except Exception:
+                    pass
+                return
+            fn = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files","*.csv")])
+            if not fn:
+                return
+            import csv
+
+            with open(fn, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["trade_index","pnl"])
+                for i, t in enumerate(self._bt_last_trades.get("trades") or []):
+                    w.writerow([i, t])
+            try:
+                messagebox.showinfo("Backtest", f"Exported to {fn}")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _render_dashboard_portfolio(self, snapshot: dict[str, object]) -> None:
         visible_trade_ids: set[str] = set()
@@ -1604,12 +2694,40 @@ class ScalperUI(tk.Tk):
             ts_s = "n/a"
 
         try:
+            total_unrealized = float(snapshot.get("total_unrealized") or 0.0)
+        except Exception:
+            total_unrealized = 0.0
+
+        try:
             if hasattr(self, "_dash_portfolio_summary_var"):
                 self._dash_portfolio_summary_var.set(
                     f"Updated {ts_s} | Exposure: Equity ₹{eq_exp:.0f} ({eq_ratio*100:.0f}%) | "
                     f"Options ₹{opt_exp:.0f} ({opt_ratio*100:.0f}%) | "
-                    f"Counts: Eq {eq_count} | Opt {opt_trades} trades / {opt_legs} legs"
+                    f"Counts: Eq {eq_count} | Opt {opt_trades} trades / {opt_legs} legs | "
+                    f"Unrealized P&L: ₹{total_unrealized:.2f} | Live P&L: ₹{total_unrealized:.2f}"
                 )
+        except Exception:
+            pass
+
+        try:
+            pnl_ledger = getattr(self, "_pnl_ledger", None)
+            if isinstance(pnl_ledger, list) and pnl_ledger:
+                running = 0.0
+                peak = 0.0
+                max_drawdown = 0.0
+                for value in pnl_ledger:
+                    running += float(value)
+                    peak = max(peak, running)
+                    max_drawdown = min(max_drawdown, running - peak)
+                live_pnl = running + total_unrealized
+                if hasattr(self, "_dash_portfolio_summary_var"):
+                    self._dash_portfolio_summary_var.set(
+                        f"Updated {ts_s} | Exposure: Equity ₹{eq_exp:.0f} ({eq_ratio*100:.0f}%) | "
+                        f"Options ₹{opt_exp:.0f} ({opt_ratio*100:.0f}%) | "
+                        f"Counts: Eq {eq_count} | Opt {opt_trades} trades / {opt_legs} legs | "
+                        f"Realized P&L: ₹{running:.2f} | Unrealized P&L: ₹{total_unrealized:.2f} | "
+                        f"Live P&L: ₹{live_pnl:.2f} | Max DD: ₹{max_drawdown:.0f}"
+                    )
         except Exception:
             pass
 
@@ -1620,6 +2738,7 @@ class ScalperUI(tk.Tk):
                 for item in tree.get_children(""):
                     tree.delete(item)
                 rows = snapshot.get("option_rows")
+                rendered_any = False
                 if isinstance(rows, list):
                     for r in rows[:200]:
                         if not isinstance(r, dict):
@@ -1642,6 +2761,22 @@ class ScalperUI(tk.Tk):
                         mtm_s = "" if mtm is None else f"{float(mtm):.2f}"
                         base_mtm_s = "" if base_mtm is None else f"{float(base_mtm):.2f}"
                         hedge_mtm_s = "" if hedge_mtm is None else f"{float(hedge_mtm):.2f}"
+                        tag = "neutral"
+                        try:
+                            is_hedge = str(trade_id).endswith("-H") or str(r.get("strategy") or "").lower().endswith("hedge")
+                            if is_hedge:
+                                tag = "hedge"
+                            else:
+                                ref = mtm if mtm is not None else leg_mtm
+                                if ref is not None:
+                                    ref_f = float(ref)
+                                    if ref_f > 0:
+                                        tag = "profit"
+                                    elif ref_f < 0:
+                                        tag = "loss"
+                        except Exception:
+                            tag = "neutral"
+
                         tree.insert(
                             "",
                             tk.END,
@@ -1661,7 +2796,73 @@ class ScalperUI(tk.Tk):
                                 r.get("target"),
                                 r.get("status"),
                             ),
+                            tags=() if tag == "neutral" else (tag,),
                         )
+                        rendered_any = True
+                # Ensure delta-hedge trades (trade_id ending with -H) are visible
+                try:
+                    for tid, st in (self._trade_state or {}).items():
+                        try:
+                            if not isinstance(tid, str):
+                                continue
+                            if not tid.endswith("-H"):
+                                continue
+                            if tid in visible_trade_ids:
+                                continue
+                            if self._is_closed_trade_state(tid, st):
+                                continue
+                            legs = st.get("legs") if isinstance(st.get("legs"), list) else []
+                            if not legs:
+                                continue
+                            # Show first underlying hedge leg as a row
+                            leg = legs[0] if legs else {}
+                            symbol = str(leg.get("symbol") or leg.get("token") or "").strip()
+                            side = str(leg.get("side") or "").upper()
+                            qty = self._get_leg_qty(leg) if hasattr(self, "_get_leg_qty") else ScalperUI._get_leg_qty(self, leg)
+                            entry = leg.get("entry_price") if leg.get("entry_price") is not None else leg.get("entry")
+                            ltp = leg.get("ltp") if leg.get("ltp") is not None else None
+                            leg_mtm = None
+                            if ltp is not None and entry is not None and qty:
+                                try:
+                                    sign = 1.0 if side == "BUY" else -1.0
+                                    leg_mtm = (float(ltp) - float(entry)) * sign * float(abs(qty))
+                                except Exception:
+                                    leg_mtm = None
+                            mtm = float(st.get("mtm") or 0.0) if st.get("mtm") is not None else None
+                            base_mtm = st.get("base_mtm") if st.get("base_mtm") is not None else None
+                            hedge_mtm = st.get("hedge_mtm") if st.get("hedge_mtm") is not None else None
+                            entry_s = "" if entry is None else f"{float(entry):.2f}"
+                            ltp_s = "" if ltp is None else f"{float(ltp):.2f}"
+                            leg_mtm_s = "" if leg_mtm is None else f"{float(leg_mtm):.2f}"
+                            mtm_s = "" if mtm is None else f"{float(mtm):.2f}"
+                            base_mtm_s = "" if base_mtm is None else f"{float(base_mtm):.2f}"
+                            hedge_mtm_s = "" if hedge_mtm is None else f"{float(hedge_mtm):.2f}"
+                            tree.insert(
+                                "",
+                                tk.END,
+                                values=(
+                                    tid,
+                                    st.get("strategy") or "hedge",
+                                    symbol,
+                                    side,
+                                    qty,
+                                    entry_s,
+                                    ltp_s,
+                                    leg_mtm_s,
+                                    mtm_s,
+                                    base_mtm_s,
+                                    hedge_mtm_s,
+                                    st.get("stop"),
+                                    st.get("target"),
+                                    st.get("status"),
+                                ),
+                                tags=("hedge",),
+                            )
+                            visible_trade_ids.add(tid)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1697,6 +2898,17 @@ class ScalperUI(tk.Tk):
                         tgt = r.get("target")
                         stop_s = "" if stop is None else f"{float(stop):.2f}"
                         tgt_s = "" if tgt is None else f"{float(tgt):.2f}"
+                        tag = "neutral"
+                        try:
+                            if pnl is not None:
+                                pnl_f = float(pnl)
+                                if pnl_f > 0:
+                                    tag = "profit"
+                                elif pnl_f < 0:
+                                    tag = "loss"
+                        except Exception:
+                            tag = "neutral"
+
                         tree.insert(
                             "",
                             tk.END,
@@ -1710,7 +2922,19 @@ class ScalperUI(tk.Tk):
                                 stop_s,
                                 tgt_s,
                             ),
+                            tags=() if tag == "neutral" else (tag,),
                         )
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "_render_option_legs"):
+                self.after(0, self._render_option_legs)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_render_managed_positions"):
+                self.after(0, self._render_managed_positions)
         except Exception:
             pass
 
@@ -1726,6 +2950,35 @@ class ScalperUI(tk.Tk):
         except Exception:
             sym = ""
         return bool(sym.endswith("CE") or sym.endswith("PE"))
+
+    def _is_meaningful_symbol(self, value: object) -> bool:
+        try:
+            sym = str(value or "").strip()
+        except Exception:
+            return False
+        if not sym:
+            return False
+        if sym.upper() in {"N/A", "NA", "NONE", "NULL", "-", "0"}:
+            return False
+        return True
+
+    def _is_meaningful_trade_row(self, row: object, *, equity: bool) -> bool:
+        if not isinstance(row, dict):
+            return False
+        try:
+            if equity:
+                symbol = row.get("symbol")
+                side = str(row.get("side") or "").strip().upper()
+                qty = int(row.get("qty") or 0)
+                return self._is_meaningful_symbol(symbol) and side in {"BUY", "SELL"} and qty != 0
+
+            trade_id = str(row.get("trade_id") or "").strip()
+            symbol = row.get("symbol")
+            side = str(row.get("side") or "").strip().upper()
+            qty = int(row.get("qty") or 0)
+            return bool(trade_id) and self._is_meaningful_symbol(symbol) and side in {"BUY", "SELL"} and qty > 0
+        except Exception:
+            return False
 
     def _get_leg_qty(self, leg: dict[str, object]) -> int:
         """Return a best-effort absolute quantity for a leg."""
@@ -1744,6 +2997,65 @@ class ScalperUI(tk.Tk):
             qty = abs(qty)
         return qty
 
+    def _merge_trade_legs(self, previous_legs: list[dict] | None, new_legs: list[dict] | None) -> list[dict]:
+        if not new_legs:
+            return [dict(lg) for lg in previous_legs or [] if isinstance(lg, dict)]
+        if not previous_legs:
+            return [dict(lg) for lg in new_legs if isinstance(lg, dict)]
+
+        merged_legs = []
+        previous_by_symbol: dict[str, dict[str, object]] = {}
+        for prev_leg in previous_legs:
+            if isinstance(prev_leg, dict):
+                prev_symbol = str(prev_leg.get("symbol") or "").strip().upper()
+                if prev_symbol:
+                    previous_by_symbol[prev_symbol] = prev_leg
+
+        for leg in new_legs:
+            if isinstance(leg, dict):
+                leg_copy = dict(leg)
+                symbol = str(leg_copy.get("symbol") or "").strip().upper()
+                prev_leg = previous_by_symbol.get(symbol) if symbol else None
+                if isinstance(prev_leg, dict):
+                    # Unify quantity/qty merge
+                    qty_val = self._get_leg_qty(leg_copy) if hasattr(self, "_get_leg_qty") else ScalperUI._get_leg_qty(self, leg_copy)
+                    if qty_val <= 0:
+                        prev_qty = self._get_leg_qty(prev_leg) if hasattr(self, "_get_leg_qty") else ScalperUI._get_leg_qty(self, prev_leg)
+                        if prev_qty > 0:
+                            for qk in ("quantity", "qty", "netQty", "netqty"):
+                                if qk in leg_copy:
+                                    leg_copy[qk] = prev_qty
+                                if qk in prev_leg and qk not in leg_copy:
+                                    leg_copy[qk] = prev_qty
+
+                    for key in (
+                        "strike", "option_type", "expiry", "side", "entry_price", "token", "exchange",
+                        "prem_stop", "prem_target", "mtm_stop", "mtm_target", "spot_stop", "spot_target",
+                        "stop", "target", "stop_loss", "profit_target",
+                        "ltp", "exit_price"
+                    ):
+                        val = leg_copy.get(key)
+                        if key in {"ltp", "exit_price"}:
+                            try:
+                                val_f = float(val) if val is not None else None
+                            except Exception:
+                                val_f = None
+                            if val_f is None or val_f <= 0:
+                                prev_val = prev_leg.get(key)
+                                try:
+                                    prev_f = float(prev_val) if prev_val is not None else None
+                                except Exception:
+                                    prev_f = None
+                                if prev_f is not None and prev_f > 0:
+                                    leg_copy[key] = prev_f
+                        else:
+                            if val in (None, "") and prev_leg.get(key) not in (None, ""):
+                                leg_copy[key] = prev_leg.get(key)
+                merged_legs.append(leg_copy)
+            else:
+                merged_legs.append(leg)
+        return merged_legs
+
     def _format_leg_symbol_ui(self, leg: dict[str, object], *, include_hedge_tag: bool = False) -> str:
         """Return a compact user-friendly leg symbol for UI tables."""
         try:
@@ -1754,12 +3066,18 @@ class ScalperUI(tk.Tk):
         label = sym
         try:
             strike = leg.get("strike")
+            if strike is None:
+                strike = leg.get("display_strike")
             opt_type = str(leg.get("option_type") or "").upper().strip()
+            if not opt_type:
+                opt_type = str(leg.get("display_option_type") or "").upper().strip()
             expiry = leg.get("expiry")
+            if expiry is None:
+                expiry = leg.get("display_expiry")
         except Exception:
             strike, opt_type, expiry = None, "", None
 
-        if strike is not None or opt_type:
+        if strike is not None or opt_type or expiry is not None:
             try:
                 if strike is not None:
                     s_val = float(strike)
@@ -1786,6 +3104,10 @@ class ScalperUI(tk.Tk):
                 pieces.append(f"{s_str}")
             if opt_type:
                 pieces.append(opt_type)
+            if not s_str and not opt_type:
+                display_sym = sym.split(":", 1)[-1].strip() if sym else ""
+                if display_sym:
+                    pieces.append(display_sym)
             if pieces:
                 label = " ".join(pieces)
         else:
@@ -1801,7 +3123,7 @@ class ScalperUI(tk.Tk):
                     label = f"{digits} {opt}"
 
         if include_hedge_tag:
-            return f"HEDGE OPT: {label}"
+            return label
         return label
 
     def _qty_track_key(self, trade_id: str, leg: dict[str, object]) -> tuple[str, str] | None:
@@ -1973,6 +3295,32 @@ class ScalperUI(tk.Tk):
                     hedge_under.append(leg)
         return main, hedge_opts, hedge_under
 
+    def _first_display_expiry_from_legs(self, legs: list[dict]) -> object | None:
+        ctx = self._first_display_option_context_from_legs(legs)
+        return ctx.get("expiry")
+
+    def _first_display_option_context_from_legs(self, legs: list[dict]) -> dict[str, object]:
+        for leg in legs or []:
+            if not isinstance(leg, dict):
+                continue
+            try:
+                expiry = leg.get("expiry")
+                if expiry is None:
+                    expiry = leg.get("display_expiry")
+                strike = leg.get("strike")
+                if strike is None:
+                    strike = leg.get("display_strike")
+                opt_type = str(leg.get("option_type") or leg.get("display_option_type") or "").strip().upper()
+                if expiry not in (None, "") or strike not in (None, "") or opt_type:
+                    return {
+                        "expiry": expiry,
+                        "strike": strike,
+                        "option_type": opt_type,
+                    }
+            except Exception:
+                continue
+        return {}
+
     def _format_net_hedge_legs(self, hedge_legs: list[dict], *, include_flat: bool = True) -> str:
         """Return a compact net view for underlying hedge legs.
 
@@ -2066,7 +3414,7 @@ class ScalperUI(tk.Tk):
         parts: list[str] = []
         for sym in order:
             rec = by_symbol.get(sym) or {}
-            net = int(rec.get("net", 0.0) or 0.0)
+            net = int(rec.get("net",0.0) or 0.0)
             buy_q = int(rec.get("buy", 0.0) or 0.0)
             sell_q = int(rec.get("sell", 0.0) or 0.0)
             legs_count = int(rec.get("legs_count", 0.0) or 0.0)
@@ -2179,18 +3527,126 @@ class ScalperUI(tk.Tk):
         right.pack(side=tk.RIGHT, anchor="e")
 
         # Use these as the canonical control buttons (methods assume these names).
-        self.btn_request_otp = ttk.Button(right, text="Request OTP", command=self._on_request_otp)
-        self.btn_verify_otp = ttk.Button(right, text="Verify OTP", command=self._on_verify_otp)
+        self.btn_login_totp = ttk.Button(right, text="Login TOTP", command=self._on_login_totp)
         ttk.Separator(right, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         self.btn_start = ttk.Button(right, text="Start Bot", command=self._on_start)
         self.btn_stop = ttk.Button(right, text="Stop Bot", command=self._on_stop, state=tk.DISABLED)
 
-        self.btn_request_otp.pack(side=tk.LEFT)
-        self.btn_verify_otp.pack(side=tk.LEFT, padx=(8, 0))
+        self.btn_login_totp.pack(side=tk.LEFT)
         self.btn_start.pack(side=tk.LEFT, padx=(12, 0))
         self.btn_stop.pack(side=tk.LEFT, padx=(8, 0))
 
+        # Export trade log quick button
+        try:
+            self.btn_export_trades = ttk.Button(right, text="Export Trade Log", command=self._export_trade_log)
+            self.btn_export_trades.pack(side=tk.LEFT, padx=(8, 0))
+        except Exception:
+            self.btn_export_trades = None
+
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=(10, 0))
+
+    def _on_dash_opt_double_click(self, event) -> None:
+        try:
+            selection = self.dash_opt_tree.selection()
+            if not selection:
+                return
+            item = self.dash_opt_tree.item(selection[0])
+            trade_id = item["values"][0] if item["values"] else None
+            
+            # Navigate to Positions parent frame, then option legs sub-tab
+            self.notebook.select(self.positions_notebook_frame)
+            self.positions_notebook.select(self.option_legs_frame)
+            
+            # Focus/select the corresponding trade leg in the detailed page
+            if trade_id:
+                for child in self.option_legs_tree.get_children():
+                    values = self.option_legs_tree.item(child)["values"]
+                    if values and str(values[0]).strip() == str(trade_id).strip():
+                        self.option_legs_tree.selection_set(child)
+                        self.option_legs_tree.focus(child)
+                        self.option_legs_tree.see(child)
+                        break
+        except Exception as e:
+            logger.error(f"Error in _on_dash_opt_double_click: {e}")
+
+    def _on_dash_eq_double_click(self, event) -> None:
+        try:
+            selection = self.dash_eq_tree.selection()
+            if not selection:
+                return
+            item = self.dash_eq_tree.item(selection[0])
+            symbol = item["values"][0] if item["values"] else None
+            
+            # Navigate to Positions parent frame, then managed positions sub-tab
+            self.notebook.select(self.positions_notebook_frame)
+            self.positions_notebook.select(self.managed_positions_frame)
+            
+            # Focus/select the corresponding equity in the detailed page
+            if symbol:
+                for child in self.managed_positions_tree.get_children():
+                    values = self.managed_positions_tree.item(child)["values"]
+                    if values and str(values[0]).strip() == str(symbol).strip():
+                        self.managed_positions_tree.selection_set(child)
+                        self.managed_positions_tree.focus(child)
+                        self.managed_positions_tree.see(child)
+                        break
+        except Exception as e:
+            logger.error(f"Error in _on_dash_eq_double_click: {e}")
+
+    def _on_tab_changed(self, event=None) -> None:
+        try:
+            active_tab_id = self.notebook.select()
+            if not active_tab_id:
+                return
+            
+            tab_text = self.notebook.tab(active_tab_id, "text")
+            logger.info(f"Main Tab changed to: {tab_text}")
+            
+            if tab_text in {"Live Dashboard", "Open Positions", "Trade History"}:
+                self._throttle_option_ltp = 250
+                self._throttle_spot_ltp = 500
+                self._throttle_portfolio = 500
+                self._throttle_margin = 1000
+            else:
+                # Dial down intervals significantly when on idle tabs
+                self._throttle_option_ltp = 6000
+                self._throttle_spot_ltp = 6000
+                self._throttle_portfolio = 6000
+                self._throttle_margin = 10000
+                
+            logger.debug(f"Throttles updated (adaptive): option={self._throttle_option_ltp}ms, spot={self._throttle_spot_ltp}ms")
+        except Exception as e:
+            logger.error(f"Error in _on_tab_changed: {e}")
+
+    def _get_scripmaster_cached(self, csv_path: str):
+        path = str(csv_path or "").strip()
+        if not path:
+            return None
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return None
+
+        mtime: float | None
+        try:
+            mtime = float(p.stat().st_mtime)
+        except Exception:
+            mtime = None
+
+        cached = self._scripmaster_cache.get(path)
+        if cached is not None:
+            cached_mtime, cached_sm = cached
+            if mtime is None or cached_mtime == mtime:
+                return cached_sm
+
+        try:
+            from scripmaster import ScripMaster
+
+            sm = ScripMaster(path)
+        except Exception:
+            return None
+
+        self._scripmaster_cache[path] = (mtime, sm)
+        return sm
 
     def _build_widgets(self) -> None:
         # --- Global header (primary actions + live status) ---
@@ -2201,18 +3657,231 @@ class ScalperUI(tk.Tk):
         # doesn't become a long, crowded form as features grow.
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
+        # 7 Parent Frames
         self.dashboard_frame = ttk.Frame(self.notebook)
-        self.trade_frame = ttk.Frame(self.notebook)
-        self.signals_frame = ttk.Frame(self.notebook)
+        
+        self.positions_notebook_frame = ttk.Frame(self.notebook)
+        self.positions_notebook = ttk.Notebook(self.positions_notebook_frame)
+        self.positions_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.history_notebook_frame = ttk.Frame(self.notebook)
+        self.history_notebook = ttk.Notebook(self.history_notebook_frame)
+        self.history_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.analytics_notebook_frame = ttk.Frame(self.notebook)
+        self.analytics_notebook = ttk.Notebook(self.analytics_notebook_frame)
+        self.analytics_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.sim_notebook_frame = ttk.Frame(self.notebook)
+        self.sim_notebook = ttk.Notebook(self.sim_notebook_frame)
+        self.sim_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
         self.gpt_frame = ttk.Frame(self.notebook)
         self.settings_frame = ttk.Frame(self.notebook)
 
+        # Register Parent Tabs in Main Notebook
         self.notebook.add(self.dashboard_frame, text="Live Dashboard")
-        self.notebook.add(self.trade_frame, text="Trade Logs")
-        self.notebook.add(self.signals_frame, text="Signals/Greeks")
+        self.notebook.add(self.positions_notebook_frame, text="Open Positions")
+        self.notebook.add(self.history_notebook_frame, text="Trade History")
+        self.notebook.add(self.analytics_notebook_frame, text="Market Analytics")
+        self.notebook.add(self.sim_notebook_frame, text="Simulation & Test")
         self.notebook.add(self.gpt_frame, text="GPT Advisor")
         self.notebook.add(self.settings_frame, text="Settings")
+        
+        # Live Harness Tab (unified backtest + optimizer)
+        self.live_harness_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.live_harness_frame, text="Live Harness")
+        
+        # Build the Live Harness content
+        self._build_live_harness_tab()
+
+        # Now, create sub-frames inside their respective sub-notebooks
+        self.trade_frame = ttk.Frame(self.history_notebook)
+        self.journal_frame = ttk.Frame(self.history_notebook)
+        self.history_notebook.add(self.trade_frame, text="Trade Logs")
+        self.history_notebook.add(self.journal_frame, text="Trade Journal")
+        
+        self.signals_frame = ttk.Frame(self.analytics_notebook)
+        self.optimizer_frame = ttk.Frame(self.analytics_notebook)
+        self.analytics_notebook.add(self.signals_frame, text="Signals/Greeks")
+        self.analytics_notebook.add(self.optimizer_frame, text="Optimizer")
+        
+        self.builder_frame = ttk.Frame(self.sim_notebook)
+        self.sim_notebook.add(self.builder_frame, text="Trade Builder")
+
+        try:
+            bf2 = ttk.Frame(self.backtest_frame)
+            bf2.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            ttk.Label(bf2, text="Backtest Runner", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+            tb = ttk.Frame(bf2)
+            tb.pack(anchor="w", pady=(8,6))
+            ttk.Label(tb, text="Price series (CSV or comma values):").grid(row=0, column=0, sticky="w")
+            self._bt_series_var = tk.StringVar(value="")
+            ttk.Entry(tb, textvariable=self._bt_series_var, width=80).grid(row=0, column=1, sticky="w")
+            ttk.Button(tb, text="Load Example Series", command=lambda: self._bt_series_var.set("100,101,102,101,103,104,105")).grid(row=0, column=2, padx=(6,0))
+            ttk.Label(tb, text="Signals (0/1 comma list):").grid(row=1, column=0, sticky="w")
+            self._bt_signals_var = tk.StringVar(value="")
+            ttk.Entry(tb, textvariable=self._bt_signals_var, width=80).grid(row=1, column=1, sticky="w")
+            ttk.Button(tb, text="Load Example Signals", command=lambda: self._bt_signals_var.set("0,1,1,0,1,1,1")).grid(row=1, column=2, padx=(6,0))
+            ttk.Button(tb, text="Sync Live Broker Data & Run", command=self._on_load_live_candles, style="Accent.TButton").grid(row=0, column=3, rowspan=2, padx=(16,0), sticky="ns")
+
+            ttk.Label(tb, text="Slippage (bps):").grid(row=2, column=0, sticky="w")
+            self._bt_slippage_var = tk.StringVar(value="2.0")
+            ttk.Entry(tb, textvariable=self._bt_slippage_var, width=10).grid(row=2, column=1, sticky="w")
+
+            ttk.Label(tb, text="Fee / order:").grid(row=2, column=2, sticky="w", padx=(12, 0))
+            self._bt_fee_var = tk.StringVar(value="0.0")
+            ttk.Entry(tb, textvariable=self._bt_fee_var, width=10).grid(row=2, column=3, sticky="w")
+
+            ttk.Label(tb, text="Partial fill %:").grid(row=2, column=4, sticky="w", padx=(12, 0))
+            self._bt_fill_var = tk.StringVar(value="1.0")
+            ttk.Entry(tb, textvariable=self._bt_fill_var, width=10).grid(row=2, column=5, sticky="w")
+
+            ttk.Button(bf2, text="Run Backtest & Optimization", command=self._bt_run).pack(pady=(10,0))
+            self._bt_result_var = tk.StringVar(value="Result: n/a")
+            ttk.Label(bf2, textvariable=self._bt_result_var).pack(anchor="w", pady=(8,0))
+            ttk.Button(bf2, text="Export Backtest Results", command=self._bt_export_results).pack(pady=(6,0))
+            self._bt_last_trades = None
+
+            # Embed consolidated Stress-Test Optimization treeview
+            ttk.Label(bf2, text="Automated Stress-Test Optimization Sweep:", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(12, 4))
+            cols = ("slippage", "fee", "fill", "pnl", "trades", "winrate", "slip_cost")
+            self.unified_opt_results_tree = ttk.Treeview(bf2, columns=cols, show="headings", height=4)
+            for c, t in (("slippage", "Slippage (bps)"), ("fee", "Fee"), ("fill", "Fill %"), ("pnl", "PnL"), ("trades", "Trades"), ("winrate", "Win Rate"), ("slip_cost", "Slippage Cost")):
+                self.unified_opt_results_tree.heading(c, text=t)
+            for c, w in (("slippage", 110), ("fee", 80), ("fill", 80), ("pnl", 90), ("trades", 80), ("winrate", 80), ("slip_cost", 110)):
+                self.unified_opt_results_tree.column(c, width=w, stretch=True, anchor="e")
+            self.unified_opt_results_tree.pack(fill=tk.X, expand=False, pady=(0, 6))
+
+            # Configure premium tags for high-contrast color badging
+            try:
+                self.unified_opt_results_tree.tag_configure("profit", foreground="#10b981") # Mint Green
+                self.unified_opt_results_tree.tag_configure("loss", foreground="#f43f5e")   # Crimson Rose
+                self.unified_opt_results_tree.tag_configure("neutral", foreground="#333333")# Charcoal Slate
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            bf = ttk.Frame(self.builder_frame)
+            bf.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            ttk.Label(bf, text="Interactive Trade Builder", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+
+            form = ttk.Frame(bf)
+            form.pack(anchor="w", pady=(8, 6))
+            ttk.Label(form, text="Strategy:").grid(row=0, column=0, sticky="w")
+            self._tb_strategy_var = tk.StringVar(value="iron_condor")
+            ttk.Entry(form, textvariable=self._tb_strategy_var, width=20).grid(row=0, column=1, sticky="w")
+
+            ttk.Label(form, text="Underlying:").grid(row=0, column=2, sticky="w", padx=(12, 0))
+            self._tb_underlying_var = tk.StringVar(value="NIFTY")
+            ttk.Entry(form, textvariable=self._tb_underlying_var, width=12).grid(row=0, column=3, sticky="w")
+
+            ttk.Label(form, text="Expiry:").grid(row=0, column=4, sticky="w", padx=(12, 0))
+            self._tb_expiry_var = tk.StringVar(value="")
+            ttk.Entry(form, textvariable=self._tb_expiry_var, width=12).grid(row=0, column=5, sticky="w")
+
+            ttk.Label(form, text="Leg Type:").grid(row=1, column=0, sticky="w")
+            self._tb_leg_type_var = tk.StringVar(value="CE")
+            ttk.Combobox(form, values=("CE","PE"), textvariable=self._tb_leg_type_var, width=6).grid(row=1, column=1, sticky="w")
+
+            ttk.Label(form, text="Strike:").grid(row=1, column=2, sticky="w", padx=(12,0))
+            self._tb_strike_var = tk.StringVar(value="17850")
+            ttk.Entry(form, textvariable=self._tb_strike_var, width=10).grid(row=1, column=3, sticky="w")
+
+            ttk.Label(form, text="Side:").grid(row=1, column=4, sticky="w", padx=(12,0))
+            self._tb_side_var = tk.StringVar(value="SELL")
+            ttk.Combobox(form, values=("BUY","SELL"), textvariable=self._tb_side_var, width=6).grid(row=1, column=5, sticky="w")
+
+            ttk.Label(form, text="Qty:").grid(row=1, column=6, sticky="w", padx=(12,0))
+            self._tb_qty_var = tk.StringVar(value="1")
+            ttk.Entry(form, textvariable=self._tb_qty_var, width=6).grid(row=1, column=7, sticky="w")
+
+            ttk.Label(form, text="Price:").grid(row=1, column=8, sticky="w", padx=(12,0))
+            self._tb_price_var = tk.StringVar(value="1.0")
+            ttk.Entry(form, textvariable=self._tb_price_var, width=8).grid(row=1, column=9, sticky="w")
+
+            ttk.Button(form, text="Add Leg", command=self._tb_add_leg).grid(row=1, column=10, sticky="w", padx=(12,0))
+
+            # Legs list + preview
+            lower = ttk.Frame(bf)
+            lower.pack(fill=tk.BOTH, expand=True, pady=(10,0))
+            self._tb_legs_listbox = tk.Listbox(lower, height=6)
+            self._tb_legs_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            ctrl = ttk.Frame(lower)
+            ctrl.pack(side=tk.LEFT, padx=(8,0), fill=tk.Y)
+            ttk.Button(ctrl, text="Remove Selected", command=self._tb_remove_selected).pack(fill=tk.X)
+            ttk.Button(ctrl, text="Clear", command=self._tb_clear).pack(fill=tk.X, pady=(6,0))
+
+            preview = ttk.Frame(bf)
+            preview.pack(fill=tk.X, pady=(8,0))
+            ttk.Label(preview, text="Net Premium:").pack(side=tk.LEFT)
+            self._tb_net_premium_var = tk.StringVar(value="₹0.00")
+            ttk.Label(preview, textvariable=self._tb_net_premium_var).pack(side=tk.LEFT, padx=(6,20))
+            ttk.Label(preview, text="Est. Margin:").pack(side=tk.LEFT)
+            self._tb_est_margin_var = tk.StringVar(value="₹n/a")
+            ttk.Label(preview, textvariable=self._tb_est_margin_var).pack(side=tk.LEFT, padx=(6,20))
+
+            ttk.Button(bf, text="Simulate Trade", command=self._tb_simulate_trade).pack(pady=(10,0))
+        except Exception:
+            pass
+
+        try:
+            self._build_trade_journal_tab()
+        except Exception:
+            pass
+
+        try:
+            self._build_optimizer_allocator_tab()
+        except Exception:
+            pass
+
+        # --- GPT Advisor tab contents (mini-log + controls)
+        try:
+            gpt_inner = ttk.Frame(self.gpt_frame)
+            gpt_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            ttk.Label(gpt_inner, text="GPT Advisor - recent events", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            self._gpt_text_widget = ScrolledText(gpt_inner, height=12, wrap=tk.WORD)
+            self._gpt_text_widget.pack(fill=tk.BOTH, expand=True, pady=(6, 8))
+            btn_row = ttk.Frame(gpt_inner)
+            btn_row.pack(fill=tk.X)
+            ttk.Button(btn_row, text="Clear Log", command=self._clear_gpt_log).pack(side=tk.LEFT)
+            ttk.Button(btn_row, text="Export GPT Log", command=self._export_gpt_log).pack(side=tk.LEFT, padx=(6, 0))
+        except Exception:
+            self._gpt_text_widget = None
+
+        # --- Greeks dashboard inside Signals/Greeks tab ---
+        try:
+            greeks_inner = ttk.Frame(self.signals_frame)
+            greeks_inner.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            ttk.Label(greeks_inner, text="Greeks Dashboard", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            gframe = ttk.Frame(greeks_inner)
+            gframe.pack(anchor="w", pady=(8, 6))
+            ttk.Label(gframe, text="Delta:").grid(row=0, column=0, sticky="w")
+            self._greeks_delta_var = tk.StringVar(value="0.0")
+            ttk.Label(gframe, textvariable=self._greeks_delta_var).grid(row=0, column=1, sticky="w", padx=(6,12))
+            ttk.Label(gframe, text="Gamma:").grid(row=0, column=2, sticky="w")
+            self._greeks_gamma_var = tk.StringVar(value="0.0")
+            ttk.Label(gframe, textvariable=self._greeks_gamma_var).grid(row=0, column=3, sticky="w", padx=(6,12))
+            ttk.Label(gframe, text="Vega:").grid(row=0, column=4, sticky="w")
+            self._greeks_vega_var = tk.StringVar(value="0.0")
+            ttk.Label(gframe, textvariable=self._greeks_vega_var).grid(row=0, column=5, sticky="w", padx=(6,12))
+            ttk.Label(gframe, text="Theta:").grid(row=0, column=6, sticky="w")
+            self._greeks_theta_var = tk.StringVar(value="0.0")
+            ttk.Label(gframe, textvariable=self._greeks_theta_var).grid(row=0, column=7, sticky="w", padx=(6,12))
+
+            hedge_frame = ttk.Frame(greeks_inner)
+            hedge_frame.pack(anchor="w", pady=(8,0))
+            ttk.Label(hedge_frame, text="Target Delta:").pack(side=tk.LEFT)
+            self._greeks_target_delta_var = tk.StringVar(value="0.0")
+            ttk.Entry(hedge_frame, textvariable=self._greeks_target_delta_var, width=8).pack(side=tk.LEFT, padx=(6,8))
+            ttk.Button(hedge_frame, text="Suggest Hedge", command=self._on_suggest_hedge).pack(side=tk.LEFT)
+            ttk.Button(hedge_frame, text="Apply Hedge (Sim)", command=self._on_apply_hedge).pack(side=tk.LEFT, padx=(6,0))
+        except Exception:
+            pass
 
         # PnL/today stats (used in both the global totals bar and Live Dashboard).
         self._pnl_profit_var = tk.StringVar(value="₹0.00")
@@ -2230,6 +3899,10 @@ class ScalperUI(tk.Tk):
         self._diag_risk_var = tk.StringVar(value="Risk: n/a")
         self._diag_preset_req_var = tk.StringVar(value="GPT preset request: n/a")
 
+        # GPT mini-log buffer (in-memory, circular)
+        self._gpt_log_buf = deque(maxlen=200)
+        self._gpt_text_widget: ScrolledText | None = None
+
         # --- Live Dashboard ---
         outer = ttk.Frame(self.dashboard_frame)
         outer.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
@@ -2245,6 +3918,7 @@ class ScalperUI(tk.Tk):
         cards.grid_columnconfigure(0, weight=1)
         cards.grid_columnconfigure(1, weight=1)
         cards.grid_columnconfigure(2, weight=1)
+        cards.grid_columnconfigure(3, weight=1)
         cards.grid_rowconfigure(0, weight=1)
 
         # Bot status card
@@ -2287,6 +3961,19 @@ class ScalperUI(tk.Tk):
         ttk.Label(eng_card, textvariable=self._diag_risk_var).grid(row=6, column=0, sticky="w", pady=(4, 0))
         ttk.Label(eng_card, textvariable=self._diag_preset_req_var).grid(row=7, column=0, sticky="w", pady=(4, 0))
 
+        # Broker health card
+        broker_card = ttk.LabelFrame(cards, text="Broker Health")
+        broker_card.grid(row=0, column=3, sticky="nsew")
+        broker_card.grid_columnconfigure(1, weight=1)
+        self._broker_health_var = tk.StringVar(value="Idle")
+        self._broker_health_mode_var = tk.StringVar(value="Mode: n/a")
+        self._broker_health_detail_var = tk.StringVar(value="Details: n/a")
+        ttk.Label(broker_card, text="Status:").grid(row=0, column=0, sticky="w")
+        ttk.Label(broker_card, textvariable=self._broker_health_var).grid(row=0, column=1, sticky="w")
+        ttk.Label(broker_card, textvariable=self._broker_health_mode_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(broker_card, textvariable=self._broker_health_detail_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(broker_card, text="Refresh Health", command=self._refresh_broker_health).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
         # --- Portfolio (live) ---
         portfolio = ttk.Frame(outer)
         portfolio.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
@@ -2322,11 +4009,17 @@ class ScalperUI(tk.Tk):
         ttk.Label(dash_stats_row2, text="Margin Req:").pack(side=tk.LEFT)
         ttk.Label(dash_stats_row2, textvariable=self._margin_required_var).pack(side=tk.LEFT, padx=(6, 0))
 
-        opt_card = ttk.LabelFrame(portfolio, text="Options (Open Legs)")
-        opt_card.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        opt_card.grid_rowconfigure(0, weight=1)
-        opt_card.grid_columnconfigure(0, weight=1)
+        if not hasattr(self, "_broker_health_var"):
+            self._broker_health_var = tk.StringVar(value="Idle")
+            self._broker_health_mode_var = tk.StringVar(value="Mode: n/a")
+            self._broker_health_detail_var = tk.StringVar(value="Details: n/a")
 
+        # Open Option Legs Overview on Dashboard
+        opt_lf = ttk.LabelFrame(portfolio, text="Open Option Legs Overview (Double-click to view/manage)")
+        opt_lf.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        opt_lf.grid_rowconfigure(0, weight=1)
+        opt_lf.grid_columnconfigure(0, weight=1)
+        
         opt_cols = (
             "trade_id",
             "strategy",
@@ -2343,11 +4036,7 @@ class ScalperUI(tk.Tk):
             "tgt",
             "status",
         )
-        opt_area = ttk.Frame(opt_card)
-        opt_area.grid(row=0, column=0, sticky="nsew")
-        opt_area.grid_rowconfigure(0, weight=1)
-        opt_area.grid_columnconfigure(0, weight=1)
-        self.dash_opt_tree = ttk.Treeview(opt_area, columns=opt_cols, show="headings", height=8)
+        self.dash_opt_tree = ttk.Treeview(opt_lf, columns=opt_cols, show="headings", height=8, style="Compact.Treeview")
         for c, title in (
             ("trade_id", "ID"),
             ("strategy", "Strategy"),
@@ -2365,6 +4054,7 @@ class ScalperUI(tk.Tk):
             ("status", "Status"),
         ):
             self.dash_opt_tree.heading(c, text=title)
+            
         self.dash_opt_tree.column("trade_id", width=60, stretch=False, anchor="w")
         self.dash_opt_tree.column("strategy", width=120, stretch=True, anchor="w")
         self.dash_opt_tree.column("symbol", width=210, stretch=True, anchor="w")
@@ -2379,25 +4069,24 @@ class ScalperUI(tk.Tk):
         self.dash_opt_tree.column("sl", width=90, stretch=False, anchor="e")
         self.dash_opt_tree.column("tgt", width=90, stretch=False, anchor="e")
         self.dash_opt_tree.column("status", width=140, stretch=True, anchor="w")
-
-        opt_vsb = ttk.Scrollbar(opt_area, orient="vertical", command=self.dash_opt_tree.yview)
-        opt_hsb = ttk.Scrollbar(opt_area, orient="horizontal", command=self.dash_opt_tree.xview)
+        
+        opt_vsb = ttk.Scrollbar(opt_lf, orient="vertical", command=self.dash_opt_tree.yview)
+        opt_hsb = ttk.Scrollbar(opt_lf, orient="horizontal", command=self.dash_opt_tree.xview)
         self.dash_opt_tree.configure(yscrollcommand=opt_vsb.set, xscrollcommand=opt_hsb.set)
         self.dash_opt_tree.grid(row=0, column=0, sticky="nsew")
         opt_vsb.grid(row=0, column=1, sticky="ns")
         opt_hsb.grid(row=1, column=0, sticky="ew")
+        
+        self.dash_opt_tree.bind("<Double-Button-1>", self._on_dash_opt_double_click)
 
-        eq_card = ttk.LabelFrame(portfolio, text="Equities (Bot-managed Positions)")
-        eq_card.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
-        eq_card.grid_rowconfigure(0, weight=1)
-        eq_card.grid_columnconfigure(0, weight=1)
-
+        # Managed Equities Overview on Dashboard
+        eq_lf = ttk.LabelFrame(portfolio, text="Managed Equities Overview (Double-click to view/manage)")
+        eq_lf.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        eq_lf.grid_rowconfigure(0, weight=1)
+        eq_lf.grid_columnconfigure(0, weight=1)
+        
         eq_cols = ("symbol", "side", "qty", "entry", "ltp", "pnl", "sl", "tgt")
-        eq_area = ttk.Frame(eq_card)
-        eq_area.grid(row=0, column=0, sticky="nsew")
-        eq_area.grid_rowconfigure(0, weight=1)
-        eq_area.grid_columnconfigure(0, weight=1)
-        self.dash_eq_tree = ttk.Treeview(eq_area, columns=eq_cols, show="headings", height=6)
+        self.dash_eq_tree = ttk.Treeview(eq_lf, columns=eq_cols, show="headings", height=6, style="Compact.Treeview")
         for c, title in (
             ("symbol", "Symbol"),
             ("side", "Side"),
@@ -2409,6 +4098,7 @@ class ScalperUI(tk.Tk):
             ("tgt", "Target"),
         ):
             self.dash_eq_tree.heading(c, text=title)
+            
         self.dash_eq_tree.column("symbol", width=200, stretch=True, anchor="w")
         self.dash_eq_tree.column("side", width=60, stretch=False, anchor="w")
         self.dash_eq_tree.column("qty", width=70, stretch=False, anchor="e")
@@ -2417,13 +4107,25 @@ class ScalperUI(tk.Tk):
         self.dash_eq_tree.column("pnl", width=90, stretch=False, anchor="e")
         self.dash_eq_tree.column("sl", width=90, stretch=False, anchor="e")
         self.dash_eq_tree.column("tgt", width=90, stretch=False, anchor="e")
-
-        eq_vsb = ttk.Scrollbar(eq_area, orient="vertical", command=self.dash_eq_tree.yview)
-        eq_hsb = ttk.Scrollbar(eq_area, orient="horizontal", command=self.dash_eq_tree.xview)
+        
+        eq_vsb = ttk.Scrollbar(eq_lf, orient="vertical", command=self.dash_eq_tree.yview)
+        eq_hsb = ttk.Scrollbar(eq_lf, orient="horizontal", command=self.dash_eq_tree.xview)
         self.dash_eq_tree.configure(yscrollcommand=eq_vsb.set, xscrollcommand=eq_hsb.set)
         self.dash_eq_tree.grid(row=0, column=0, sticky="nsew")
         eq_vsb.grid(row=0, column=1, sticky="ns")
         eq_hsb.grid(row=1, column=0, sticky="ew")
+        
+        self.dash_eq_tree.bind("<Double-Button-1>", self._on_dash_eq_double_click)
+
+        # Configure custom modern HSL tags for beautiful high-contrast badges
+        for tree in (self.dash_opt_tree, self.dash_eq_tree):
+            try:
+                tree.tag_configure("profit", foreground="#10b981") # HSL Premium Mint Green
+                tree.tag_configure("loss", foreground="#f43f5e")   # HSL Premium Crimson Rose
+                tree.tag_configure("neutral", foreground="#333333")# Charcoal Slate
+                tree.tag_configure("hedge", foreground="#64748b")  # Balanced Steel Blue
+            except Exception:
+                pass
 
         # Analytics/Charts removed from UI.
 
@@ -2517,10 +4219,38 @@ class ScalperUI(tk.Tk):
         self.password_entry.grid(row=row, column=1, sticky="we", padx=5)
 
         row += 1
-        ttk.Label(frm, text="OTP").grid(row=row, column=0, sticky="w")
-        self.otp_var = tk.StringVar(value="")
-        self.otp_entry = ttk.Entry(frm, textvariable=self.otp_var, width=20)
-        self.otp_entry.grid(row=row, column=1, sticky="w", padx=5)
+        ttk.Label(frm, text="TOTP Secret").grid(row=row, column=0, sticky="w")
+        self.totp_secret_var = tk.StringVar(value="")
+        
+        # Sub-frame container to align entry and show/hide button on the same line
+        totp_frm = ttk.Frame(frm)
+        totp_frm.grid(row=row, column=1, sticky="w", padx=5)
+        
+        self.totp_secret_entry = ttk.Entry(totp_frm, textvariable=self.totp_secret_var, show="*", width=45)
+        self.totp_secret_entry.pack(side=tk.LEFT, padx=(0, 5))
+        
+        def toggle_totp_visibility():
+            if self.totp_secret_entry.cget("show") == "*":
+                self.totp_secret_entry.configure(show="")
+                show_btn.configure(text="Hide")
+            else:
+                self.totp_secret_entry.configure(show="*")
+                show_btn.configure(text="Show")
+                
+        show_btn = ttk.Button(totp_frm, text="Show", width=6, command=toggle_totp_visibility)
+        show_btn.pack(side=tk.LEFT)
+
+        # Or manually enter 6-digit dynamic TOTP Code from phone
+        row += 1
+        ttk.Label(frm, text="Or 6-Digit TOTP Code").grid(row=row, column=0, sticky="w")
+        self.totp_code_var = tk.StringVar(value="")
+        
+        totp_code_frm = ttk.Frame(frm)
+        totp_code_frm.grid(row=row, column=1, sticky="w", padx=5)
+        
+        self.totp_code_entry = ttk.Entry(totp_code_frm, textvariable=self.totp_code_var, width=15)
+        self.totp_code_entry.pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(totp_code_frm, text="(Enter manual 6-digit OTP code from Google Authenticator)", font=("Segoe UI", 8, "italic")).pack(side=tk.LEFT)
 
         # Strategy selection
         row += 1
@@ -2738,20 +4468,65 @@ class ScalperUI(tk.Tk):
         sm_row.grid(row=row, column=1, sticky="we", padx=5, pady=(10, 0))
         ttk.Entry(sm_row, textvariable=self.scripmaster_path_var, width=52).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        def _refresh_main_expiries(*args) -> None:
+        _main_expiry_refresh_after_id: str | None = None
+        _main_expiry_refresh_seq = 0
+        _main_expiry_cache: dict[tuple[str, str], list[str]] = {}
+
+        def _apply_main_expiry_values(values: list[str], seq: int) -> None:
+            nonlocal _main_expiry_refresh_seq
+            if seq != _main_expiry_refresh_seq:
+                return
+            try:
+                self.target_expiry_combo["values"] = values
+            except Exception:
+                pass
+
+        def _refresh_main_expiries_now() -> None:
+            nonlocal _main_expiry_refresh_seq
             # Prefer the UI field so browsing a new CSV updates immediately
             # (even if an older value is still present in the process env).
             sm_path = self.scripmaster_path_var.get().strip() or os.getenv("MSTOCK_SCRIPMASTER_PATH", "")
-            if sm_path and Path(sm_path).exists():
+            u = os.getenv("MSTOCK_UNDERLYING", os.getenv("MSTOCK_SYMBOL", "NIFTY"))
+            if not sm_path or not Path(sm_path).exists() or not u:
+                _apply_main_expiry_values([], _main_expiry_refresh_seq)
+                return
+
+            cache_key = (sm_path, str(u).strip().upper())
+            cached = _main_expiry_cache.get(cache_key)
+            if cached is not None:
+                _apply_main_expiry_values(cached, _main_expiry_refresh_seq)
+                return
+
+            _main_expiry_refresh_seq += 1
+            seq = _main_expiry_refresh_seq
+
+            def _worker() -> None:
+                values: list[str] = []
                 try:
-                    from scripmaster import ScripMaster
-                    sm = ScripMaster(sm_path)
-                    u = os.getenv("MSTOCK_UNDERLYING", os.getenv("MSTOCK_SYMBOL", "NIFTY"))
-                    exps = sm.get_available_expiries(u)
-                    if exps:
-                        self.target_expiry_combo["values"] = [d.strftime("%d-%m-%Y") for d in exps]
+                    sm = self._get_scripmaster_cached(sm_path)
+                    if sm is None:
+                        values = []
+                    else:
+                        exps = sm.get_available_expiries(u)
+                        values = [d.strftime("%d-%m-%Y") for d in exps] if exps else []
+                except Exception:
+                    values = []
+                _main_expiry_cache[cache_key] = values
+                try:
+                    self.after(0, lambda: _apply_main_expiry_values(values, seq))
                 except Exception:
                     pass
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def _refresh_main_expiries(*_args: object) -> None:
+            nonlocal _main_expiry_refresh_after_id
+            try:
+                if _main_expiry_refresh_after_id is not None:
+                    self.after_cancel(_main_expiry_refresh_after_id)
+            except Exception:
+                pass
+            _main_expiry_refresh_after_id = self.after(180, _refresh_main_expiries_now)
 
         _refresh_main_expiries()
         self.scripmaster_path_var.trace_add("write", _refresh_main_expiries)
@@ -2819,7 +4594,7 @@ class ScalperUI(tk.Tk):
         self.trade_tree.column("pos_type", width=85, stretch=False, anchor="w")
         self.trade_tree.column("strategy", width=110, stretch=False, anchor="w")
         # Keep Legs wide and non-stretch so horizontal scrolling can reveal long text.
-        self.trade_tree.column("legs", width=900, stretch=False, anchor="w")
+        self.trade_tree.column("legs", width=820, stretch=False, anchor="w")
         self.trade_tree.column("mtm", width=90, stretch=False, anchor="e")
         self.trade_tree.column("realized", width=80, stretch=False, anchor="e")
         # Status may also contain hedge summaries; keep it wide enough.
@@ -2836,11 +4611,10 @@ class ScalperUI(tk.Tk):
         tree_area.grid_rowconfigure(0, weight=1)
         tree_area.grid_columnconfigure(0, weight=1)
 
-        # Row color-coding (profit/loss).
         try:
-            self.trade_tree.tag_configure("profit", foreground="green")
-            self.trade_tree.tag_configure("loss", foreground="red")
-            self.trade_tree.tag_configure("hedge", foreground="gray")
+            self.trade_tree.tag_configure("profit", foreground="#10b981") # HSL Premium Mint Green
+            self.trade_tree.tag_configure("loss", foreground="#f43f5e")   # HSL Premium Crimson Rose
+            self.trade_tree.tag_configure("hedge", foreground="#64748b")  # Balanced Steel Blue
         except Exception:
             pass
 
@@ -2849,6 +4623,15 @@ class ScalperUI(tk.Tk):
         self._trade_ctx_menu = tk.Menu(self, tearoff=0)
         self._trade_ctx_menu.add_command(label="Manually Exit Leg", command=self._trade_ctx_manual_exit)
         self.trade_tree.bind("<Button-3>", self._trade_tree_right_click)
+
+        # --- Open Option Legs tab + Managed Positions tab ---
+        self.option_legs_frame = ttk.Frame(self.positions_notebook)
+        self.positions_notebook.add(self.option_legs_frame, text="Open Option Legs")
+        self._build_option_legs_tab()
+
+        self.managed_positions_frame = ttk.Frame(self.positions_notebook)
+        self.positions_notebook.add(self.managed_positions_frame, text="Managed Positions")
+        self._build_managed_positions_tab()
 
         # --- Signals/Greeks tab ---
         self._build_signals_tab()
@@ -3149,6 +4932,39 @@ class ScalperUI(tk.Tk):
         ent_key.grid(row=0, column=1, sticky="we", padx=8, pady=4)
         add_tooltip(lbl_key, "Your AICredits API key (OpenAI-compatible). Required.")
 
+        # Option to persist API key (explicit)
+        self.gpt_persist_api_key_var = tk.BooleanVar(value=False)
+        def _on_persist_api_key_changed() -> None:
+            if self.gpt_persist_api_key_var.get():
+                # show a brief warning when enabling
+                try:
+                    messagebox.showwarning(
+                        "Persist API Key",
+                        "Persisting the API key to .scalper.env will store it on disk in the repository root.\nOnly enable if you understand the security implications.",
+                    )
+                except Exception:
+                    pass
+
+        ttk.Checkbutton(
+            cfg,
+            text="Persist API key to .scalper.env (unsafe)",
+            variable=self.gpt_persist_api_key_var,
+            command=_on_persist_api_key_changed,
+        ).grid(row=0, column=2, sticky="w", padx=8, pady=4)
+
+        # Show API key checkbox (reveal/hide)
+        def _toggle_show_key():
+            try:
+                if bool(getattr(self, "_gpt_show_key_var", tk.BooleanVar()).get()):
+                    ent_key.configure(show="")
+                else:
+                    ent_key.configure(show="*")
+            except Exception:
+                pass
+
+        self._gpt_show_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cfg, text="Show API key", variable=self._gpt_show_key_var, command=_toggle_show_key).grid(row=0, column=3, sticky="w", padx=8, pady=4)
+
         # Model
         lbl_model = ttk.Label(cfg, text="Model:")
         lbl_model.grid(row=1, column=0, sticky="w", padx=8, pady=4)
@@ -3212,6 +5028,559 @@ class ScalperUI(tk.Tk):
         summary = ttk.Label(out, textvariable=self.gpt_summary_var, font=("Segoe UI", 10, "bold"), foreground="#225522")
         summary.pack(fill=tk.X, padx=6, pady=4)
 
+    def _build_option_legs_tab(self) -> None:
+        root = ttk.Frame(self.option_legs_frame)
+        root.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        ttk.Label(root, text="Open Option Legs", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(
+            root,
+            text="MTM = (LTP - Entry) * Qty for BUY, (Entry - LTP) * Qty for SELL. Trade MTM = Base MTM + Hedge MTM.",
+        ).pack(anchor="w", pady=(2, 6))
+        btns = ttk.Frame(root)
+        btns.pack(fill=tk.X, expand=False, pady=(6, 8))
+        ttk.Button(btns, text="Refresh", command=self._render_option_legs).pack(side=tk.LEFT)
+
+        style = ttk.Style()
+        try:
+            style.configure("Compact.Treeview", rowheight=20, font=("Segoe UI", 9))
+            style.configure("Compact.Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        except Exception:
+            pass
+
+        tree_area = ttk.Frame(root)
+        tree_area.pack(fill=tk.BOTH, expand=True)
+
+        opt_cols = (
+            "trade_id",
+            "strategy",
+            "symbol",
+            "side",
+            "qty",
+            "entry",
+            "ltp",
+            "leg_mtm",
+            "trade_mtm",
+            "base_mtm",
+            "hedge_mtm",
+            "sl",
+            "tgt",
+            "status",
+        )
+
+        self.option_legs_tree = ttk.Treeview(tree_area, columns=opt_cols, show="headings", height=16, style="Compact.Treeview")
+        for c, title in (
+            ("trade_id", "ID"),
+            ("strategy", "Strategy"),
+            ("symbol", "Symbol"),
+            ("side", "Side"),
+            ("qty", "Qty"),
+            ("entry", "Entry"),
+            ("ltp", "LTP"),
+            ("leg_mtm", "Leg MTM"),
+            ("trade_mtm", "Trade MTM"),
+            ("base_mtm", "Base MTM"),
+            ("hedge_mtm", "Hedge MTM"),
+            ("sl", "Stop"),
+            ("tgt", "Target"),
+            ("status", "Status"),
+        ):
+            self.option_legs_tree.heading(c, text=title)
+
+        self.option_legs_tree.column("trade_id", width=60, stretch=False, anchor="w")
+        self.option_legs_tree.column("strategy", width=120, stretch=True, anchor="w")
+        self.option_legs_tree.column("symbol", width=210, stretch=True, anchor="w")
+        self.option_legs_tree.column("side", width=55, stretch=False, anchor="w")
+        self.option_legs_tree.column("qty", width=55, stretch=False, anchor="e")
+        self.option_legs_tree.column("entry", width=70, stretch=False, anchor="e")
+        self.option_legs_tree.column("ltp", width=70, stretch=False, anchor="e")
+        self.option_legs_tree.column("leg_mtm", width=80, stretch=False, anchor="e")
+        self.option_legs_tree.column("trade_mtm", width=80, stretch=False, anchor="e")
+        self.option_legs_tree.column("base_mtm", width=80, stretch=False, anchor="e")
+        self.option_legs_tree.column("hedge_mtm", width=80, stretch=False, anchor="e")
+        self.option_legs_tree.column("sl", width=90, stretch=False, anchor="e")
+        self.option_legs_tree.column("tgt", width=90, stretch=False, anchor="e")
+        self.option_legs_tree.column("status", width=140, stretch=True, anchor="w")
+
+        opt_vsb = ttk.Scrollbar(tree_area, orient="vertical", command=self.option_legs_tree.yview)
+        opt_hsb = ttk.Scrollbar(tree_area, orient="horizontal", command=self.option_legs_tree.xview)
+        self.option_legs_tree.configure(yscrollcommand=opt_vsb.set, xscrollcommand=opt_hsb.set)
+        self.option_legs_tree.grid(row=0, column=0, sticky="nsew")
+        opt_vsb.grid(row=0, column=1, sticky="ns")
+        opt_hsb.grid(row=1, column=0, sticky="ew")
+        tree_area.grid_rowconfigure(0, weight=1)
+        tree_area.grid_columnconfigure(0, weight=1)
+
+        try:
+            self.option_legs_tree.tag_configure("profit", foreground="#10b981") # HSL Premium Mint Green
+            self.option_legs_tree.tag_configure("loss", foreground="#f43f5e")   # HSL Premium Crimson Rose
+            self.option_legs_tree.tag_configure("hedge", foreground="#64748b")  # Balanced Steel Blue
+        except Exception:
+            pass
+
+        try:
+            self._render_option_legs()
+        except Exception:
+            pass
+
+    def _build_managed_positions_tab(self) -> None:
+        root = ttk.Frame(self.managed_positions_frame)
+        root.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        ttk.Label(root, text="Managed Positions (Equities)", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        btns = ttk.Frame(root)
+        btns.pack(fill=tk.X, expand=False, pady=(6, 8))
+        ttk.Button(btns, text="Refresh", command=self._render_managed_positions).pack(side=tk.LEFT)
+
+        style = ttk.Style()
+        try:
+            style.configure("Compact.Treeview", rowheight=20, font=("Segoe UI", 9))
+            style.configure("Compact.Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        except Exception:
+            pass
+
+        tree_area = ttk.Frame(root)
+        tree_area.pack(fill=tk.BOTH, expand=True)
+
+        eq_cols = ("symbol", "side", "qty", "entry", "ltp", "pnl", "sl", "tgt")
+        self.managed_positions_tree = ttk.Treeview(tree_area, columns=eq_cols, show="headings", height=16, style="Compact.Treeview")
+        for c, title in (
+            ("symbol", "Symbol"),
+            ("side", "Side"),
+            ("qty", "Qty"),
+            ("entry", "Entry"),
+            ("ltp", "LTP"),
+            ("pnl", "PnL"),
+            ("sl", "Stop"),
+            ("tgt", "Target"),
+        ):
+            self.managed_positions_tree.heading(c, text=title)
+
+        self.managed_positions_tree.column("symbol", width=200, stretch=True, anchor="w")
+        self.managed_positions_tree.column("side", width=60, stretch=False, anchor="w")
+        self.managed_positions_tree.column("qty", width=70, stretch=False, anchor="e")
+        self.managed_positions_tree.column("entry", width=80, stretch=False, anchor="e")
+        self.managed_positions_tree.column("ltp", width=80, stretch=False, anchor="e")
+        self.managed_positions_tree.column("pnl", width=90, stretch=False, anchor="e")
+        self.managed_positions_tree.column("sl", width=90, stretch=False, anchor="e")
+        self.managed_positions_tree.column("tgt", width=90, stretch=False, anchor="e")
+
+        vsb = ttk.Scrollbar(tree_area, orient="vertical", command=self.managed_positions_tree.yview)
+        hsb = ttk.Scrollbar(tree_area, orient="horizontal", command=self.managed_positions_tree.xview)
+        self.managed_positions_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.managed_positions_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_area.grid_rowconfigure(0, weight=1)
+        tree_area.grid_columnconfigure(0, weight=1)
+
+        try:
+            self.managed_positions_tree.tag_configure("profit", foreground="#10b981") # HSL Premium Mint Green
+            self.managed_positions_tree.tag_configure("loss", foreground="#f43f5e")   # HSL Premium Crimson Rose
+            self.managed_positions_tree.tag_configure("neutral", foreground="#333333")# Charcoal Slate
+            self.managed_positions_tree.tag_configure("hedge", foreground="#64748b")  # Balanced Steel Blue
+        except Exception:
+            pass
+
+        try:
+            self._render_managed_positions()
+        except Exception:
+            pass
+
+    def _render_option_legs(self) -> None:
+        try:
+            for iid in list(self.option_legs_tree.get_children()):
+                try:
+                    self.option_legs_tree.delete(iid)
+                except Exception:
+                    pass
+
+            def _insert_option_row(*, tid: str, strategy: object, symbol: object, side: object, qty: object,
+                                   entry: object, ltp: object, leg_mtm: object, trade_mtm: object,
+                                   base_mtm: object, hedge_mtm: object, stop: object, target: object, status: object) -> None:
+                entry_s = "" if entry is None else f"{float(entry):.2f}"
+                ltp_s = "" if ltp is None else f"{float(ltp):.2f}"
+                leg_mtm_s = "" if leg_mtm is None else f"{float(leg_mtm):.2f}"
+                mtm_s = "" if trade_mtm is None else f"{float(trade_mtm):.2f}"
+                base_mtm_s = "" if base_mtm is None else f"{float(base_mtm):.2f}"
+                hedge_mtm_s = "" if hedge_mtm is None else f"{float(hedge_mtm):.2f}"
+                stop_s = "" if stop in (None, "None", "") else str(stop)
+                target_s = "" if target in (None, "None", "") else str(target)
+                tag = "neutral"
+                try:
+                    is_hedge = str(tid).endswith("-H") or str(strategy or "").lower().endswith("hedge")
+                    if is_hedge:
+                        tag = "hedge"
+                    else:
+                        ref = trade_mtm if trade_mtm is not None else leg_mtm
+                        if ref is not None:
+                            ref_f = float(ref)
+                            if ref_f > 0:
+                                tag = "profit"
+                            elif ref_f < 0:
+                                tag = "loss"
+                except Exception:
+                    tag = "neutral"
+                self.option_legs_tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        tid,
+                        strategy,
+                        symbol,
+                        side,
+                        qty,
+                        entry_s,
+                        ltp_s,
+                        leg_mtm_s,
+                        mtm_s,
+                        base_mtm_s,
+                        hedge_mtm_s,
+                        stop_s,
+                        target_s,
+                        status,
+                    ),
+                    tags=() if tag == "neutral" else (tag,),
+                )
+
+            rendered_any = False
+            for tid, st in (self._trade_state or {}).items():
+                try:
+                    if self._is_closed_trade_state(tid, st):
+                        continue
+                    legs = st.get("legs") or []
+                    for leg in legs:
+                        if not isinstance(leg, dict):
+                            continue
+                        try:
+                            if not self._is_option_leg(leg):
+                                continue
+                        except Exception:
+                            continue
+
+                        is_hedge = bool(leg.get("is_hedge"))
+                        sym = self._format_leg_symbol_ui(leg, include_hedge_tag=is_hedge)
+                        side = str(leg.get("side") or "").upper().strip()
+                        qty = self._get_leg_qty(leg)
+                        if qty <= 0 and not sym:
+                            continue
+                        entry = leg.get("entry_price") if leg.get("entry_price") is not None else leg.get("entry")
+                        ltp = leg.get("ltp")
+                        if (ltp is None or ltp == "") and getattr(self, "_client", None) is not None:
+                            try:
+                                live = self._try_get_live_ltp_for_leg(self._client, leg)
+                                if live is not None:
+                                    ltp = float(live)
+                            except Exception:
+                                pass
+
+                        leg_mtm = None
+                        try:
+                            leg_mtm = leg.get("mtm")
+                        except Exception:
+                            leg_mtm = None
+                        if leg_mtm is None and ltp is not None and entry is not None and qty:
+                            try:
+                                sign = 1.0 if side == "BUY" else -1.0
+                                leg_mtm = (float(ltp) - float(entry)) * sign * float(abs(qty))
+                            except Exception:
+                                leg_mtm = None
+
+                        pnl_breakdown = self._compute_parent_display_pnl_breakdown(tid, st)
+                        trade_mtm = pnl_breakdown.get("parent_mtm")
+                        base_mtm = pnl_breakdown.get("base_mtm")
+                        hedge_mtm = pnl_breakdown.get("hedge_mtm")
+
+                        # Stop/target extraction and conversion
+                        prem_stop = None
+                        try:
+                            prem_stop = float(leg.get("prem_stop")) if leg.get("prem_stop") is not None else None
+                        except Exception:
+                            prem_stop = None
+                        prem_target = None
+                        try:
+                            prem_target = float(leg.get("prem_target")) if leg.get("prem_target") is not None else None
+                        except Exception:
+                            prem_target = None
+                        mtm_stop = None
+                        try:
+                            mtm_stop = float(leg.get("mtm_stop")) if leg.get("mtm_stop") is not None else None
+                        except Exception:
+                            mtm_stop = None
+                        mtm_target = None
+                        try:
+                            mtm_target = float(leg.get("mtm_target")) if leg.get("mtm_target") is not None else None
+                        except Exception:
+                            mtm_target = None
+                        spot_stop = None
+                        try:
+                            spot_stop = float(leg.get("spot_stop")) if leg.get("spot_stop") is not None else None
+                        except Exception:
+                            spot_stop = None
+                        spot_target = None
+                        try:
+                            spot_target = float(leg.get("spot_target")) if leg.get("spot_target") is not None else None
+                        except Exception:
+                            spot_target = None
+
+                        stop_s = ""
+                        tgt_s = ""
+                        if prem_stop is not None or prem_target is not None:
+                            if prem_stop is not None:
+                                stop_s = f"{float(prem_stop):.2f}"
+                            if prem_target is not None:
+                                tgt_s = f"{float(prem_target):.2f}"
+                        elif mtm_stop is not None or mtm_target is not None:
+                            entry_premium_abs = None
+                            try:
+                                entry_premium_signed = 0.0
+                                any_entry = False
+                                for lg in legs:
+                                    if not isinstance(lg, dict):
+                                        continue
+                                    if bool(lg.get("is_hedge")) and not self._is_option_leg(lg):
+                                        continue
+                                    e_val = lg.get("entry_price") if lg.get("entry_price") is not None else lg.get("entry")
+                                    try:
+                                        e_float = float(e_val) if e_val is not None else None
+                                    except Exception:
+                                        e_float = None
+                                    q = self._get_leg_qty(lg)
+                                    s = str(lg.get("side") or "").strip().upper()
+                                    if e_float is None or q <= 0 or s not in {"BUY", "SELL"}:
+                                        continue
+                                    any_entry = True
+                                    if s == "SELL":
+                                        entry_premium_signed += float(e_float) * float(q)
+                                    else:
+                                        entry_premium_signed -= float(e_float) * float(q)
+                                if any_entry:
+                                    entry_premium_abs = float(abs(entry_premium_signed))
+                            except Exception:
+                                entry_premium_abs = None
+
+                            try:
+                                e = entry
+                                if e is not None and entry_premium_abs is not None and entry_premium_abs > 0:
+                                    stop_pct_eff = abs(float(mtm_stop)) / float(entry_premium_abs) if mtm_stop is not None else None
+                                    tgt_pct_eff = abs(float(mtm_target)) / float(entry_premium_abs) if mtm_target is not None else None
+                                    if stop_pct_eff is not None and stop_pct_eff >= 0:
+                                        if side == "SELL":
+                                            sl_price = float(e) * (1.0 + float(stop_pct_eff))
+                                        else:
+                                            sl_price = float(e) * (1.0 - float(stop_pct_eff))
+                                        if sl_price < 0:
+                                            sl_price = 0.0
+                                        stop_s = f"{sl_price:.2f}"
+                                    if tgt_pct_eff is not None and tgt_pct_eff >= 0:
+                                        if side == "SELL":
+                                            tp_price = float(e) * (1.0 - float(tgt_pct_eff))
+                                        else:
+                                            tp_price = float(e) * (1.0 + float(tgt_pct_eff))
+                                        if tp_price < 0:
+                                            tp_price = 0.0
+                                        tgt_s = f"{tp_price:.2f}"
+                            except Exception:
+                                stop_s = ""
+                                tgt_s = ""
+                        elif spot_stop is not None or spot_target is not None:
+                            if spot_stop is not None:
+                                stop_s = f"{spot_stop:.1f}"
+                            if spot_target is not None:
+                                tgt_s = f"{spot_target:.1f}"
+
+                        if not stop_s:
+                            raw_stop = leg.get("stop")
+                            if raw_stop is None:
+                                raw_stop = leg.get("stop_loss")
+                            if raw_stop is not None:
+                                try:
+                                    stop_s = f"{float(raw_stop):.2f}"
+                                except Exception:
+                                    stop_s = str(raw_stop)
+
+                        if not tgt_s:
+                            raw_target = leg.get("target")
+                            if raw_target is None:
+                                raw_target = leg.get("profit_target")
+                            if raw_target is not None:
+                                try:
+                                    tgt_s = f"{float(raw_target):.2f}"
+                                except Exception:
+                                    tgt_s = str(raw_target)
+
+                        if not stop_s:
+                            raw_stop = st.get("stop_loss") if isinstance(st, dict) else None
+                            if raw_stop is not None:
+                                try:
+                                    stop_s = f"{float(raw_stop):.2f}"
+                                except Exception:
+                                    stop_s = str(raw_stop)
+                        if not tgt_s:
+                            raw_target = st.get("profit_target") if isinstance(st, dict) else None
+                            if raw_target is not None:
+                                try:
+                                    tgt_s = f"{float(raw_target):.2f}"
+                                except Exception:
+                                    tgt_s = str(raw_target)
+
+                        _insert_option_row(
+                            tid=str(tid),
+                            strategy=str(st.get("strategy") or ""),
+                            symbol=sym,
+                            side=side,
+                            qty=qty,
+                            entry=entry,
+                            ltp=ltp,
+                            leg_mtm=leg_mtm,
+                            trade_mtm=trade_mtm,
+                            base_mtm=base_mtm,
+                            hedge_mtm=hedge_mtm,
+                            stop=stop_s,
+                            target=tgt_s,
+                            status=st.get("status"),
+                        )
+                        rendered_any = True
+                except Exception:
+                    continue
+
+            if not rendered_any:
+                # Snapshot fallback keeps the tab populated if live state is incomplete.
+                snap = getattr(self, "_dash_portfolio_snapshot", {}) or {}
+                rows = snap.get("option_rows") if isinstance(snap.get("option_rows"), list) else []
+                for item in rows[:1000]:
+                    try:
+                        if not self._is_meaningful_trade_row(item, equity=False):
+                            continue
+                        _insert_option_row(
+                            tid=str(item.get("trade_id") or ""),
+                            strategy=item.get("strategy"),
+                            symbol=item.get("symbol"),
+                            side=item.get("side"),
+                            qty=item.get("qty"),
+                            entry=item.get("entry"),
+                            ltp=item.get("ltp"),
+                            leg_mtm=item.get("leg_mtm"),
+                            trade_mtm=item.get("mtm"),
+                            base_mtm=item.get("base_mtm"),
+                            hedge_mtm=item.get("hedge_mtm"),
+                            stop=item.get("stop"),
+                            target=item.get("target"),
+                            status=item.get("status"),
+                        )
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    def _render_managed_positions(self) -> None:
+        try:
+            for iid in list(self.managed_positions_tree.get_children()):
+                try:
+                    self.managed_positions_tree.delete(iid)
+                except Exception:
+                    pass
+
+            def _insert_equity_row(symbol: object, side: object, qty: object, entry: object, ltp: object, pnl: object, stop: object, target: object, *, tag: str = "neutral") -> None:
+                entry_s = "" if entry is None else f"{float(entry):.2f}"
+                ltp_s = "" if ltp is None else f"{float(ltp):.2f}"
+                pnl_s = "" if pnl is None else f"{float(pnl):.2f}"
+                self.managed_positions_tree.insert(
+                    "",
+                    tk.END,
+                    values=(symbol, side, qty, entry_s, ltp_s, pnl_s, stop, target),
+                    tags=() if tag == "neutral" else (tag,),
+                )
+
+            rendered_any = False
+            for tid, st in (self._trade_state or {}).items():
+                try:
+                    if self._is_closed_trade_state(tid, st):
+                        continue
+                    legs = st.get("legs") or []
+                    for leg in legs:
+                        if not isinstance(leg, dict):
+                            continue
+                        try:
+                            if self._is_option_leg(leg):
+                                continue
+                        except Exception:
+                            continue
+
+                        is_hedge = bool(leg.get("is_hedge"))
+                        sym = self._format_leg_symbol_ui(leg, include_hedge_tag=is_hedge)
+                        side = str(leg.get("side") or "").upper().strip()
+                        qty = self._get_leg_qty(leg)
+                        if qty <= 0 and not sym:
+                            continue
+                        entry = leg.get("entry_price") if leg.get("entry_price") is not None else leg.get("entry")
+                        ltp = leg.get("ltp")
+                        if (ltp is None or ltp == "") and getattr(self, "_client", None) is not None:
+                            try:
+                                live = self._try_get_live_ltp_for_leg(self._client, leg)
+                                if live is not None:
+                                    ltp = float(live)
+                            except Exception:
+                                pass
+
+                        pnl_val = None
+                        try:
+                            pnl_val = leg.get("pnl")
+                        except Exception:
+                            pnl_val = None
+
+                        tag = "neutral"
+                        try:
+                            if bool(leg.get("is_hedge")):
+                                tag = "hedge"
+                            elif pnl_val is not None:
+                                pnl_f = float(pnl_val)
+                                if pnl_f > 0:
+                                    tag = "profit"
+                                elif pnl_f < 0:
+                                    tag = "loss"
+                        except Exception:
+                            tag = "neutral"
+                        _insert_equity_row(sym, side, qty, entry, ltp, pnl_val, leg.get("stop"), leg.get("target"), tag=tag)
+                        rendered_any = True
+                except Exception:
+                    continue
+
+            if not rendered_any:
+                snap = getattr(self, "_dash_portfolio_snapshot", {}) or {}
+                rows = snap.get("equity_rows") if isinstance(snap.get("equity_rows"), list) else []
+                for r in rows[:1000]:
+                    try:
+                        if not self._is_meaningful_trade_row(r, equity=True):
+                            continue
+                        tag = "neutral"
+                        try:
+                            pnl_val = r.get("pnl")
+                            if pnl_val is not None:
+                                pnl_f = float(pnl_val)
+                                if pnl_f > 0:
+                                    tag = "profit"
+                                elif pnl_f < 0:
+                                    tag = "loss"
+                        except Exception:
+                            tag = "neutral"
+                        _insert_equity_row(
+                            r.get("symbol"),
+                            r.get("side"),
+                            r.get("qty"),
+                            r.get("entry"),
+                            r.get("ltp"),
+                            r.get("pnl"),
+                            r.get("stop"),
+                            r.get("target"),
+                            tag=tag,
+                        )
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
     def _append_gpt_output(self, text: str, summary: str = "") -> None:
         try:
             self.gpt_out.configure(state=tk.NORMAL)
@@ -3223,8 +5592,13 @@ class ScalperUI(tk.Tk):
         except Exception:
             pass
 
-    def _sync_gpt_config_from_ui(self, *, persist_non_secret: bool = False) -> dict[str, str]:
-        """Apply GPT tab values to the current process and optionally persist safe fields."""
+    def _sync_gpt_config_from_ui(self, *, persist_non_secret: bool = False, persist_secret: bool = False) -> dict[str, str]:
+        """Apply GPT tab values to the current process and optionally persist fields.
+
+        If `persist_secret` is True the API key (`MSTOCK_GPT_API_KEY`) will be
+        written to the repo `.scalper.env` file. This requires an explicit
+        user confirmation upstream.
+        """
 
         applied: dict[str, str] = {}
         api_key_now = str(self.gpt_api_key_var.get() or "").strip()
@@ -3261,9 +5635,20 @@ class ScalperUI(tk.Tk):
             else:
                 to_unset.append("MSTOCK_GPT_MODEL")
 
+            # optionally persist the API key when explicitly requested
+            if persist_secret:
+                if api_key_now:
+                    to_persist["MSTOCK_GPT_API_KEY"] = api_key_now
+                else:
+                    to_unset.append("MSTOCK_GPT_API_KEY")
+
             try:
-                persist_settings_env(to_persist, to_unset)
+                p = persist_settings_env(to_persist, to_unset)
                 applied["persisted"] = "true"
+                try:
+                    applied["persisted_path"] = str(p)
+                except Exception:
+                    pass
             except Exception:
                 applied["persisted"] = "false"
 
@@ -3271,7 +5656,19 @@ class ScalperUI(tk.Tk):
 
     def _on_gpt_save_config(self) -> None:
         try:
-            applied = self._sync_gpt_config_from_ui(persist_non_secret=True)
+            persist_secret = bool(getattr(self, "gpt_persist_api_key_var", tk.BooleanVar()).get())
+            if persist_secret:
+                try:
+                    ok = messagebox.askyesno(
+                        "Persist API key",
+                        "Persisting the API key will store it on disk in .scalper.env\nDo you want to continue?",
+                    )
+                except Exception:
+                    ok = False
+                if not ok:
+                    persist_secret = False
+
+            applied = self._sync_gpt_config_from_ui(persist_non_secret=True, persist_secret=persist_secret)
             saved_model = applied.get("MSTOCK_GPT_MODEL") or "(default)"
             saved_url = applied.get("MSTOCK_GPT_API_BASE_URL") or "(default AICredits URL)"
             self._gpt_status_var.set("Saved")
@@ -3283,12 +5680,18 @@ class ScalperUI(tk.Tk):
                             "MSTOCK_GPT_MODEL": saved_model,
                             "MSTOCK_GPT_API_BASE_URL": saved_url,
                         },
-                        "api_key_persisted": False,
+                        "api_key_persisted": bool(persist_secret),
                     },
                     indent=2,
                 ),
                 summary="Saved GPT model/base URL for next startup.",
             )
+            # show persisted path when available
+            if applied.get("persisted") == "true" and applied.get("persisted_path"):
+                try:
+                    messagebox.showinfo("Saved", f"GPT settings written to: {applied.get('persisted_path')}")
+                except Exception:
+                    pass
         except Exception as exc:
             self._gpt_status_var.set("Save failed")
             self._append_gpt_output(json.dumps({"saved": False, "detail": str(exc)}, indent=2), summary="Failed to save GPT config.")
@@ -3351,9 +5754,21 @@ class ScalperUI(tk.Tk):
         except Exception:
             pass
 
+        # Force reload .env file to pick up any changes without restart
+        try:
+            from dotenv import load_dotenv
+            # Get the correct path to .env file (same as startup)
+            env_path = Path(__file__).parent.parent / ".env"
+            if env_path.exists():
+                load_dotenv(dotenv_path=env_path, override=True)
+                print(f"[GPT] Reloaded .env from {env_path}")
+        except Exception as e:
+            print(f"[GPT] Failed to reload .env: {e}")
+
         # Build snapshot on UI thread.
         snapshot = self._build_market_snapshot()
-        model = str(self.gpt_model_var.get() or "").strip() or "gpt-4o-mini"
+        # Re-read model from env to pick up any .env changes
+        model = str(os.getenv("MSTOCK_GPT_MODEL") or "").strip() or str(self.gpt_model_var.get() or "").strip() or "gpt-4o-mini"
         api_key = str(self.gpt_api_key_var.get() or "").strip()
         base_url = str(self.gpt_base_url_var.get() or "").strip() or None
         try:
@@ -3815,6 +6230,13 @@ class ScalperUI(tk.Tk):
                     continue
 
                 opt_type = str(leg.get("option_type") or leg.get("type") or leg.get("opt_type") or "").strip().upper()
+                if opt_type not in {"CE", "PE"}:
+                    sym_upper = sym.upper()
+                    if sym_upper.endswith("CE") or "CE" in sym_upper:
+                        opt_type = "CE"
+                    elif sym_upper.endswith("PE") or "PE" in sym_upper:
+                        opt_type = "PE"
+
                 display_sym = f"HEDGE {sym}" if is_hedge else sym
 
                 # Show hedge-underlying legs in the greeks tab as visibility-only rows.
@@ -3867,16 +6289,82 @@ class ScalperUI(tk.Tk):
                 if opt_type not in {"CE", "PE"}:
                     continue
 
+                # strike
                 strike = leg.get("strike") if leg.get("strike") is not None else leg.get("Strike")
                 try:
                     strike_f = float(strike)
                 except Exception:
-                    continue
-                if strike_f <= 0:
+                    strike_f = 0.0
+
+                # expiry
+                expiry_dt = self._parse_expiry(leg.get("expiry") if leg.get("expiry") is not None else leg.get("Expiry"))
+                expiry_str_matched = None
+                if expiry_dt is None:
+                    # best-effort parse from symbol
+                    import re
+                    # 1. Weekly pattern: DDMMMYY / DDMMMYYYY
+                    m_exp = re.search(r"(\d{2}[A-Z]{3}(?:20\d{2}|\d{2}))", sym.upper())
+                    if m_exp:
+                        expiry_str_matched = m_exp.group(1)
+                        try:
+                            dd_s = expiry_str_matched[:2]
+                            mon_s = expiry_str_matched[2:5]
+                            yy_s = expiry_str_matched[5:]
+                            dd = int(dd_s)
+                            if len(yy_s) == 4:
+                                year = int(yy_s)
+                            else:
+                                year = 2000 + int(yy_s)
+                            mon_map = {
+                                "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                                "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+                            }
+                            mm = mon_map.get(mon_s)
+                            if mm:
+                                expiry_dt = datetime(year, mm, dd, 15, 30, 0)
+                        except Exception:
+                            expiry_dt = None
+
+                    # 2. Monthly pattern: YYMMM / YYYYMMM
+                    if expiry_dt is None:
+                        m_exp2 = re.search(r"((?:20\d{2}|\d{2})[A-Z]{3})", sym.upper())
+                        if m_exp2:
+                            expiry_str_matched = m_exp2.group(1)
+                            try:
+                                yy_s = expiry_str_matched[:-3]
+                                mon_s = expiry_str_matched[-3:]
+                                if len(yy_s) == 4:
+                                    year = int(yy_s)
+                                else:
+                                    year = 2000 + int(yy_s)
+                                mon_map = {
+                                    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+                                    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+                                }
+                                mm = mon_map.get(mon_s)
+                                if mm:
+                                    # Default to 28th of the month
+                                    expiry_dt = datetime(year, mm, 28, 15, 30, 0)
+                            except Exception:
+                                expiry_dt = None
+                if expiry_dt is None:
                     continue
 
-                expiry_dt = self._parse_expiry(leg.get("expiry") if leg.get("expiry") is not None else leg.get("Expiry"))
-                if expiry_dt is None:
+                # If strike is not yet set, parse it using the resolved expiry match to avoid year confusion
+                if strike_f <= 0:
+                    import re
+                    right_part = sym.upper()
+                    if expiry_str_matched:
+                        parts = sym.upper().split(expiry_str_matched, 1)
+                        if len(parts) > 1:
+                            right_part = parts[1]
+                    m_str = re.search(r"(\d+)(CE|PE)", right_part)
+                    if m_str:
+                        try:
+                            strike_f = float(m_str.group(1))
+                        except Exception:
+                            pass
+                if strike_f <= 0:
                     continue
                 t_sec = (expiry_dt - now).total_seconds()
                 if t_sec <= 60:
@@ -4298,6 +6786,11 @@ class ScalperUI(tk.Tk):
 
         st = self._trade_state.get(tid)
         if not isinstance(st, dict):
+            for key, val in (self._trade_state or {}).items():
+                if str(key).strip() == tid:
+                    st = val
+                    break
+        if not isinstance(st, dict):
             messagebox.showinfo("Not available", "No trade details available for this row yet.")
             return
         legs = st.get("legs")
@@ -4402,24 +6895,20 @@ class ScalperUI(tk.Tk):
             except Exception:
                 return str(value)
 
-        legs_all = state.get("legs") if isinstance(state.get("legs"), list) else []
-        if str(trade_id).endswith("-H"):
-            hedge_legs = [leg for leg in legs_all if isinstance(leg, dict)]
-            legs_text = self._format_legs(hedge_legs, show_prices=True, hedge_prefix=False)
+        legs_text = self._format_trade_legs_for_state(trade_id, state)
+
+        # Extract GPT decision from trade state (stored in note field as "gpt:DECISION:REASON")
+        note = str(state.get("note") or "")
+        gpt_decision = ""
+        if note.startswith("gpt:"):
+            parts = note.split(":", 2)
+            if len(parts) >= 2:
+                gpt_decision = parts[1].strip()
         else:
-            main_legs, hedge_opt_legs, _hedge_under_legs = self._split_legs_for_display(legs_all)
-            display_main_legs: list[dict] = []
-            for leg in list(main_legs) + list(hedge_opt_legs):
-                if not isinstance(leg, dict):
-                    continue
-                try:
-                    q = int(leg.get("quantity") or 0)
-                except Exception:
-                    q = 0
-                if q <= 0:
-                    continue
-                display_main_legs.append(leg)
-            legs_text = self._format_legs(display_main_legs, show_prices=True, hedge_prefix=True)
+            # Fallback to direct "gpt" key if present
+            gpt_val = state.get("gpt")
+            if gpt_val is not None:
+                gpt_decision = str(gpt_val).strip()
 
         pnl_breakdown = self._compute_parent_display_pnl_breakdown(str(trade_id), state)
         mtm_display = pnl_breakdown.get("parent_mtm")
@@ -4793,12 +7282,333 @@ class ScalperUI(tk.Tk):
         except Exception:
             pass
 
+    def _refresh_broker_health(self) -> None:
+        try:
+            live = bool(getattr(self, "live_var", tk.BooleanVar(value=False)).get())
+        except Exception:
+            live = False
+        try:
+            scalper = getattr(self, "_scalper", None)
+            client_ready = bool(getattr(self, "_client", None) is not None)
+            trade_q_size = int(self._trade_q.qsize()) if hasattr(self, "_trade_q") else 0
+            mode = "LIVE" if live else "PAPER"
+            status = "Connected" if client_ready and scalper is not None else ("Ready" if scalper is not None else "Idle")
+            detail = f"Queue {trade_q_size} | bot={'yes' if scalper is not None else 'no'} | client={'yes' if client_ready else 'no'}"
+            if hasattr(self, "_broker_health_var"):
+                self._broker_health_var.set(status)
+            if hasattr(self, "_broker_health_mode_var"):
+                self._broker_health_mode_var.set(f"Mode: {mode}")
+            if hasattr(self, "_broker_health_detail_var"):
+                self._broker_health_detail_var.set(detail)
+        except Exception:
+            pass
+
+    def _build_trade_journal_tab(self) -> None:
+        root = ttk.Frame(self.journal_frame)
+        root.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        ttk.Label(root, text="Trade Journal", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        controls = ttk.Frame(root)
+        controls.pack(fill=tk.X, pady=(8, 6))
+
+        self._journal_limit_var = tk.StringVar(value="200")
+        self._journal_filter_var = tk.StringVar(value="")
+        self._journal_event_var = tk.StringVar(value="ALL")
+        ttk.Label(controls, text="Limit:").pack(side=tk.LEFT)
+        ttk.Entry(controls, textvariable=self._journal_limit_var, width=8).pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Label(controls, text="Filter:").pack(side=tk.LEFT)
+        ttk.Entry(controls, textvariable=self._journal_filter_var, width=24).pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Label(controls, text="Event:").pack(side=tk.LEFT)
+        ttk.Combobox(controls, textvariable=self._journal_event_var, values=("ALL", "OPEN", "UPDATE", "PARTIAL_CLOSE", "CLOSE"), width=14).pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Button(controls, text="Refresh", command=self._refresh_trade_journal).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Export CSV", command=self._export_trade_journal_csv).pack(side=tk.LEFT, padx=(6, 0))
+
+        self._journal_status_var = tk.StringVar(value="Ready")
+        ttk.Label(root, textvariable=self._journal_status_var).pack(anchor="w", pady=(0, 6))
+
+        cols = ("ts", "event", "trade_id", "position_type", "name", "mtm", "realized", "reason", "legs")
+        area = ttk.Frame(root)
+        area.pack(fill=tk.BOTH, expand=True)
+        self.journal_tree = ttk.Treeview(area, columns=cols, show="headings", height=16)
+        for c, title in (("ts", "Time"), ("event", "Event"), ("trade_id", "Trade ID"), ("position_type", "Type"), ("name", "Name"), ("mtm", "MTM"), ("realized", "Realized"), ("reason", "Reason"), ("legs", "Legs")):
+            self.journal_tree.heading(c, text=title)
+        self.journal_tree.column("ts", width=90, stretch=False, anchor="w")
+        self.journal_tree.column("event", width=110, stretch=False, anchor="w")
+        self.journal_tree.column("trade_id", width=80, stretch=False, anchor="w")
+        self.journal_tree.column("position_type", width=90, stretch=False, anchor="w")
+        self.journal_tree.column("name", width=140, stretch=True, anchor="w")
+        self.journal_tree.column("mtm", width=90, stretch=False, anchor="e")
+        self.journal_tree.column("realized", width=90, stretch=False, anchor="e")
+        self.journal_tree.column("reason", width=180, stretch=True, anchor="w")
+        self.journal_tree.column("legs", width=520, stretch=True, anchor="w")
+        vsb = ttk.Scrollbar(area, orient="vertical", command=self.journal_tree.yview)
+        hsb = ttk.Scrollbar(area, orient="horizontal", command=self.journal_tree.xview)
+        self.journal_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.journal_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        area.grid_rowconfigure(0, weight=1)
+        area.grid_columnconfigure(0, weight=1)
+        self._refresh_trade_journal()
+
+    def _refresh_trade_journal(self) -> None:
+        try:
+            db = getattr(self, "_db_manager", None)
+            if db is None or not hasattr(db, "list_recent_trade_events"):
+                return
+            try:
+                limit = max(1, int(self._journal_limit_var.get() or 200))
+            except Exception:
+                limit = 200
+            event_filter = str(self._journal_event_var.get() or "ALL").strip().upper()
+            text_filter = str(self._journal_filter_var.get() or "").strip().lower()
+
+            def _worker() -> None:
+                try:
+                    rows = db.list_recent_trade_events(limit=limit)
+                except Exception as exc:
+                    def _error() -> None:
+                        if hasattr(self, "_journal_status_var"):
+                            self._journal_status_var.set(f"Journal load failed: {exc}")
+                    try:
+                        self.after(0, _error)
+                    except Exception:
+                        pass
+                    return
+
+                def _apply() -> None:
+                    try:
+                        for iid in list(self.journal_tree.get_children()):
+                            try:
+                                self.journal_tree.delete(iid)
+                            except Exception:
+                                pass
+                        kept = 0
+                        for row in rows:
+                            if not isinstance(row, dict):
+                                continue
+                            event = str(row.get("event") or "").upper()
+                            if event_filter != "ALL" and event != event_filter:
+                                continue
+                            hay = " ".join([str(row.get("trade_id") or ""), str(row.get("name") or ""), str(row.get("reason") or "")]).lower()
+                            if text_filter and text_filter not in hay:
+                                continue
+                            try:
+                                ts = float(row.get("ts") or 0.0)
+                                ts_s = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts > 0 else "n/a"
+                            except Exception:
+                                ts_s = "n/a"
+                            legs = row.get("legs") if isinstance(row.get("legs"), list) else []
+                            legs_s = self._format_legs(legs, show_prices=True) if legs else ""
+                            self.journal_tree.insert("", tk.END, values=(ts_s, row.get("event"), row.get("trade_id"), row.get("position_type"), row.get("name"), row.get("mtm"), row.get("realized"), row.get("reason"), legs_s))
+                            kept += 1
+                        if hasattr(self, "_journal_status_var"):
+                            self._journal_status_var.set(f"Loaded {kept} event(s)")
+                    except Exception as exc:
+                        if hasattr(self, "_journal_status_var"):
+                            self._journal_status_var.set(f"Journal render failed: {exc}")
+
+                try:
+                    self.after(0, _apply)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception as exc:
+            if hasattr(self, "_journal_status_var"):
+                self._journal_status_var.set(f"Journal load failed: {exc}")
+
+    def _export_trade_journal_csv(self) -> None:
+        try:
+            import csv
+            from tkinter import filedialog
+            fn = filedialog.asksaveasfilename(title="Export Trade Journal", defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+            if not fn:
+                return
+            rows = []
+            for iid in self.journal_tree.get_children():
+                rows.append(self.journal_tree.item(iid, "values"))
+            with open(fn, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(("Time", "Event", "Trade ID", "Type", "Name", "MTM", "Realized", "Reason", "Legs"))
+                writer.writerows(rows)
+            if hasattr(self, "_journal_status_var"):
+                self._journal_status_var.set(f"Exported {len(rows)} row(s)")
+        except Exception as exc:
+            if hasattr(self, "_journal_status_var"):
+                self._journal_status_var.set(f"Export failed: {exc}")
+
+    def _build_optimizer_allocator_tab(self) -> None:
+        root = ttk.Frame(self.optimizer_frame)
+        root.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        ttk.Label(root, text="Optimizer & Allocator", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        panes = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
+        panes.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        left = ttk.Frame(panes)
+        right = ttk.Frame(panes)
+        panes.add(left, weight=1)
+        panes.add(right, weight=1)
+
+        alloc = ttk.LabelFrame(left, text="Strategy Allocator")
+        alloc.pack(fill=tk.X, expand=False, pady=(0, 8))
+        self._alloc_atr_var = tk.StringVar(value="20")
+        self._alloc_adx_var = tk.StringVar(value="28")
+        self._alloc_rsi_var = tk.StringVar(value="52")
+        self._alloc_regime_var = tk.StringVar(value="n/a")
+        self._alloc_strategy_var = tk.StringVar(value="n/a")
+        self._alloc_tuning_var = tk.StringVar(value="n/a")
+        row = 0
+        for label, var in (("ATR", self._alloc_atr_var), ("ADX", self._alloc_adx_var), ("RSI", self._alloc_rsi_var)):
+            ttk.Label(alloc, text=label + ":").grid(row=row, column=0, sticky="w", padx=8, pady=4)
+            ttk.Entry(alloc, textvariable=var, width=10).grid(row=row, column=1, sticky="w", padx=8, pady=4)
+            row += 1
+        ttk.Button(alloc, text="Detect Regime", command=self._update_allocator_preview).grid(row=0, column=2, rowspan=2, padx=8, pady=4, sticky="ns")
+        ttk.Label(alloc, textvariable=self._alloc_regime_var).grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(6, 0))
+        ttk.Label(alloc, textvariable=self._alloc_strategy_var).grid(row=4, column=0, columnspan=3, sticky="w", padx=8)
+        ttk.Label(alloc, textvariable=self._alloc_tuning_var).grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        self._update_allocator_preview()
+
+        exit_box = ttk.LabelFrame(left, text="Exit Optimizer")
+        exit_box.pack(fill=tk.X, expand=False)
+        self._exit_unreal_var = tk.StringVar(value="0")
+        self._exit_stop_var = tk.StringVar(value="-100")
+        self._exit_target_var = tk.StringVar(value="100")
+        self._exit_suggest_var = tk.StringVar(value="n/a")
+        ttk.Label(exit_box, text="Unrealized P&L:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(exit_box, textvariable=self._exit_unreal_var, width=10).grid(row=0, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(exit_box, text="Stop:").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(exit_box, textvariable=self._exit_stop_var, width=10).grid(row=1, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(exit_box, text="Target:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(exit_box, textvariable=self._exit_target_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        ttk.Button(exit_box, text="Suggest Exit", command=self._suggest_optimizer_exit).grid(row=0, column=2, rowspan=3, padx=8, pady=4, sticky="ns")
+        ttk.Label(exit_box, textvariable=self._exit_suggest_var).grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 6))
+
+        bt = ttk.LabelFrame(right, text="Backtest Optimizer")
+        bt.pack(fill=tk.BOTH, expand=True)
+        self._opt_series_var = tk.StringVar(value="100,101,102,101,103,104,105")
+        self._opt_signals_var = tk.StringVar(value="0,1,1,0,1,1,1")
+        self._opt_slippage_var = tk.StringVar(value="2.0")
+        self._opt_fee_var = tk.StringVar(value="0.0")
+        self._opt_fill_var = tk.StringVar(value="1.0")
+        ttk.Label(bt, text="Price series:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(bt, textvariable=self._opt_series_var, width=60).grid(row=0, column=1, sticky="we", padx=8, pady=4)
+        ttk.Label(bt, text="Signals:").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(bt, textvariable=self._opt_signals_var, width=60).grid(row=1, column=1, sticky="we", padx=8, pady=4)
+        ttk.Label(bt, text="Slippage bps:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(bt, textvariable=self._opt_slippage_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(bt, text="Fee/order:").grid(row=3, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(bt, textvariable=self._opt_fee_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(bt, text="Partial fill %:").grid(row=4, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(bt, textvariable=self._opt_fill_var, width=10).grid(row=4, column=1, sticky="w", padx=8, pady=4)
+        ttk.Button(bt, text="Run Comparison", command=self._run_backtest_comparison).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 4))
+        ttk.Button(bt, text="Test Telegram Alert", command=self._send_test_alert).grid(row=6, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+        self._opt_status_var = tk.StringVar(value="Ready")
+        ttk.Label(bt, textvariable=self._opt_status_var).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+        bt.grid_columnconfigure(1, weight=1)
+
+        cols = ("slippage", "fee", "fill", "pnl", "trades", "winrate", "slip_cost")
+        self._opt_results_tree = ttk.Treeview(bt, columns=cols, show="headings", height=8)
+        for c, t in (("slippage", "Slippage"), ("fee", "Fee"), ("fill", "Fill %"), ("pnl", "PnL"), ("trades", "Trades"), ("winrate", "WinRate"), ("slip_cost", "Slip Cost")):
+            self._opt_results_tree.heading(c, text=t)
+        for c, w in (("slippage", 80), ("fee", 80), ("fill", 80), ("pnl", 90), ("trades", 80), ("winrate", 80), ("slip_cost", 90)):
+            self._opt_results_tree.column(c, width=w, stretch=False, anchor="e")
+        opt_vsb = ttk.Scrollbar(bt, orient="vertical", command=self._opt_results_tree.yview)
+        self._opt_results_tree.configure(yscrollcommand=opt_vsb.set)
+        self._opt_results_tree.grid(row=8, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        opt_vsb.grid(row=8, column=1, sticky="ns", pady=(4, 8))
+        bt.grid_rowconfigure(8, weight=1)
+
+    def _update_allocator_preview(self) -> None:
+        try:
+            from strategy_allocator import detect_regime, get_regime_tuning, select_strategy_for_regime
+            atr = [float(self._alloc_atr_var.get() or 0.0)] * 30
+            adx = [float(self._alloc_adx_var.get() or 0.0)] * 30
+            rsi = [float(self._alloc_rsi_var.get() or 50.0)] * 30
+            regime = detect_regime(atr, adx, rsi)
+            strategy = select_strategy_for_regime(regime, getattr(self, "_scalper", None).cfg if getattr(self, "_scalper", None) is not None else None)
+            tuning = get_regime_tuning(regime, getattr(self, "_scalper", None).cfg if getattr(self, "_scalper", None) is not None else None)
+            self._alloc_regime_var.set(f"Regime: {regime}")
+            self._alloc_strategy_var.set(f"Suggested strategy: {strategy}")
+            self._alloc_tuning_var.set(f"Tuning: trend_mult={tuning.get('trend_mult')} ml_threshold={tuning.get('ml_threshold')} preferred={','.join(tuning.get('preferred') or [])}")
+        except Exception as exc:
+            self._alloc_regime_var.set(f"Regime: error")
+            self._alloc_strategy_var.set(f"Suggested strategy: n/a")
+            self._alloc_tuning_var.set(f"Tuning error: {exc}")
+
+    def _suggest_optimizer_exit(self) -> None:
+        try:
+            from exit_optimizer import ExitOptimizer
+            optimizer = ExitOptimizer({})
+            trade_state = {
+                "unrealized_pnl": float(self._exit_unreal_var.get() or 0.0),
+                "stop_loss": float(self._exit_stop_var.get() or 0.0),
+                "profit_target": float(self._exit_target_var.get() or 0.0),
+            }
+            rec = optimizer.suggest_exit(trade_state)
+            self._exit_suggest_var.set(f"Suggestion: {rec.get('action')} ({rec.get('reason', 'n/a')})")
+        except Exception as exc:
+            self._exit_suggest_var.set(f"Exit optimizer error: {exc}")
+
+    def _run_backtest_comparison(self) -> None:
+        try:
+            from backtest_harness import simulate_simple
+            prices = [float(x.strip()) for x in str(self._opt_series_var.get() or "").split(",") if x.strip()]
+            signals = [int(float(x.strip())) for x in str(self._opt_signals_var.get() or "").split(",") if x.strip()]
+            if not prices or not signals:
+                self._opt_status_var.set("Enter price series and signals.")
+                return
+            base_slip = float(self._opt_slippage_var.get() or 0.0)
+            fee = float(self._opt_fee_var.get() or 0.0)
+            fill = float(self._opt_fill_var.get() or 1.0)
+            grid = [
+                (base_slip, fee, fill),
+                (max(0.0, base_slip - 1.0), fee, min(1.0, fill)),
+                (base_slip + 1.0, fee * 1.5, max(0.25, fill - 0.25)),
+            ]
+            for iid in list(self._opt_results_tree.get_children()):
+                self._opt_results_tree.delete(iid)
+            best = None
+            for slip, fee_val, fill_val in grid:
+                pnl, trades = simulate_simple(prices, signals, slippage_bps=slip, fee_per_order=fee_val, partial_fill_rate=fill_val, return_trades=True)
+                trade_count = len(trades)
+                winrate = 0.0
+                try:
+                    wins = sum(1 for t in trades if float(t.get("net_pnl", 0.0) or 0.0) > 0)
+                    winrate = (wins / trade_count * 100.0) if trade_count else 0.0
+                except Exception:
+                    winrate = 0.0
+                slip_cost = sum(float(t.get("slippage_cost", 0.0) or 0.0) for t in trades) if trades else 0.0
+                self._opt_results_tree.insert("", tk.END, values=(f"{slip:.2f}", f"{fee_val:.2f}", f"{fill_val:.2f}", f"{float(pnl):.2f}", trade_count, f"{winrate:.1f}%", f"{slip_cost:.2f}"))
+                if best is None or float(pnl) > float(best[0]):
+                    best = (pnl, slip, fee_val, fill_val)
+            if best is not None:
+                self._opt_status_var.set(f"Best PnL {float(best[0]):.2f} at slip={best[1]:.2f}, fee={best[2]:.2f}, fill={best[3]:.2f}")
+        except Exception as exc:
+            self._opt_status_var.set(f"Optimizer run failed: {exc}")
+
+    def _send_test_alert(self) -> None:
+        try:
+            from alerts import TelegramNotifier
+            cfg = getattr(self, "_scalper", None)
+            cfg_obj = getattr(cfg, "cfg", None) if cfg is not None else None
+            bot_token = str(getattr(cfg_obj, "telegram_bot_token", "") or os.getenv("MSTOCK_TELEGRAM_BOT_TOKEN", "")).strip()
+            chat_id = str(getattr(cfg_obj, "telegram_chat_id", "") or os.getenv("MSTOCK_TELEGRAM_CHAT_ID", "")).strip()
+            if not bot_token or not chat_id:
+                self._opt_status_var.set("Telegram config missing.")
+                return
+            notifier = TelegramNotifier(bot_token, chat_id)
+            notifier.send_message("<b>NiftyScalper</b> test alert: alerts are wired.")
+            self._opt_status_var.set("Test alert sent.")
+        except Exception as exc:
+            self._opt_status_var.set(f"Alert failed: {exc}")
+
     def _format_legs(
         self,
         legs: list[dict],
         *,
         show_prices: bool = True,
-        hedge_prefix: bool = True,
+        hedge_prefix: bool = False,
     ) -> str:
         parts: list[str] = []
         for leg in legs:
@@ -4816,22 +7626,19 @@ class ScalperUI(tk.Tk):
                     is_hedge = False
                 is_option_leg = self._is_option_leg(leg)
 
-                # Try to simplify option legs like NIFTY2610626200CE -> 26200 CE.
                 label = sym
                 strike = leg.get("strike")
+                if strike is None:
+                    strike = leg.get("display_strike")
                 opt_type = str(leg.get("option_type") or "").upper()
+                if not opt_type:
+                    opt_type = str(leg.get("display_option_type") or "").upper().strip()
                 expiry = leg.get("expiry")
-
-                if is_hedge and not is_option_leg:
-                    # Render hedge legs in a distinct, unambiguous format.
-                    # Example: "HEDGE: SELL NIFTY x65 (...)".
-                    label = sym
-                    strike = None
-                    opt_type = ""
-                    expiry = None
+                if expiry is None:
+                    expiry = leg.get("display_expiry")
 
                 # Prefer explicit strike/option_type when present from the option chain.
-                if strike is not None or opt_type:
+                if strike is not None or opt_type or expiry is not None:
                     try:
                         if strike is not None:
                             s_val = float(strike)
@@ -4858,6 +7665,10 @@ class ScalperUI(tk.Tk):
                         pieces.append(f"{s_str}")
                     if opt_type:
                         pieces.append(opt_type)
+                    if not s_str and not opt_type:
+                        display_sym = sym.split(":", 1)[-1].strip() if sym else ""
+                        if display_sym:
+                            pieces.append(display_sym)
                     if pieces:
                         label = " ".join(pieces)
                 else:
@@ -4925,6 +7736,112 @@ class ScalperUI(tk.Tk):
                 continue
         return "; ".join(parts)[:500]
 
+    def _format_trade_legs_for_state(self, trade_id: str, state: dict[str, object]) -> str:
+        legs_all = state.get("legs") if isinstance(state.get("legs"), list) else []
+        if not legs_all:
+            return ""
+
+        def _format_leg_loose(leg: dict[str, object]) -> str:
+            try:
+                side = str(leg.get("side") or "").upper().strip()
+            except Exception:
+                side = ""
+            if not side:
+                side = "?"
+
+            label = self._format_leg_symbol_ui(leg, include_hedge_tag=False)
+            if not label:
+                try:
+                    label = str(leg.get("symbol") or "").strip()
+                except Exception:
+                    label = ""
+            if not label:
+                return ""
+
+            try:
+                qty = self._get_leg_qty(leg)
+            except Exception:
+                qty = 0
+
+            prices: list[str] = []
+            for key, prefix in (("entry_price", "entry"), ("exit_price", "exit"), ("ltp", "last")):
+                try:
+                    raw = leg.get(key)
+                    if raw is None:
+                        continue
+                    prices.append(f"{prefix} {float(raw):.2f}")
+                except Exception:
+                    continue
+
+            qty_text = f" x{qty}" if qty > 0 else ""
+            if prices:
+                return f"{side} {label}{qty_text} ({', '.join(prices)})"
+            return f"{side} {label}{qty_text}"
+
+        def _format_leg_list(legs: list[dict], *, hedge_prefix: bool) -> str:
+            primary = self._format_legs(legs, show_prices=True, hedge_prefix=hedge_prefix)
+            if primary:
+                return primary
+            fallback_parts: list[str] = []
+            for leg in legs:
+                if not isinstance(leg, dict):
+                    continue
+                txt = _format_leg_loose(leg)
+                if txt:
+                    fallback_parts.append(txt)
+            return "; ".join(fallback_parts)[:500]
+
+        if str(trade_id).endswith("-H"):
+            hedge_legs = [leg for leg in legs_all if isinstance(leg, dict)]
+            if not hedge_legs:
+                return ""
+            try:
+                parent_id = str(trade_id)[:-2]
+                trade_state = getattr(self, "_trade_state", {})
+                parent_state = trade_state.get(parent_id) if isinstance(trade_state, dict) else None
+                parent_legs = parent_state.get("legs") if isinstance(parent_state, dict) and isinstance(parent_state.get("legs"), list) else []
+                parent_ctx = self._first_display_option_context_from_legs(parent_legs)
+            except Exception:
+                parent_ctx = {}
+            if parent_ctx:
+                enriched_hedge_legs: list[dict] = []
+                for leg in hedge_legs:
+                    try:
+                        leg_copy = dict(leg)
+                        parent_expiry = parent_ctx.get("expiry")
+                        parent_strike = parent_ctx.get("strike")
+                        parent_opt_type = parent_ctx.get("option_type")
+                        if leg_copy.get("expiry") in (None, "") and leg_copy.get("display_expiry") in (None, ""):
+                            leg_copy["display_expiry"] = parent_expiry
+                        if leg_copy.get("strike") in (None, "") and leg_copy.get("display_strike") in (None, ""):
+                            leg_copy["display_strike"] = parent_strike
+                        if leg_copy.get("option_type") in (None, "") and leg_copy.get("display_option_type") in (None, ""):
+                            leg_copy["display_option_type"] = parent_opt_type
+                        enriched_hedge_legs.append(leg_copy)
+                    except Exception:
+                        enriched_hedge_legs.append(leg)
+                hedge_legs = enriched_hedge_legs
+            primary = self._format_legs(hedge_legs, show_prices=True, hedge_prefix=False)
+            if primary:
+                return primary
+            net_view = self._format_net_hedge_legs(hedge_legs, include_flat=True)
+            if net_view:
+                return net_view
+            return _format_leg_list(hedge_legs, hedge_prefix=False)
+
+        main_legs, hedge_opt_legs, _hedge_under_legs = self._split_legs_for_display(legs_all)
+        display_main_legs: list[dict] = []
+        for leg in list(main_legs) + list(hedge_opt_legs):
+            if not isinstance(leg, dict):
+                continue
+            if self._get_leg_qty(leg) <= 0 and not str(leg.get("symbol") or "").strip():
+                continue
+            display_main_legs.append(leg)
+        if display_main_legs:
+            return _format_leg_list(display_main_legs, hedge_prefix=False)
+
+        return _format_leg_list([leg for leg in legs_all if isinstance(leg, dict)], hedge_prefix=False)
+
     def _note_traded_qty(self, evt: TradeLogEvent) -> None:
         """Accumulate traded quantity (turnover) for today (option legs only, excludes hedges).
 
@@ -4968,7 +7885,7 @@ class ScalperUI(tk.Tk):
             if primary_key is None:
                 continue
             try:
-                q = int(leg.get("quantity") or 0)
+                q = self._get_leg_qty(leg) if hasattr(self, "_get_leg_qty") else ScalperUI._get_leg_qty(self, leg)
             except Exception:
                 q = 0
 
@@ -5224,14 +8141,46 @@ class ScalperUI(tk.Tk):
                 evt = self._trade_q.get_nowait()
                 processed += 1
                 try:
+                    try:
+                        db = getattr(self, "_db_manager", None)
+                        if db is not None and hasattr(db, "insert_trade_event"):
+                            db.insert_trade_event({
+                                "ts": evt.ts,
+                                "event": evt.event,
+                                "trade_id": evt.trade_id,
+                                "position_type": evt.position_type,
+                                "name": evt.name,
+                                "legs": evt.legs,
+                                "mtm": evt.mtm,
+                                "realized": evt.realized,
+                                "reason": evt.reason,
+                                "margin_required": evt.margin_required,
+                            })
+                    except Exception:
+                        pass
+
                     trade_id = str(evt.trade_id)
                     state = self._trade_state.setdefault(trade_id, {})
+                    closed_before_event = self._is_closed_trade_state(trade_id, state)
+                    if evt.event == "UPDATE" and closed_before_event:
+                        continue
+                    if evt.event == "CLOSE" and closed_before_event and bool(state.get("_close_realized_applied")):
+                        continue
+
+                    # Some strategy paths emit a first UPDATE instead of OPEN.
+                    # Seed the row state so the UI still shows a complete trade line.
+                    if evt.event == "UPDATE" and not state:
+                        state.setdefault("opened_ts", float(evt.ts))
+                        state["pos_type"] = evt.position_type
+                        state["strategy"] = evt.name
+                        state["legs"] = self._merge_trade_legs(state.get("legs"), evt.legs)
+                        state["status"] = "OPEN"
 
                     if evt.event == "OPEN":
                         state.setdefault("opened_ts", float(evt.ts))
                         state["pos_type"] = evt.position_type
                         state["strategy"] = evt.name
-                        state["legs"] = evt.legs
+                        state["legs"] = self._merge_trade_legs(state.get("legs"), evt.legs)
                         state["status"] = "OPEN"
                         self._note_traded_qty(evt)
                         self._note_hedge_traded_qty(evt)
@@ -5338,41 +8287,7 @@ class ScalperUI(tk.Tk):
                         # exit prices so closed-leg logs keep quantities and strikes.
                         try:
                             if evt.legs:
-                                merged_legs: list[dict[str, object]] = []
-                                previous_legs = state.get("legs") if isinstance(state.get("legs"), list) else []
-                                previous_by_symbol: dict[str, dict[str, object]] = {}
-                                for prev_leg in previous_legs:
-                                    if not isinstance(prev_leg, dict):
-                                        continue
-                                    prev_symbol = str(prev_leg.get("symbol") or "").strip()
-                                    if prev_symbol and prev_symbol not in previous_by_symbol:
-                                        previous_by_symbol[prev_symbol] = prev_leg
-
-                                for leg in evt.legs:
-                                    if not isinstance(leg, dict):
-                                        continue
-                                    leg_copy = dict(leg)
-                                    symbol = str(leg_copy.get("symbol") or "").strip()
-                                    prev_leg = previous_by_symbol.get(symbol) if symbol else None
-                                    if isinstance(prev_leg, dict):
-                                        try:
-                                            leg_qty = int(leg_copy.get("quantity") or 0)
-                                        except Exception:
-                                            leg_qty = 0
-                                        if leg_qty <= 0:
-                                            try:
-                                                prev_qty = int(prev_leg.get("quantity") or 0)
-                                            except Exception:
-                                                prev_qty = 0
-                                            if prev_qty > 0:
-                                                leg_copy["quantity"] = prev_qty
-                                        for key in ("strike", "option_type", "expiry", "side", "entry_price", "token", "exchange"):
-                                            if leg_copy.get(key) in (None, "") and prev_leg.get(key) not in (None, ""):
-                                                leg_copy[key] = prev_leg.get(key)
-                                    merged_legs.append(leg_copy)
-
-                                if merged_legs:
-                                    state["legs"] = merged_legs
+                                state["legs"] = self._merge_trade_legs(state.get("legs"), evt.legs)
                         except Exception:
                             pass
                         close_evt = evt
@@ -5395,21 +8310,49 @@ class ScalperUI(tk.Tk):
                         self._note_closed_option_legs(close_evt)
                         self._note_traded_qty(evt)
                         self._note_hedge_traded_qty(evt)
+                        try:
+                            if evt.realized is not None:
+                                ledger = getattr(self, "_pnl_ledger", None)
+                                if not isinstance(ledger, list):
+                                    ledger = []
+                                    setattr(self, "_pnl_ledger", ledger)
+                                ledger.append(float(evt.realized))
+                        except Exception:
+                            pass
                     elif evt.event == "UPDATE":
                         # Keep status as-is.
                         state.setdefault("status", "OPEN")
                         # Count any incremental adds to open qty on UPDATE.
                         self._note_traded_qty(evt)
                         self._note_hedge_traded_qty(evt)
+                        try:
+                            if evt.realized is not None:
+                                ledger = getattr(self, "_pnl_ledger", None)
+                                if not isinstance(ledger, list):
+                                    ledger = []
+                                    setattr(self, "_pnl_ledger", ledger)
+                                ledger.append(float(evt.realized))
+                        except Exception:
+                            pass
 
                     if evt.legs and evt.event not in {"PARTIAL_CLOSE", "CLOSE"}:
-                        state["legs"] = evt.legs
+                        state["legs"] = self._merge_trade_legs(state.get("legs"), evt.legs)
                     if evt.mtm is not None:
                         state["mtm"] = float(evt.mtm)
                     if evt.realized is not None:
                         # Accumulate realized P&L for partial bookings
                         cur_realized = float(state.get("realized") or 0.0)
                         state["realized"] = cur_realized + float(evt.realized)
+                    if evt.event == "CLOSE":
+                        state["_close_realized_applied"] = True
+
+                    if self._is_closed_trade_state(trade_id, state):
+                        closed_display = self._closed_trade_display_value(state)
+                        if closed_display is not None:
+                            state["_closed_display_pnl"] = float(closed_display)
+                            state["mtm"] = float(closed_display)
+                            if state.get("realized") is None:
+                                state["realized"] = float(closed_display)
 
                     # Margin requirement (best-effort; present only when strategy computed it).
                     try:
@@ -5425,35 +8368,85 @@ class ScalperUI(tk.Tk):
                     mtm_str = "" if mtm is None else f"{float(mtm):.2f}"
                     realized_str = "" if realized is None else f"{float(realized):.2f}"
 
+                    def _display_text(value: object, fallback: str = "") -> str:
+                        try:
+                            text = str(value).strip()
+                        except Exception:
+                            return fallback
+                        if not text or text.lower() == "none":
+                            return fallback
+                        return text
+
+                    trade_id_raw = trade_id
+                    trade_id_norm = str(trade_id_raw or "").strip()
+                    trade_id_display = trade_id_norm or str(trade_id_raw or "")
+
+                    pos_type = _display_text(state.get("pos_type"))
+                    if not pos_type:
+                        if trade_id_norm.endswith("-H"):
+                            pos_type = "delta_hedge"
+                        elif trade_id_display.startswith("D"):
+                            pos_type = "directional"
+                        elif trade_id_display.startswith("M"):
+                            pos_type = "multi"
+
+                    strategy = _display_text(state.get("strategy"))
+                    if not strategy:
+                        strategy = _display_text(state.get("name"))
+                    if not strategy and pos_type == "directional":
+                        strategy = "AUTO"
+
                     legs_all = state.get("legs") or []
-                    main_legs, hedge_opt_legs, hedge_under_legs = self._split_legs_for_display(legs_all)
-                    # Keep option hedges in Legs; underlying hedges get their own row.
-                    display_main_legs: list[dict] = []
-                    for leg in list(main_legs) + list(hedge_opt_legs):
-                        if not isinstance(leg, dict):
-                            continue
-                        if self._get_leg_qty(leg) <= 0:
-                            continue
-                        display_main_legs.append(leg)
-                    legs_str = self._format_legs(display_main_legs, show_prices=True, hedge_prefix=True)
+                    _main_legs, _hedge_opt_legs, hedge_under_legs = self._split_legs_for_display(legs_all)
+                    hedge_display_ctx = self._first_display_option_context_from_legs(list(_main_legs) + list(_hedge_opt_legs))
+                    legs_str = self._format_trade_legs_for_state(trade_id, state)
+                    gpt_col = ""
+                    try:
+                        # Prefer explicit reason field attached by strategy (e.g. gpt:TAKE:...)
+                        r = str(evt.reason or "") if 'evt' in locals() else str(state.get("reason") or "")
+                    except Exception:
+                        r = str(state.get("reason") or "")
+                    try:
+                        r_lower = r.lower()
+                        if r_lower.startswith("gpt:"):
+                            parts = r.split(":", 2)
+                            gpt_col = (parts[1] if len(parts) > 1 else parts[0]) or parts[0]
+                        elif "gpt_auto_select" in r_lower:
+                            gpt_col = "AUTO"
+                        else:
+                            # fallback: inspect status/reason tokens in state
+                            st_r = str(state.get("status") or "")
+                            st_r_lower = st_r.lower()
+                            if "gpt_take" in st_r_lower or "gpt_take" in r_lower:
+                                gpt_col = "TAKE"
+                            elif "gpt_skip" in st_r_lower or "gpt_skip" in r_lower:
+                                gpt_col = "SKIP"
+                            else:
+                                gpt_col = ""
+                    except Exception:
+                        gpt_col = ""
+
+                    if not gpt_col and "gpt" in str(state.get("status") or "").lower():
+                        gpt_col = "AUTO"
+
                     values = (
                         t_str,
-                        trade_id,
-                        str(state.get("pos_type") or ""),
-                        str(state.get("strategy") or ""),
+                        trade_id_display,
+                        pos_type,
+                        strategy,
                         legs_str,
                         mtm_str,
                         realized_str,
                         str(state.get("status") or ""),
                     )
 
-                    row = self._trade_rows.get(trade_id)
+                    row = self._trade_rows.get(trade_id_display)
                     if row is None:
                         row = self.trade_tree.insert("", tk.END, values=values)
-                        self._trade_rows[trade_id] = row
+                        self._trade_rows[trade_id_display] = row
                         # First time this trade shows up in the table.
                         print(
-                            f"[UI] Paper Trade Log row created: {trade_id}"
+                            f"[UI] Paper Trade Log row created: {trade_id_display}"
                             f" ({state.get('pos_type','')} {state.get('strategy','')})"
                         )
                     else:
@@ -5462,7 +8455,7 @@ class ScalperUI(tk.Tk):
                     # Apply row color-coding (profit/loss).
                     try:
                         tag = "neutral"
-                        if str(trade_id).endswith("-H"):
+                        if trade_id_norm.endswith("-H"):
                             tag = "hedge"
                         else:
                             status_s = str(state.get("status") or "").strip().upper()
@@ -5499,8 +8492,12 @@ class ScalperUI(tk.Tk):
                         pass
 
                     # --- Underlying hedge row (separate position type) ---
-                    hedge_trade_id = f"{trade_id}-H"
-                    if hedge_under_legs:
+                    pos_type_norm = str(state.get("pos_type") or "").strip().lower()
+                    strategy_norm = str(state.get("strategy") or "").strip().lower()
+                    is_delta_hedge_trade = trade_id_norm.endswith("-H") or pos_type_norm == "delta_hedge" or strategy_norm == "delta_hedge"
+
+                    hedge_trade_id = f"{trade_id_display}-H"
+                    if hedge_under_legs and not is_delta_hedge_trade:
                         hedge_state = self._trade_state.setdefault(hedge_trade_id, {})
                         hedge_state.setdefault("opened_ts", opened_ts)
                         hedge_state["pos_type"] = "delta_hedge"
@@ -5511,6 +8508,16 @@ class ScalperUI(tk.Tk):
                             if not isinstance(lg, dict):
                                 continue
                             leg_copy = dict(lg)
+                            if hedge_display_ctx:
+                                display_expiry = hedge_display_ctx.get("expiry")
+                                display_strike = hedge_display_ctx.get("strike")
+                                display_option_type = hedge_display_ctx.get("option_type")
+                                if display_expiry not in (None, "") and leg_copy.get("expiry") in (None, "") and leg_copy.get("display_expiry") in (None, ""):
+                                    leg_copy["display_expiry"] = display_expiry
+                                if display_strike not in (None, "") and leg_copy.get("strike") in (None, "") and leg_copy.get("display_strike") in (None, ""):
+                                    leg_copy["display_strike"] = display_strike
+                                if display_option_type and leg_copy.get("option_type") in (None, "") and leg_copy.get("display_option_type") in (None, ""):
+                                    leg_copy["display_option_type"] = display_option_type
                             # Prefer live last price for MTM; if unavailable, use
                             # explicit exit_price (for closed snapshots) as fallback.
                             try:
@@ -5588,7 +8595,7 @@ class ScalperUI(tk.Tk):
                                 self._trade_state.pop(hedge_trade_id, None)
                             except Exception:
                                 pass
-                    else:
+                    elif not is_delta_hedge_trade:
                         # If hedge is fully removed, hide the hedge row.
                         hedge_row = self._trade_rows.pop(hedge_trade_id, None)
                         if hedge_row is not None:
@@ -5603,7 +8610,7 @@ class ScalperUI(tk.Tk):
                                 pass
 
                     if evt.event == "CLOSE":
-                        print(f"[UI] Paper Trade Log row closed: {trade_id} ({state.get('status','')})")
+                        print(f"[UI] Paper Trade Log row closed: {trade_id_display} ({state.get('status','')})")
                 except Exception as exc:  # noqa: BLE001
                     # Never let a UI rendering issue stop updates.
                     print(f"[UI] Failed to render trade event: {exc}")
@@ -5640,6 +8647,13 @@ class ScalperUI(tk.Tk):
             # leave stale OPEN/PARTIAL rows once the bot is idle.
             try:
                 self._prune_stale_open_rows_when_idle()
+            except Exception:
+                pass
+            try:
+                if "processed" in locals() and processed:
+                    self._refresh_broker_health()
+                    if hasattr(self, "journal_tree"):
+                        self._refresh_trade_journal()
             except Exception:
                 pass
             self.after(150, self._pump_trades)
@@ -6807,11 +9821,12 @@ class ScalperUI(tk.Tk):
             def _worker() -> None:
                 values: list[str] = []
                 try:
-                    from scripmaster import ScripMaster
-
-                    sm = ScripMaster(path)
-                    exps = sm.get_available_expiries(root)
-                    values = [d.strftime("%d-%m-%Y") for d in exps] if exps else []
+                    sm = self._get_scripmaster_cached(path)
+                    if sm is None:
+                        values = []
+                    else:
+                        exps = sm.get_available_expiries(root)
+                        values = [d.strftime("%d-%m-%Y") for d in exps] if exps else []
                 except Exception:
                     values = []
                 _expiry_cache[cache_key] = values
@@ -7988,6 +11003,39 @@ class ScalperUI(tk.Tk):
         os.environ["MSTOCK_SHORT_STRIKE_DISTANCE"] = self.distance_var.get().strip() or "50"
         os.environ["MSTOCK_ENABLE_LIVE_TRADING"] = "true" if self.live_var.get() else "false"
 
+        # GPT settings live on a separate tab, but Start Bot should still pick
+        # up the current UI values without requiring a manual save first.
+        if hasattr(self, "gpt_enable_var"):
+            os.environ["MSTOCK_GPT_ENABLE"] = "true" if bool(self.gpt_enable_var.get()) else "false"
+        if hasattr(self, "gpt_require_rec_var"):
+            os.environ["MSTOCK_GPT_REQUIRE_RECOMMENDATION"] = "true" if bool(self.gpt_require_rec_var.get()) else "false"
+        if hasattr(self, "gpt_auto_select_var"):
+            os.environ["MSTOCK_GPT_AUTO_SELECT"] = "true" if bool(self.gpt_auto_select_var.get()) else "false"
+        if hasattr(self, "gpt_mode_var"):
+            gpt_mode = str(self.gpt_mode_var.get() or "").strip().lower()
+            if gpt_mode:
+                os.environ["MSTOCK_GPT_MODE"] = gpt_mode
+        if hasattr(self, "gpt_timeout_var"):
+            gpt_timeout = str(self.gpt_timeout_var.get() or "").strip()
+            if gpt_timeout:
+                os.environ["MSTOCK_GPT_TIMEOUT_SEC"] = gpt_timeout
+        if hasattr(self, "gpt_model_var"):
+            gpt_model = str(self.gpt_model_var.get() or "").strip()
+            if gpt_model:
+                os.environ["MSTOCK_GPT_MODEL"] = gpt_model
+        if hasattr(self, "gpt_base_url_var"):
+            gpt_base_url = str(self.gpt_base_url_var.get() or "").strip()
+            if gpt_base_url:
+                os.environ["MSTOCK_GPT_API_BASE_URL"] = gpt_base_url
+            else:
+                os.environ.pop("MSTOCK_GPT_API_BASE_URL", None)
+        if hasattr(self, "gpt_api_key_var"):
+            gpt_api_key = str(self.gpt_api_key_var.get() or "").strip()
+            if gpt_api_key:
+                os.environ["MSTOCK_GPT_API_KEY"] = gpt_api_key
+            else:
+                os.environ.pop("MSTOCK_GPT_API_KEY", None)
+
         if hasattr(self, "delta_hedge_scope_var"):
             os.environ["MSTOCK_DELTA_HEDGE_SCOPE"] = (
                 self.delta_hedge_scope_var.get().strip().lower() or "strategy_only"
@@ -8030,6 +11078,7 @@ class ScalperUI(tk.Tk):
             else os.getenv("MSTOCK_STARTUP_USE_HISTORICAL_CANDLES", "true").lower() in {"1", "true", "yes", "y"}
         )
         scripmaster_path = str(saved.get("scripmaster_path") or os.getenv("MSTOCK_SCRIPMASTER_PATH", ""))
+        totp_secret = str(saved.get("totp_secret") or os.getenv("MSTOCK_TOTP_SECRET", ""))
         csv_only = bool(
             saved.get("use_csv_only")
             if "use_csv_only" in saved
@@ -8056,6 +11105,8 @@ class ScalperUI(tk.Tk):
         self.api_key_var.set(api_key)
         self.username_var.set(username)
         self.password_var.set(password)
+        if hasattr(self, "totp_secret_var"):
+            self.totp_secret_var.set(totp_secret)
         if hasattr(self, "underlying_token_var"):
             self.underlying_token_var.set(underlying_token)
         if hasattr(self, "underlying_exchange_var"):
@@ -8107,6 +11158,10 @@ class ScalperUI(tk.Tk):
             "username": self.username_var.get().strip(),
             "password": self.password_var.get(),
         }
+        if hasattr(self, "totp_secret_var"):
+            totp_sec = self.totp_secret_var.get().strip()
+            if totp_sec:
+                data["totp_secret"] = totp_sec
         if hasattr(self, "underlying_token_var"):
             u_tok = self.underlying_token_var.get().strip()
             if u_tok:
@@ -8191,68 +11246,78 @@ class ScalperUI(tk.Tk):
             pass
         self.after(100, self._pump_logs)
 
-    # --- Login flow ---
+    # --- Login flow (TOTP) ---
 
-    def _on_request_otp(self) -> None:
-        # Always push any prefilled creds into env for the rest of the app.
+    def _on_login_totp(self) -> None:
+        """Login using TOTP (Time-based One-Time Password) from authenticator app."""
         self._set_env_from_fields()
         username = self.username_var.get().strip()
         password = self.password_var.get()
+        api_key = self.api_key_var.get().strip()
+        totp_secret = self.totp_secret_var.get().strip()
+        totp_code = self.totp_code_var.get().strip() if hasattr(self, "totp_code_var") else ""
+
         if not username or not password:
             messagebox.showerror("Missing info", "Enter username and password first.")
             return
-
-        self.btn_request_otp.configure(state=tk.DISABLED)
-        self.btn_verify_otp.configure(state=tk.DISABLED)
-
-        def worker() -> None:
-            try:
-                refresh_token, message = request_sms_otp(username, password)
-                self._login_state.refresh_token = refresh_token
-                print(message + "\n")
-                self.after(0, lambda: self.otp_entry.focus_set())
-            except Exception as exc:  # noqa: BLE001
-                print(f"Request OTP failed: {exc}\n")
-                self._login_state.refresh_token = None
-            finally:
-                self.after(0, lambda: self.btn_request_otp.configure(state=tk.NORMAL))
-                self.after(0, lambda: self.btn_verify_otp.configure(state=tk.NORMAL))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_verify_otp(self) -> None:
-        self._set_env_from_fields()
-        api_key = self.api_key_var.get().strip()
-        otp = self.otp_var.get().strip()
-        refresh_token = self._login_state.refresh_token
-
         if not api_key:
             messagebox.showerror("Missing info", "Enter API key first.")
             return
-        if not refresh_token:
-            messagebox.showerror("Missing step", "Click 'Request OTP' first.")
-            return
-        if not otp:
-            messagebox.showerror("Missing info", "Enter OTP first.")
+        if not totp_secret and not totp_code:
+            messagebox.showerror("Missing info", "Enter either your TOTP Secret Key or a 6-digit TOTP Code.")
             return
 
-        self.btn_verify_otp.configure(state=tk.DISABLED)
+        self.btn_login_totp.configure(state=tk.DISABLED)
 
         def worker() -> None:
             try:
-                access_token = verify_sms_otp(api_key, refresh_token, otp)
+                access_token = login_with_totp(username, password, api_key, totp_secret, totp_code)
                 os.environ["MSTOCK_ACCESS_TOKEN"] = access_token
+                # Persist the new access token to .env file so it survives restarts.
+                try:
+                    env_path = Path(__file__).parent.parent / ".env"
+                    if env_path.exists():
+                        lines = env_path.read_text(encoding="utf-8").splitlines()
+                        new_lines = []
+                        replaced = False
+                        for line in lines:
+                            if line.startswith("MSTOCK_ACCESS_TOKEN="):
+                                new_lines.append(f"MSTOCK_ACCESS_TOKEN={access_token}")
+                                replaced = True
+                            else:
+                                new_lines.append(line)
+                        if not replaced:
+                            new_lines.append(f"MSTOCK_ACCESS_TOKEN={access_token}")
+                        env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                        print("[ui] Saved new access token to .env")
+                except Exception as exc:
+                    print(f"[ui] Warning: could not persist access token to .env: {exc}")
+
                 self.after(0, lambda: self.access_token_var.set(access_token))
-                self.after(0, lambda: self.otp_var.set(""))
-                print("Access token generated and set in MSTOCK_ACCESS_TOKEN.\n")
+                self.after(0, lambda: self.totp_secret_var.set(""))
+                if hasattr(self, "totp_code_var"):
+                    self.after(0, lambda: self.totp_code_var.set(""))
+                print("Access token generated via TOTP and set in MSTOCK_ACCESS_TOKEN.\n")
+
+                # Update the existing client instance with the new token if it exists.
+                if self._client is not None:
+                    try:
+                        if hasattr(self._client, '_raw') and hasattr(self._client._raw, 'set_access_token'):
+                            self._client._raw.set_access_token(access_token)
+                        elif hasattr(self._client, 'access_token'):
+                            self._client.access_token = access_token
+                        print("[ui] Updated existing client with new access token.\n")
+                    except Exception as exc:
+                        print(f"[ui] Warning: could not update existing client token: {exc}")
 
                 if self.remember_var.get():
                     # Save credentials on successful login if user opted in.
                     self.after(0, self._on_save_credentials)
             except Exception as exc:  # noqa: BLE001
-                print(f"Verify OTP failed: {exc}\n")
+                print(f"TOTP login failed: {exc}\n")
+                self.after(0, lambda e=exc: messagebox.showerror("Login Failed", f"TOTP Login failed: {e}\n\nPlease check if your TOTP Secret Key is correct and matches your authenticator app."))
             finally:
-                self.after(0, lambda: self.btn_verify_otp.configure(state=tk.NORMAL))
+                self.after(0, lambda: self.btn_login_totp.configure(state=tk.NORMAL))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -8279,6 +11344,8 @@ class ScalperUI(tk.Tk):
             return
 
         self._bot_stop.clear()
+        self._bot_start_ts = time.time()
+        self._bot_last_error = ""
         self.btn_start.configure(state=tk.DISABLED)
         self.btn_stop.configure(state=tk.NORMAL)
         if hasattr(self, "status_var"):
@@ -8420,6 +11487,14 @@ class ScalperUI(tk.Tk):
 
                 def event_sink(evt: TradeLogEvent) -> None:  # type: ignore[no-redef]
                     try:
+                        # Show paper-mode simulated trade events by default so the UI
+                        # reflects what the bot is doing. Hide them only when explicitly requested.
+                        allow_paper = str(os.getenv("MSTOCK_HIDE_PAPER_TRADES", "") or "").strip().lower() not in {"1","true","yes","y"}
+                        is_live_cfg = bool(getattr(strat_cfg, "enable_live_trading", False))
+                        if (not is_live_cfg) and (not allow_paper):
+                            # Skip queuing the event without spamming the console.
+                            return
+
                         self._trade_q.put(evt)
                         print(
                             "[UI] Trade event queued: "
@@ -8476,14 +11551,27 @@ class ScalperUI(tk.Tk):
                         return
 
                 scalper = NiftyScalper(client, strat_cfg, event_sink=event_sink, on_tick=on_tick)
+                # Do NOT assign self._scalper in the bot thread; use UI thread callback only
+                try:
+                    scalper._last_router_snapshot = {  # type: ignore[attr-defined]
+                        "source": "ui_start",
+                        "selected": "starting",
+                        "candidates": [],
+                    }
+                except Exception:
+                    pass
                 try:
                     self.after(0, lambda s=scalper: setattr(self, "_scalper", s))
                 except Exception:
-                    self._scalper = scalper
+                    pass  # Assignment in bot thread is unsafe; UI thread callback is primary
                 print("Starting scalper loop...\n")
                 scalper.run_forever(stop_event=self._bot_stop)
                 print("Scalper loop ended.\n")
             except Exception as exc:  # noqa: BLE001
+                try:
+                    self._bot_last_error = f"{type(exc).__name__}: {exc}"
+                except Exception:
+                    self._bot_last_error = "Bot crashed"
                 print(f"Bot crashed: {exc}\n")
             finally:
                 try:

@@ -600,6 +600,24 @@ class StrategyConfig:
     strategy_router_mode: str = "balanced"  # conservative | balanced | aggressive
     diagnostics_enabled: bool = True
 
+    # ---- Regime-specific tuning ----
+    # Used by auto-mode and the ML gate.
+    regime_trending_trend_mult: float = 1.20
+    regime_trending_ml_threshold: float = 0.58
+    regime_trending_preferred_strategy: str = "bull_call_spread"
+
+    regime_volatile_trend_mult: float = 0.90
+    regime_volatile_ml_threshold: float = 0.62
+    regime_volatile_preferred_strategy: str = "long_straddle"
+
+    regime_mean_reverting_trend_mult: float = 0.75
+    regime_mean_reverting_ml_threshold: float = 0.55
+    regime_mean_reverting_preferred_strategy: str = "iron_condor"
+
+    regime_quiet_trend_mult: float = 0.65
+    regime_quiet_ml_threshold: float = 0.57
+    regime_quiet_preferred_strategy: str = "short_strangle"
+
     # ---- Portfolio-level Risk Caps ----
     # 0 disables each cap.
     max_portfolio_option_notional: float = 500000.0
@@ -751,6 +769,10 @@ def _settings_env_path() -> Path:
     return _repo_root() / ".scalper.env"
 
 
+def _dotenv_env_path() -> Path:
+    return _repo_root() / ".env"
+
+
 def _decode_env_value(raw: str) -> str:
     v = (raw or "").strip()
     if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
@@ -804,7 +826,11 @@ def ensure_persisted_env_loaded() -> None:
     global _PERSISTED_ENV_LOADED
     if _PERSISTED_ENV_LOADED:
         return
-    load_persisted_env(override_existing=False)
+    # Load repo-local .env without requiring python-dotenv. This carries secrets
+    # such as MSTOCK_ACCESS_TOKEN for CLI/headless runs and VS Code terminals.
+    load_persisted_env(override_existing=False, path=_dotenv_env_path())
+    # UI-persisted settings should win over .env when both define a setting.
+    load_persisted_env(override_existing=True, path=_settings_env_path())
     _PERSISTED_ENV_LOADED = True
 
 
@@ -882,6 +908,7 @@ def load_api_config() -> APIConfig:
 
     Replace placeholders based on your actual m.Stock Type B naming.
     """
+    ensure_persisted_env_loaded()
     saved = load_saved_credentials()
 
     base_url = os.getenv("MSTOCK_BASE_URL", "").strip() or _sdk_default_base_url()
@@ -2273,6 +2300,22 @@ def load_strategy_config() -> StrategyConfig:
         cfg.auto_dir_rsi_slop = float(os.getenv("MSTOCK_AUTO_DIR_RSI_SLOP", str(cfg.auto_dir_rsi_slop)))
     except Exception:
         pass
+
+    # Regime tuning overrides (optional).
+    for regime_key in ("TRENDING", "VOLATILE", "MEAN_REVERTING", "QUIET"):
+        for suffix, caster in (("TREND_MULT", float), ("ML_THRESHOLD", float), ("PREFERRED_STRATEGY", str)):
+            env_name = f"MSTOCK_REGIME_{regime_key}_{suffix}"
+            v = os.getenv(env_name)
+            if v is None:
+                continue
+            attr = f"regime_{regime_key.lower()}_{suffix.lower()}"
+            try:
+                if caster is float:
+                    setattr(cfg, attr, float(v))
+                else:
+                    setattr(cfg, attr, str(v).strip())
+            except Exception:
+                pass
 
     # Signal Quality
     mtf_enabled = os.getenv("MSTOCK_ENABLE_MTF_CONFIRMATION")

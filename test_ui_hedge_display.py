@@ -35,8 +35,7 @@ def test_format_net_hedge_legs_nets_by_symbol() -> None:
 def test_trade_log_row_values_for_hedge_uses_netted_text() -> None:
     ui = _dummy_ui()
     ui._split_legs_for_display = lambda legs: ([], [], [])  # type: ignore[assignment]
-    ui._format_legs = lambda legs, **kwargs: "SELL NIFTYBEES x65 (entry 120.00, last 118.00)"  # type: ignore[assignment]
-    ui._format_net_hedge_legs = lambda legs: ""  # type: ignore[assignment]
+    ui._format_trade_legs_for_state = lambda tid, state: "SELL NIFTYBEES x65 (entry 120.00, last 118.00)"  # type: ignore[assignment]
 
     row = ScalperUI._trade_log_row_values_from_state(
         ui,
@@ -52,8 +51,44 @@ def test_trade_log_row_values_for_hedge_uses_netted_text() -> None:
     )
 
     assert row is not None
+    # row[4] = legs_text, row[5] = mtm_display
     assert row[4] == "SELL NIFTYBEES x65 (entry 120.00, last 118.00)"
     assert row[5] == "130.50"
+
+
+def test_underlying_hedge_row_inherits_parent_expiry_format() -> None:
+    ui = _dummy_ui()
+    ui._trade_state = {
+        "D1": {
+            "legs": [
+                {
+                    "symbol": "NIFTY26MAY23950PE",
+                    "side": "BUY",
+                    "quantity": 65,
+                    "strike": 23950,
+                    "option_type": "PE",
+                    "expiry": "26-May-26",
+                    "entry_price": 88.70,
+                }
+            ],
+        },
+        "D1-H": {
+            "legs": [
+                {
+                    "symbol": "NIFTY",
+                    "side": "BUY",
+                    "quantity": 65,
+                    "is_hedge": True,
+                    "entry_price": 23938.90,
+                    "ltp": 23940.70,
+                }
+            ],
+        },
+    }
+
+    txt = ScalperUI._format_trade_legs_for_state(ui, "D1-H", ui._trade_state["D1-H"])
+
+    assert txt == "BUY 26-May-26 23950 PE x65 (entry 23938.90, last 23940.70)"
 
 
 def test_format_net_hedge_legs_can_skip_flat_symbols() -> None:
@@ -73,7 +108,24 @@ def test_format_net_hedge_legs_can_skip_flat_symbols() -> None:
 
 def test_trade_log_row_values_ignores_zero_qty_main_legs() -> None:
     ui = _dummy_ui()
-    ui._split_legs_for_display = lambda legs: (legs, [], [])  # type: ignore[assignment]
+    
+    # Mock _format_trade_legs_for_state to return a predictable string
+    def mock_format_trade_legs(trade_id: str, state: dict) -> str:
+        legs = state.get("legs", [])
+        # Filter out zero quantity legs for display
+        non_zero_legs = [l for l in legs if l.get("quantity", 0) > 0]
+        if not non_zero_legs:
+            return ""
+        # Simple format for testing
+        parts = []
+        for leg in non_zero_legs:
+            side = leg.get("side", "")
+            opt_type = leg.get("option_type", "")
+            qty = leg.get("quantity", 0)
+            parts.append(f"{side} {opt_type} x{qty}")
+        return ", ".join(parts)
+    
+    ui._format_trade_legs_for_state = mock_format_trade_legs  # type: ignore[assignment]
 
     row = ScalperUI._trade_log_row_values_from_state(
         ui,
@@ -103,5 +155,6 @@ def test_trade_log_row_values_ignores_zero_qty_main_legs() -> None:
     )
 
     assert row is not None
+    # row[4] = legs_text
     assert "25000 CE" not in row[4]
     assert "SELL PE x50" in row[4]

@@ -84,8 +84,9 @@ def test_collect_today_trade_log_pdf_rows_filters_and_formats(monkeypatch) -> No
     assert rows[0][2] == "multi"
     assert rows[0][3] == "iron_condor"
     assert "SELL 22400 CE x50 (entry 101.25)" in rows[0][4]
-    assert "HEDGE: BUY 22600 CE x50 (entry 41.50)" in rows[0][4]
+    assert "BUY 22600 CE x50 (entry 41.50)" in rows[0][4]
+    assert "HEDGE:" not in rows[0][4]
     assert rows[0][5] == "1240.50 (base 1250.50 + hedge -10.00)"
     assert rows[0][6] == "300.00"
-    assert rows[1][4] == "BUY NIFTY-I x50"
+    assert rows[1][4] == "BUY 22400 CE x50"
     assert rows[1][5] == "-10.00"

@@ -31,3 +31,25 @@ def kelly_fraction(win_rate: float, win_loss_ratio: float) -> float:
         return max(0.0, min(1.0, f))
     except Exception:
         return 0.0
+
+
+def optimize_sizes_cvar(returns_matrix, target_cvar: float = 0.02, budget: float = 1.0):
+    """Wrapper to `risk_cvar.optimize_position_sizes` with a safe fallback.
+
+    `returns_matrix` should be a list of lists (scenarios x assets). Returns
+    a list of weights (floats) or None on failure.
+    """
+    try:
+        from risk_cvar import optimize_position_sizes
+
+        return optimize_position_sizes(returns_matrix, target_cvar=target_cvar, budget=budget)
+    except Exception:
+        # Fallback: equal-weight heuristic scaled to budget
+        try:
+            n = len(returns_matrix[0]) if returns_matrix and returns_matrix[0] else 0
+            if n <= 0:
+                return None
+            w = [float(budget) / float(n) for _ in range(n)]
+            return w
+        except Exception:
+            return None
