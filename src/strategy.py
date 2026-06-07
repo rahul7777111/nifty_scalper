@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
+import json
+import logging
 import os
 import re
 import time
@@ -8,8 +11,8 @@ import math
 from datetime import date
 from datetime import datetime as dt_datetime, time as dt_time, timedelta
 from dataclasses import dataclass, replace
-from threading import Event
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from threading import Event, Lock
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 try:
     import pytz  # type: ignore[import-not-found]
@@ -52,19 +55,31 @@ from candlestick_patterns import (
     is_shooting_star,
 )
 from config import StrategyConfig
+from cost_model import CostModel, evaluate_live_execution_friction
 from greeks import OptionType, delta, gamma, implied_volatility, theta as bs_theta, vega
 from indicators import adx, atr, ema, rsi, sma, supertrend, roc, choppiness_index, pivot_points
 from market_data import Candle
+from mean_reversion import evaluate_mean_reversion
 from mstock_client import MStockTypeBClient, Order
+from stat_arb import evaluate_pair_spread
 from volatility import forecast_volatility
-from strategy_allocator import detect_regime, get_regime_tuning, select_strategy_for_regime
+from strategy_allocator import allocate_sleeves_for_regime, detect_regime, get_regime_tuning, select_strategy_for_regime
 from risk_cvar import compute_cvar
 from greeks_manager import GreeksManager
-from exit_optimizer import ExitOptimizer
-from ml_signals import feature_vector_from_candles, load_model, predict
-from position_sizing import volatility_target_size, kelly_fraction
+from exit_optimizer import (
+    ExitOptimizer,
+    TripleBarrierState,
+    evaluate_triple_barrier_state,
+    initialize_triple_barrier_state,
+)
+from label_policies import get_label_policy_spec
+from ml_signals import evaluate_ml_gating_before_execution, feature_vector_from_candles, load_model, predict
+from position_sizing import calculate_position_size, volatility_target_size, kelly_fraction
 from trailing import atr_trailing_stop
 from backtest_harness import simulate_simple
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def calc_partial_exit_qty(total_qty: int, partial_pct: float, lot_size: int) -> int:
@@ -118,6 +133,21 @@ def calc_partial_exit_qty(total_qty: int, partial_pct: float, lot_size: int) -> 
     return exit_qty
 
 
+def submit_paper_trade_order(
+    strategy_context: Dict[str, Any],
+    prediction_id: str,
+    probability: float,
+) -> Dict[str, Any]:
+    """Build a trade payload with explicit ML telemetry linkage."""
+
+    payload = dict(strategy_context or {})
+    metadata = dict(payload.get("metadata") or {})
+    metadata["prediction_id"] = str(prediction_id or "")
+    metadata["probability"] = float(probability)
+    payload["metadata"] = metadata
+    return payload
+
+
 @dataclass
 class TradeState:
     open_orders: List[Order]
@@ -140,7 +170,7 @@ class TradeState:
 @dataclass(frozen=True)
 class TradeLogEvent:
     ts: float
-    event: str  # "OPEN" | "UPDATE" | "CLOSE"
+    event: str  # "OPEN" | "UPDATE" | "CLOSE" | "PARTIAL_CLOSE"
     trade_id: str
     position_type: str  # "multi" | "directional"
     name: str
@@ -149,6 +179,38 @@ class TradeLogEvent:
     realized: Optional[float] = None
     reason: Optional[str] = None
     margin_required: Optional[float] = None
+    # ---- paper-journal validation fields ----
+    symbol: Optional[str] = None  # e.g. "NIFTY" (root, derived from legs)
+    strike: Optional[float] = None  # ATM strike at entry
+    option_type: Optional[str] = None  # "CE" | "PE"
+    side: Optional[str] = None  # "BUY" | "SELL"
+    quantity: Optional[int] = None  # lots × multiplier
+    bid: Optional[float] = None  # best bid at entry/exit
+    ask: Optional[float] = None  # best ask at entry/exit
+    ltp: Optional[float] = None  # last traded price at entry/exit
+    execution_price: Optional[float] = None  # actual price used
+    execution_price_source: Optional[str] = None  # "ask" | "bid" | "ltp_fallback"
+    entry_price: Optional[float] = None
+    exit_price: Optional[float] = None
+    gross_pnl: Optional[float] = None  # before costs
+    net_pnl: Optional[float] = None  # after costs (spread + slippage + brokerage)
+    spread_cost: Optional[float] = None  # spread cost in rupees
+    slippage_cost: Optional[float] = None  # slippage cost in rupees
+    brokerage_cost: Optional[float] = None  # brokerage + taxes + fees in rupees
+    exit_reason: Optional[str] = None  # stop_loss | target_hit | time_exit | eod_squareoff | gpt_override
+    risk_filter_decisions: Optional[Dict[str, Any]] = None  # dict of what filters passed/failed
+    realized_slippage_pct: Optional[float] = None
+    paper_mode: bool = True  # True for simulated fills; False for live
+
+
+@dataclass(frozen=True)
+class OptionContract:
+    exchange: str
+    tradingsymbol: str
+    instrument_token: str
+    expiry: object
+    strike: float
+    option_type: str
 
 
 class NiftyScalper:
@@ -179,6 +241,12 @@ class NiftyScalper:
         try:
             from db import DatabaseManager
             self.db_manager = DatabaseManager()
+        except ImportError:
+            pass
+        self.reconciliation_engine = None
+        try:
+            from reconciliation import ReconciliationEngine
+            self.reconciliation_engine = ReconciliationEngine()
         except ImportError:
             pass
             
@@ -228,6 +296,9 @@ class NiftyScalper:
 
         # Win-rate tracker state
         self._strategy_winrate: Dict[str, Dict[str, object]] = {}
+        self._last_prediction_id: Optional[str] = None
+        self._last_prediction_record: Optional[Dict[str, object]] = None
+        self._ml_model_checksum: Optional[str] = None
         self._entries_paused: bool = False
         self._disabled_strategies: Dict[str, float] = {}
         
@@ -264,6 +335,10 @@ class NiftyScalper:
         self._last_ml_feature_names: List[str] = []
         self._last_ml_features: List[float] = []
         self._last_regime_profile: Dict[str, object] = {}
+        self._last_ml_bet_multiplier: float = 0.0
+        self._last_baseline_vol_lots: int = 0
+        self._last_final_allocated_lots: int = 0
+        self._peak_equity_rupees: float = max(float(getattr(self.cfg, "account_capital", 100000.0) or 100000.0), 1.0)
 
         # ---- P1: GPT Exit Management state ----
         self._gpt_exit_mgmt_last_run: float = 0.0
@@ -289,6 +364,7 @@ class NiftyScalper:
 
         # last ML preds cache
         self._last_ml_pred: float = 0.0
+        self._last_ml_threshold: float = 0.0
 
         # ---- P4: GPT Regime Monitor state ----
         self._gpt_regime_last_run: float = 0.0
@@ -412,20 +488,52 @@ class NiftyScalper:
         """
         try:
             if not candles:
+                LOGGER.debug("Entry evaluation skipped: no candles available")
                 return {"take": False, "reason": "no_data", "size": 0, "ml_prob": 0.0}
             latest = candles[-1]
             # basic technicals
             r = rsi([c.close for c in candles], period=self.cfg.atr_period)
             atr_val = atr([c.high for c in candles], [c.low for c in candles], [c.close for c in candles], period=self.cfg.atr_period)
             self._cached_atr = float(atr_val or 0.0)
+            closes = [float(c.close) for c in candles]
+            fast_ema_live = float(ema(closes, period=self.cfg.ema_fast) or 0.0)
+            slow_ema_live = float(ema(closes, period=self.cfg.ema_slow) or 0.0)
+            trend_strength_live = float(self._trend_strength(fast_ema_live, slow_ema_live, float(latest.close or 0.0)))
             # regime
             regime = detect_regime([self._cached_atr] * 30, [20.0] * 30, [r or 50.0] * 30)
             regime_profile = get_regime_tuning(regime, self.cfg)
             self._last_regime_profile = dict(regime_profile)
-            suggested = select_strategy_for_regime(regime, self.cfg)
-
+            mr_signal = evaluate_mean_reversion(
+                closes,
+                lookback=int(getattr(self.cfg, "mean_reversion_lookback", 20) or 20),
+                entry_zscore=float(getattr(self.cfg, "mean_reversion_entry_zscore", 1.25) or 1.25),
+                exit_zscore=float(getattr(self.cfg, "mean_reversion_exit_zscore", 0.35) or 0.35),
+            )
+            fair_value_series = [float(ema(closes[: idx + 1], period=self.cfg.ema_slow) or closes[idx]) for idx in range(len(closes))]
+            stat_arb_signal = evaluate_pair_spread(
+                closes,
+                fair_value_series,
+                lookback=int(getattr(self.cfg, "stat_arb_lookback", 30) or 30),
+                entry_zscore=float(getattr(self.cfg, "stat_arb_entry_zscore", 1.5) or 1.5),
+                exit_zscore=float(getattr(self.cfg, "stat_arb_exit_zscore", 0.5) or 0.5),
+            )
+            sleeve_plan = allocate_sleeves_for_regime(
+                regime,
+                account_capital=float(getattr(self.cfg, "account_capital", 100000.0) or 100000.0),
+                trend_score=max(0.0, trend_strength_live * 100.0),
+                mean_reversion_score=float(mr_signal.entry_score),
+                stat_arb_score=float(stat_arb_signal.confidence),
+                max_single_sleeve_weight=float(getattr(self.cfg, "sleeve_max_single_weight", 0.50) or 0.50),
+                reserve_cash_weight=float(getattr(self.cfg, "sleeve_reserve_cash_weight", 0.10) or 0.10),
+                drawdown_throttle=max(0.25, 1.0 - min(1.0, float(self._current_drawdown_pct()) / 0.05)),
+            )
+            self._last_router_snapshot = dict(getattr(self, "_last_router_snapshot", {}) or {})
+            self._last_router_snapshot["sleeve_plan"] = sleeve_plan
+            suggested = str(sleeve_plan.get("selected_strategy") or select_strategy_for_regime(regime, self.cfg))
+            ctx: Dict[str, Any] = {}
             ml_prob = 0.0
             if getattr(self.cfg, "enable_ml_signals", False) and self.ml_model is not None:
+                LOGGER.debug("Entry evaluation starting ML scoring on %d candles", len(candles))
                 current_iv = None
                 try:
                     iv_watch = self._iv_watch if isinstance(getattr(self, "_iv_watch", None), dict) else {}
@@ -446,15 +554,54 @@ class NiftyScalper:
                     "vega": float(getattr(greeks, "vega", 0.0) or 0.0) if greeks is not None else 0.0,
                     "theta": float(getattr(greeks, "theta", 0.0) or 0.0) if greeks is not None else 0.0,
                     "spot": float(latest.close or 0.0),
-                    "trend_strength": float(self._trend_strength(float(ema([c.close for c in candles], period=self.cfg.ema_fast) or 0.0), float(ema([c.close for c in candles], period=self.cfg.ema_slow) or 0.0), float(latest.close or 0.0))),
+                    "trend_strength": float(trend_strength_live),
+                    "mean_reversion_zscore": float(mr_signal.zscore),
+                    "stat_arb_zscore": float(stat_arb_signal.zscore),
                 }
                 feat_vec, feat_names = feature_vector_from_candles(candles, context=ctx)
                 self._last_ml_features = list(feat_vec)
                 self._last_ml_feature_names = list(feat_names)
-                ml_pred = predict(self.ml_model, [feat_vec])
-                ml_prob = float(ml_pred[0]) if ml_pred else 0.0
+                live_row = {
+                    name: feat_vec[idx]
+                    for idx, name in enumerate(feat_names)
+                    if idx < len(feat_vec)
+                }
+                prediction_id, ml_prob = evaluate_ml_gating_before_execution(
+                    live_row,
+                    self.ml_model,
+                    feat_names,
+                )
+                LOGGER.debug(
+                    "ML scoring completed prediction_id=%s prob=%.4f features=%d shadow_mode=%s",
+                    prediction_id,
+                    float(ml_prob),
+                    len(feat_names),
+                    bool(getattr(self.cfg, "shadow_mode", False)),
+                )
+                self._last_prediction_id = prediction_id
                 self._last_ml_pred = ml_prob
+                try:
+                    self._record_ml_prediction(
+                        prediction_id=str(prediction_id or ""),
+                        candles=candles,
+                        probability=float(ml_prob),
+                        threshold=0.5,
+                        take=False,
+                        reason="ml_scored_pending",
+                        regime=str(regime or ""),
+                        suggested_strategy=None,
+                        feature_names=self._last_ml_feature_names,
+                        feature_values=self._last_ml_features,
+                        ctx=ctx,
+                    )
+                except Exception:
+                    pass
             else:
+                LOGGER.debug(
+                    "Entry evaluation bypassed ML scoring enable_ml_signals=%s model_loaded=%s",
+                    bool(getattr(self.cfg, "enable_ml_signals", False)),
+                    self.ml_model is not None,
+                )
                 self._last_ml_features = []
                 self._last_ml_feature_names = []
 
@@ -462,6 +609,7 @@ class NiftyScalper:
                 ml_threshold = float(regime_profile.get("ml_threshold") if isinstance(regime_profile, dict) else 0.55)
             except Exception:
                 ml_threshold = 0.55
+            self._last_ml_threshold = float(ml_threshold)
 
             # Regime-specific gating: use per-regime ML thresholds before falling back.
             take = False
@@ -506,6 +654,14 @@ class NiftyScalper:
                     if (r or 50.0) < 30 or (r or 50.0) > 70:
                         take = True
                         reason = "technical_fallback"
+                LOGGER.debug(
+                    "Auto entry gating prediction_id=%s prob=%.4f threshold=%.4f take=%s reason=%s",
+                    str(getattr(self, "_last_prediction_id", "") or ""),
+                    float(ml_prob),
+                    float(ml_threshold),
+                    bool(take),
+                    str(reason or ""),
+                )
 
                 # If GPT is enabled, optionally ask GPT to approve/deny the proposed trade.
                 try:
@@ -647,16 +803,88 @@ class NiftyScalper:
 
             # position sizing using volatility targeting
             size = 0
+            baseline_vol_lots = 0
+            ml_bet_multiplier = 0.0
+            final_allocated_lots = 0
             if take:
                 if getattr(self.cfg, "risk_per_trade_percentage", 0.0) > 0:
                     cash = float(getattr(self.cfg, "account_capital", 100000.0) or 100000.0)
                     vol_target = float(getattr(self.cfg, "risk_per_trade_percentage", 0.0) or 0.0)
-                    size = volatility_target_size(cash, vol_target, float(self._cached_atr or 0.01), float(latest.close or 0.0))
+                    baseline_vol_lots = volatility_target_size(cash, vol_target, float(self._cached_atr or 0.01), float(latest.close or 0.0))
                 else:
                     # default small size
-                    size = max(1, int(self.cfg.lot_size // 1))
+                    baseline_vol_lots = max(1, int(self.cfg.lot_size // 1))
 
-            return {"take": take, "reason": reason, "size": int(size), "ml_prob": float(ml_prob), "suggested_strategy": suggested}
+                sizing = calculate_position_size(
+                    baseline_lots=baseline_vol_lots,
+                    calibrated_prob=float(ml_prob),
+                    optimal_threshold=float(ml_threshold),
+                    standard_error=0.10,
+                    current_drawdown_pct=self._current_drawdown_pct(),
+                    max_allowable_drawdown=0.05,
+                    enforce_min_lot=True,
+                )
+                ml_bet_multiplier = float(sizing.get("ml_bet_multiplier", 0.0) or 0.0)
+                final_allocated_lots = int(sizing.get("final_allocated_lots", 0) or 0)
+                size = final_allocated_lots
+
+            self._last_ml_bet_multiplier = float(ml_bet_multiplier)
+            self._last_baseline_vol_lots = int(baseline_vol_lots)
+            self._last_final_allocated_lots = int(final_allocated_lots)
+
+            if getattr(self.cfg, "enable_ml_signals", False) and self.ml_model is not None and self._last_ml_feature_names:
+                try:
+                    sizing_ctx = dict(ctx or {})
+                    sizing_ctx.update(
+                        {
+                            "ml_bet_multiplier": float(self._last_ml_bet_multiplier),
+                            "baseline_vol_lots": int(self._last_baseline_vol_lots),
+                            "final_allocated_lots": int(self._last_final_allocated_lots),
+                            "current_drawdown_pct": float(self._current_drawdown_pct()),
+                        }
+                    )
+                    self._record_ml_prediction(
+                        prediction_id=str(getattr(self, "_last_prediction_id", "") or ""),
+                        candles=candles,
+                        probability=float(ml_prob),
+                        threshold=float(ml_threshold),
+                        take=bool(take),
+                        reason=str(reason or ""),
+                        regime=str(regime or ""),
+                        suggested_strategy=str(suggested or ""),
+                        feature_names=self._last_ml_feature_names,
+                        feature_values=self._last_ml_features,
+                        ctx=sizing_ctx,
+                    )
+                except Exception:
+                    pass
+
+            LOGGER.debug(
+                "Entry evaluation finalized prediction_id=%s take=%s size=%d ml_prob=%.4f multiplier=%.4f baseline_lots=%d final_lots=%d reason=%s",
+                str(getattr(self, "_last_prediction_id", "") or ""),
+                bool(take),
+                int(size),
+                float(ml_prob),
+                float(self._last_ml_bet_multiplier),
+                int(self._last_baseline_vol_lots),
+                int(self._last_final_allocated_lots),
+                str(reason or ""),
+            )
+
+            return {
+                "take": take,
+                "reason": reason,
+                "size": int(size),
+                "ml_prob": float(ml_prob),
+                "ml_bet_multiplier": float(self._last_ml_bet_multiplier),
+                "baseline_vol_lots": int(self._last_baseline_vol_lots),
+                "final_allocated_lots": int(self._last_final_allocated_lots),
+                "suggested_strategy": suggested,
+                "prediction_id": getattr(self, "_last_prediction_id", None),
+                "mean_reversion_signal": mr_signal.signal,
+                "stat_arb_signal": stat_arb_signal.signal,
+                "sleeve_plan": sleeve_plan,
+            }
         except Exception as exc:
             return {"take": False, "reason": f"error:{exc}", "size": 0, "ml_prob": 0.0}
 
@@ -729,6 +957,26 @@ class NiftyScalper:
                 option_type = "CE"
 
             option_symbol = f"{self.cfg.underlying}{expiry}{atm_strike}{option_type}"
+            contract = self._option_contract_from_row(
+                {
+                    "symbol": option_symbol,
+                    "exchange": "NFO",
+                    "token": "",
+                    "expiry": expiry,
+                    "strike": atm_strike,
+                    "option_type": option_type,
+                }
+            )
+            if contract is None or not str(contract.instrument_token or "").isdigit():
+                self._entry_block_for_missing_contract_token(row={"symbol": option_symbol}, context="auto_ml_directional")
+                return None
+            resolved_symbol = contract.tradingsymbol
+            resolved_token = contract.instrument_token
+            resolved_exchange = contract.exchange
+            print(
+                f"[CONTRACT] selected tradingsymbol={resolved_symbol} "
+                f"token={resolved_token} exchange={resolved_exchange}"
+            )
 
             # Parse resolved expiry string back to datetime.date object for greeks/portfolio risk snapshot
             parsed_exp = None
@@ -747,16 +995,29 @@ class NiftyScalper:
 
             # Fetch option contract LTP
             try:
-                option_ltp = self.client.get_ltp(option_symbol)
+                option_ltp = self.client.get_ltp(f"{resolved_exchange}:{resolved_token}")
                 if option_ltp is None:
-                    print(f"[ERROR] No LTP available for option {option_symbol}")
+                    print(f"[ERROR] No LTP available for option {resolved_symbol}")
                     return None
                 price = float(option_ltp)
             except Exception as e:
-                print(f"[ERROR] Failed to fetch LTP for {option_symbol}: {e}")
+                print(f"[ERROR] Failed to fetch LTP for {resolved_symbol}: {e}")
                 return None
             name = "auto_ml_directional"
-            target_symbol = option_symbol if not bool(getattr(self.cfg, "enable_live_trading", False)) else str(getattr(self.cfg, "delta_hedge_symbol", "") or self.cfg.underlying)
+            target_symbol = resolved_symbol if not bool(getattr(self.cfg, "enable_live_trading", False)) else str(getattr(self.cfg, "delta_hedge_symbol", "") or self.cfg.underlying)
+            friction_preview = evaluate_live_execution_friction(
+                {
+                    "client": self.client,
+                    "symbol": resolved_symbol,
+                    "exchange": resolved_exchange,
+                    "cost_model": CostModel(),
+                    "ltp": price,
+                    "enforce_cost_boundary": False,
+                }
+            )
+            if str(friction_preview.get("status") or "") == "REJECT_LIQUIDITY_CEILING":
+                print(f"[ENTRY BLOCKED] {friction_preview.get('status')}: {friction_preview.get('reason')}")
+                return None
 
             # Pyramiding: check for existing open position first
             existing = None
@@ -839,31 +1100,133 @@ class NiftyScalper:
 
             # Paper mode: just print and append a minimal trade record
             if not bool(getattr(self.cfg, "enable_live_trading", False)):
-                print(f"[PAPER][AUTO] {name}: side=BUY size={size} price={price} reason={reason}")
-                tr = {
+                # ----------------------------------------------------------------
+                # Paper BUY entry: use ask price from broker, not LTP.
+                # Block if bid/ask is unavailable (no silent LTP fallback).
+                # ----------------------------------------------------------------
+                bid_raw, ask_raw, _ = self.client.get_bid_ask(
+                    resolved_symbol,
+                    exchange_hint=resolved_exchange,
+                )
+                if ask_raw is None:
+                    print(f"[PAPER][BLOCKED] {name}: ask price unavailable for {resolved_symbol} — bid/ask required for paper realism")
+                    return None
+                paper_entry_price = float(ask_raw)
+                paper_spread_cost = 0.0
+                try:
+                    bid_f = float(bid_raw) if bid_raw is not None else None
+                    if bid_f is not None and paper_entry_price > bid_f:
+                        paper_spread_cost = float((paper_entry_price - bid_f) * float(size))
+                except Exception:
+                    pass
+                # Model slippage + brokerage costs using the paper cost model.
+                # Use cfg.paper_slippage_pct (default 0.1%) as the primary slippage input.
+                # The spread_cost is logged but NOT double-deducted — it is embedded in the ask price.
+                try:
+                    from cost_model import estimate_paper_execution_costs
+                    _entry_costs = estimate_paper_execution_costs(
+                        execution_price=paper_entry_price,
+                        quantity=int(size),
+                        slippage_pct=float(getattr(self.cfg, "paper_slippage_pct", 0.001) or 0.001),
+                        extra_market_impact_pct=float(getattr(self.cfg, "paper_extra_market_impact_pct", 0.0) or 0.0),
+                        apply_brokerage=bool(getattr(self.cfg, "paper_apply_brokerage_costs", True)),
+                        cost_model_source=str(getattr(self.cfg, "paper_cost_model_source", "cost_model_assumptions") or "cost_model_assumptions"),
+                        side="BUY",
+                    )
+                    _entry_slippage_cost = float(_entry_costs.get("slippage_cost", 0.0))
+                    _entry_brokerage_cost = float(_entry_costs.get("total_brokerage_charges", 0.0))
+                    _entry_total_cost = float(_entry_costs.get("total_cost", 0.0))
+                    _entry_slippage_pct = float(getattr(self.cfg, "paper_slippage_pct", 0.001) or 0.001)
+                except Exception:
+                    _entry_costs = {}
+                    _entry_slippage_cost = 0.0
+                    _entry_brokerage_cost = 0.0
+                    _entry_total_cost = 0.0
+                    _entry_slippage_pct = 0.0
+
+                # Enforce premium and liquidity filters before accepting paper entry.
+                paper_legs = [
+                    {
+                        "symbol": resolved_symbol,
+                        "token": resolved_token,
+                        "exchange": resolved_exchange,
+                        "side": "BUY",
+                        "quantity": int(size),
+                        "entry_price": paper_entry_price,
+                    }
+                ]
+                ok, filter_reason = self._check_entry_leg_premiums(paper_legs)
+                if not ok:
+                    print(f"[PAPER][BLOCKED] {name}: premium filter rejected — {filter_reason}")
+                    return None
+
+                print(f"[PAPER][AUTO] {name}: side=BUY size={size} price={paper_entry_price} (ask) reason={reason}")
+                prediction_id = str(getattr(self, "_last_prediction_id", "") or "")
+                meta: Dict[str, Any] = {
+                    "simulated": True,
+                    "reason": reason,
+                    "prediction_id": prediction_id,
+                    "ml_probability": float(getattr(self, "_last_ml_pred", 0.0) or 0.0),
+                    "ml_threshold": float(getattr(self, "_last_ml_threshold", 0.0) or 0.0),
+                    "ml_bet_multiplier": float(getattr(self, "_last_ml_bet_multiplier", 0.0) or 0.0),
+                    "baseline_vol_lots": int(getattr(self, "_last_baseline_vol_lots", 0) or 0),
+                    "final_allocated_lots": int(getattr(self, "_last_final_allocated_lots", size) or size),
+                    "live_bid_ask_spread_pct": float(friction_preview.get("relative_spread_pct") or 0.0),
+                    "order_routing_style": "midpoint_pegged_limit",
+                    "spread_cost_rupees": float(paper_spread_cost),  # logged (embedded in ask price; NOT double-deducted)
+                    "slippage_cost_rupees": float(_entry_slippage_cost),
+                    "brokerage_cost_rupees": float(_entry_brokerage_cost),
+                    "total_entry_cost": float(_entry_total_cost),
+                    "realized_slippage_pct": float(_entry_slippage_pct),
+                    "execution_price_source": "ask",
+                    "execution_friction_status": str(friction_preview.get("status") or ""),
+                }
+                if prediction_id:
+                    try:
+                        meta["triple_barrier"] = self._build_triple_barrier_metadata(
+                            fill_price=paper_entry_price,
+                            prediction_id=prediction_id,
+                            bar_timestamp=getattr(latest, "time", None),
+                        )
+                    except Exception:
+                        pass
+                tr = submit_paper_trade_order(
+                    {
                     "trade_id": self._new_trade_id("D"),
                     "name": name,
-                    "symbol": option_symbol,
+                    "symbol": resolved_symbol,
+                    "token": resolved_token,
+                    "exchange": resolved_exchange,
                     "side": "BUY",
                     "quantity": int(size),
                     "entry_spot": float(spot),
-                    "entry_price": float(price),
+                    "entry_price": float(paper_entry_price),
                     "atr": float(self._cached_atr or 0.0),
                     "legs": [
                         {
-                            "symbol": option_symbol,
+                            "symbol": resolved_symbol,
+                            "token": resolved_token,
+                            "exchange": resolved_exchange,
                             "quantity": int(size),
                             "side": "BUY",
-                            "entry_price": float(price),
+                            "entry_price": float(paper_entry_price),
                             "strike": float(atm_strike),
                             "option_type": option_type,
                             "expiry": parsed_exp,
                         }
                     ],
-                    "meta": {"simulated": True, "reason": reason},
+                    "meta": meta,
                     "opened_ts": time.time(),
                     "entry_time": dt_datetime.now(IST) if IST else dt_datetime.now(),
-                }
+                    },
+                    prediction_id,
+                    float(getattr(self, "_last_ml_pred", 0.0) or 0.0),
+                )
+                if prediction_id and self.db_manager is not None:
+                    try:
+                        self.db_manager.link_prediction_to_trade(prediction_id, str(tr["trade_id"]))
+                    except Exception:
+                        pass
                 self.state.open_directional.append(tr)
                 self.state.trades_today += 1
                 self.state.last_entry_ts = time.time()
@@ -875,35 +1238,79 @@ class NiftyScalper:
             try:
                 hedge_sym = str(getattr(self.cfg, "delta_hedge_symbol", "") or self.cfg.underlying)
                 print(f"[LIVE][AUTO] placing market BUY {hedge_sym} x{size} as underlying proxy for {name}")
-                self.client.place_order(symbol=hedge_sym, side="BUY", quantity=int(size), order_type="MARKET")
+                route_meta: Dict[str, Any] = {}
+                route_result = self._route_midpoint_pegged_limit_order(
+                    symbol=resolved_symbol,
+                    side="BUY",
+                    quantity=int(size),
+                    exchange=resolved_exchange or None,
+                    symbol_token=resolved_token or None,
+                    meta=route_meta,
+                )
+                if not bool(route_result.get("ok")):
+                    print(f"[LIVE][AUTO] midpoint route blocked: {route_result.get('status')} {route_result.get('reason')}")
+                    return None
             except Exception as exc:
                 print(f"[LIVE][AUTO] failed to place underlying order: {exc}")
                 return None
 
-            tr_live = {
+            prediction_id = str(getattr(self, "_last_prediction_id", "") or "")
+            meta_live: Dict[str, Any] = {
+                "simulated": False,
+                "reason": reason,
+                "prediction_id": prediction_id,
+                "ml_probability": float(getattr(self, "_last_ml_pred", 0.0) or 0.0),
+                "ml_threshold": float(getattr(self, "_last_ml_threshold", 0.0) or 0.0),
+                "ml_bet_multiplier": float(getattr(self, "_last_ml_bet_multiplier", 0.0) or 0.0),
+                "baseline_vol_lots": int(getattr(self, "_last_baseline_vol_lots", 0) or 0),
+                "final_allocated_lots": int(getattr(self, "_last_final_allocated_lots", size) or size),
+                "live_bid_ask_spread_pct": float(route_meta.get("live_bid_ask_spread_pct") or 0.0),
+                "order_routing_style": "midpoint_pegged_limit",
+                "realized_slippage_pct": float(route_meta.get("realized_slippage_pct") or 0.0),
+                "execution_friction_status": str(route_meta.get("execution_friction_status") or ""),
+            }
+            if prediction_id and price:
+                try:
+                    meta_live["triple_barrier"] = self._build_triple_barrier_metadata(
+                        fill_price=float(route_result.get("fill_price") or price),
+                        prediction_id=prediction_id,
+                        bar_timestamp=getattr(latest, "time", None),
+                    )
+                except Exception:
+                    pass
+            tr_live = submit_paper_trade_order(
+                {
                 "trade_id": self._new_trade_id("D"),
                 "name": name,
                 "symbol": hedge_sym,
                 "side": "BUY",
                 "quantity": int(size),
                 "entry_spot": float(price),
-                "entry_price": float(price),
+                "entry_price": float(route_result.get("fill_price") or price),
                 "atr": float(self._cached_atr or 0.0),
                 "legs": [
                     {
                         "symbol": hedge_sym,
                         "quantity": int(size),
                         "side": "BUY",
-                        "entry_price": float(price),
+                        "entry_price": float(route_result.get("fill_price") or price),
                         "strike": float(atm_strike),
                         "option_type": option_type,
                         "expiry": parsed_exp,
                     }
                 ],
-                "meta": {"simulated": False, "reason": reason},
+                "meta": meta_live,
                 "opened_ts": time.time(),
                 "entry_time": dt_datetime.now(IST) if IST else dt_datetime.now(),
-            }
+                },
+                prediction_id,
+                float(getattr(self, "_last_ml_pred", 0.0) or 0.0),
+            )
+            if prediction_id and self.db_manager is not None:
+                try:
+                    self.db_manager.link_prediction_to_trade(prediction_id, str(tr_live["trade_id"]))
+                except Exception:
+                    pass
             self.state.open_directional.append(tr_live)
             self.state.trades_today += 1
             self.state.last_entry_ts = time.time()
@@ -2580,6 +2987,15 @@ class NiftyScalper:
             return bool(use_intraday)
         return bool(use_intraday) and self._bool_env("MSTOCK_INTRADAY_ONLY", False)
 
+    def _prefer_synthetic_warmup(self) -> bool:
+        if self._intraday_only_enabled():
+            return True
+        try:
+            client_name = type(self.client).__name__.strip().lower()
+        except Exception:
+            client_name = ""
+        return client_name == "dhanclient"
+
     def _tf_bucket_seconds(self, timeframe: str) -> int:
         tf = str(timeframe or "").strip().lower()
         if tf.endswith("m"):
@@ -3524,6 +3940,255 @@ class NiftyScalper:
                     time.sleep(delay)
         raise RuntimeError(f"place_order failed after {attempts} attempts: {last_exc}")
 
+    @staticmethod
+    def _round_limit_price(price: Optional[float]) -> Optional[float]:
+        try:
+            px = float(price) if price is not None else None
+        except Exception:
+            px = None
+        if px is None or px <= 0.0:
+            return None
+        return round(px * 20.0) / 20.0
+
+    def _route_midpoint_pegged_limit_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        quantity: int,
+        exchange: Optional[str],
+        symbol_token: Optional[str],
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        routing_meta = meta if isinstance(meta, dict) else {}
+        fsm = None
+        if getattr(self, "reconciliation_engine", None) is not None:
+            try:
+                fsm = self.reconciliation_engine.register_order(
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    metadata={
+                        "symbol_token": symbol_token,
+                        "exchange": exchange,
+                        "order_routing_style": "midpoint_pegged_limit",
+                    },
+                )
+            except Exception:
+                fsm = None
+        friction = evaluate_live_execution_friction(
+            {
+                "client": self.client,
+                "symbol": symbol,
+                "exchange": exchange,
+                "cost_model": CostModel(),
+                "enforce_cost_boundary": bool(getattr(self.cfg, "enforce_cost_boundary", False)),
+            }
+        )
+        routing_meta["live_bid_ask_spread_pct"] = float(friction.get("relative_spread_pct") or 0.0)
+        routing_meta["order_routing_style"] = "midpoint_pegged_limit"
+        routing_meta["execution_friction_status"] = str(friction.get("status") or "")
+        routing_meta["execution_friction_reason"] = str(friction.get("reason") or "")
+        routing_meta["initial_midpoint_at_signal"] = friction.get("midpoint")
+        routing_meta["unfilled_ticks"] = 0
+        routing_meta["realized_slippage_pct"] = 0.0
+
+        if str(friction.get("status") or "") == "REJECT_LIQUIDITY_CEILING":
+            return {
+                "ok": False,
+                "status": "REJECT_LIQUIDITY_CEILING",
+                "reason": str(friction.get("reason") or "live_friction_rejected"),
+                "meta": routing_meta,
+                "fsm": fsm,
+            }
+
+        limit_price = self._round_limit_price(friction.get("midpoint"))
+        if limit_price is None:
+            return {
+                "ok": False,
+                "status": "REJECT_LIQUIDITY_CEILING",
+                "reason": "invalid_midpoint_price",
+                "meta": routing_meta,
+                "fsm": fsm,
+            }
+
+        try:
+            chase_reset_ticks = max(1, int(getattr(self.cfg, "midpoint_router_chase_reset_ticks", 5) or 5))
+        except Exception:
+            chase_reset_ticks = 5
+        try:
+            max_unfilled_ticks = max(chase_reset_ticks, int(getattr(self.cfg, "midpoint_router_timeout_ticks", 15) or 15))
+        except Exception:
+            max_unfilled_ticks = 15
+        try:
+            tick_sleep_sec = max(0.0, float(getattr(self.cfg, "midpoint_router_tick_sleep_sec", 0.25) or 0.25))
+        except Exception:
+            tick_sleep_sec = 0.25
+
+        order: Optional[Order] = None
+        latest_friction = dict(friction)
+        for unfilled_ticks in range(max_unfilled_ticks + 1):
+            routing_meta["unfilled_ticks"] = int(unfilled_ticks)
+            if order is None or unfilled_ticks == 0 or (unfilled_ticks % chase_reset_ticks == 0 and unfilled_ticks < max_unfilled_ticks):
+                if order is not None and getattr(order, "order_id", ""):
+                    if fsm is not None:
+                        try:
+                            self.reconciliation_engine.mark_cancel_requested(fsm)
+                        except Exception:
+                            pass
+                    try:
+                        self.client.cancel_order(str(order.order_id))
+                        if fsm is not None:
+                            try:
+                                self.reconciliation_engine.resolve_cancel_result(fsm=fsm, cancel_succeeded=True)
+                            except Exception:
+                                pass
+                    except Exception:
+                        if fsm is not None:
+                            try:
+                                self.reconciliation_engine.resolve_cancel_result(
+                                    fsm=fsm,
+                                    cancel_succeeded=False,
+                                    fill_qty=int(quantity),
+                                    fill_price=float(limit_price or 0.0),
+                                    unsolicited=True,
+                                )
+                            except Exception:
+                                pass
+                        routing_meta["cancel_replace_latency_ms"] = fsm.cancel_replace_latency_ms if fsm is not None else None
+                        routing_meta["unsolicited_fill_occurred"] = True
+                        routing_meta["reconciliation_status_code"] = "LATE_FILL_ABORT"
+                        routing_meta["realized_slippage_pct"] = abs(float(limit_price or 0.0) - float(routing_meta.get("initial_midpoint_at_signal") or limit_price or 1.0)) / max(float(routing_meta.get("initial_midpoint_at_signal") or limit_price or 1.0), 1e-9)
+                        return {
+                            "ok": True,
+                            "status": "late_fill_abort",
+                            "order": order,
+                            "fill_price": float(limit_price or 0.0),
+                            "meta": routing_meta,
+                            "fsm": fsm,
+                        }
+                latest_friction = evaluate_live_execution_friction(
+                    {
+                        "client": self.client,
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "cost_model": CostModel(),
+                        "enforce_cost_boundary": bool(getattr(self.cfg, "enforce_cost_boundary", False)),
+                    }
+                )
+                routing_meta["live_bid_ask_spread_pct"] = float(latest_friction.get("relative_spread_pct") or 0.0)
+                routing_meta["execution_friction_status"] = str(latest_friction.get("status") or "")
+                routing_meta["execution_friction_reason"] = str(latest_friction.get("reason") or "")
+                if str(latest_friction.get("status") or "") == "REJECT_LIQUIDITY_CEILING":
+                    return {
+                        "ok": False,
+                        "status": "REJECT_LIQUIDITY_CEILING",
+                        "reason": str(latest_friction.get("reason") or "spread_widened_during_chase"),
+                        "meta": routing_meta,
+                    }
+                limit_price = self._round_limit_price(latest_friction.get("midpoint"))
+                if limit_price is None:
+                    return {
+                        "ok": False,
+                        "status": "REJECT_LIQUIDITY_CEILING",
+                        "reason": "invalid_midpoint_during_chase",
+                        "meta": routing_meta,
+                    }
+                order = self._place_order_with_retry(
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    order_type="LIMIT",
+                    price=limit_price,
+                    exchange=exchange,
+                    symbol_token=symbol_token,
+                )
+                if fsm is not None:
+                    try:
+                        self.reconciliation_engine.bind_order_id(fsm, str(getattr(order, "order_id", "") or ""))
+                    except Exception:
+                        pass
+                # Broker fill polling is not yet exposed, so treat the newly routed limit as filled at midpoint.
+                fill_price = float(limit_price)
+                initial_mid = float(routing_meta.get("initial_midpoint_at_signal") or limit_price)
+                routing_meta["realized_slippage_pct"] = abs(fill_price - initial_mid) / max(initial_mid, 1e-9)
+                routing_meta["final_limit_price"] = float(limit_price)
+                routing_meta["broker_order_id"] = str(getattr(order, "order_id", "") or "")
+                if fsm is not None:
+                    try:
+                        self.reconciliation_engine.resolve_cancel_result(
+                            fsm=fsm,
+                            cancel_succeeded=False,
+                            fill_qty=int(quantity),
+                            fill_price=float(fill_price),
+                            unsolicited=False,
+                        )
+                    except Exception:
+                        pass
+                    routing_meta["cancel_replace_latency_ms"] = fsm.cancel_replace_latency_ms
+                    routing_meta["unsolicited_fill_occurred"] = bool(fsm.unsolicited_fill_occurred)
+                    routing_meta["reconciliation_status_code"] = str(fsm.reconciliation_status_code or "")
+                return {
+                    "ok": True,
+                    "status": "filled",
+                    "order": order,
+                    "fill_price": float(fill_price),
+                    "meta": routing_meta,
+                    "fsm": fsm,
+                }
+            if tick_sleep_sec > 0.0:
+                time.sleep(tick_sleep_sec)
+
+        if order is not None and getattr(order, "order_id", ""):
+            late_fill = False
+            late_fill_price = None
+            if fsm is not None:
+                try:
+                    self.reconciliation_engine.mark_cancel_requested(fsm)
+                except Exception:
+                    pass
+            try:
+                self.client.cancel_order(str(order.order_id))
+                if fsm is not None:
+                    try:
+                        self.reconciliation_engine.resolve_cancel_result(fsm=fsm, cancel_succeeded=True)
+                    except Exception:
+                        pass
+            except Exception:
+                late_fill = True
+                late_fill_price = limit_price
+                if fsm is not None:
+                    try:
+                        self.reconciliation_engine.resolve_cancel_result(
+                            fsm=fsm,
+                            cancel_succeeded=False,
+                            fill_qty=int(quantity),
+                            fill_price=float(limit_price or 0.0),
+                            unsolicited=True,
+                        )
+                    except Exception:
+                        pass
+            if late_fill:
+                routing_meta["cancel_replace_latency_ms"] = fsm.cancel_replace_latency_ms if fsm is not None else None
+                routing_meta["unsolicited_fill_occurred"] = True
+                routing_meta["reconciliation_status_code"] = "LATE_FILL_ABORT"
+                routing_meta["realized_slippage_pct"] = abs(float(late_fill_price or 0.0) - float(routing_meta.get("initial_midpoint_at_signal") or late_fill_price or 1.0)) / max(float(routing_meta.get("initial_midpoint_at_signal") or late_fill_price or 1.0), 1e-9)
+                return {
+                    "ok": True,
+                    "status": "late_fill_abort",
+                    "order": order,
+                    "fill_price": float(late_fill_price or 0.0),
+                    "meta": routing_meta,
+                    "fsm": fsm,
+                }
+        return {
+            "ok": False,
+            "status": "CANCEL_UNFILLED_TIMEOUT",
+            "reason": "midpoint_pegged_limit_timeout",
+            "meta": routing_meta,
+            "fsm": fsm,
+        }
+
     def _build_bracket_levels(self, *, entry_price: Optional[float], side: str, quantity: int = 0) -> Dict[str, object]:
         try:
             px = float(entry_price) if entry_price is not None else None
@@ -3984,6 +4649,378 @@ class NiftyScalper:
         self._last_candle_err = key
         self._last_candle_err_ts = now
         print(msg)
+
+    def _current_model_artifact_path(self) -> str:
+        try:
+            return os.path.abspath("ml_signal_model.pkl")
+        except Exception:
+            return "ml_signal_model.pkl"
+
+    def _current_model_checksum(self) -> str:
+        if self._ml_model_checksum is not None:
+            return str(self._ml_model_checksum)
+        try:
+            with open(self._current_model_artifact_path(), "rb") as fh:
+                self._ml_model_checksum = hashlib.sha1(fh.read()).hexdigest()
+        except Exception:
+            self._ml_model_checksum = ""
+        return str(self._ml_model_checksum or "")
+
+    def _confidence_bucket(self, probability: float) -> str:
+        try:
+            lower = math.floor(float(probability) * 10.0) / 10.0
+        except Exception:
+            lower = 0.0
+        upper = min(1.0, lower + 0.1)
+        return f"{lower:.1f}-{upper:.1f}"
+
+    def _current_drawdown_pct(self) -> float:
+        try:
+            account_capital = max(float(getattr(self.cfg, "account_capital", 100000.0) or 100000.0), 1.0)
+        except Exception:
+            account_capital = 100000.0
+        current_equity = account_capital + float(getattr(self.state, "realized_pnl", 0.0) or 0.0) + float(getattr(self.state, "unrealized_pnl", 0.0) or 0.0)
+        self._peak_equity_rupees = max(float(getattr(self, "_peak_equity_rupees", account_capital) or account_capital), current_equity)
+        peak_equity = max(float(self._peak_equity_rupees), 1.0)
+        drawdown = max(0.0, peak_equity - current_equity)
+        return float(drawdown / peak_equity)
+
+    def _active_label_policy_config(self) -> Dict[str, Any]:
+        model_bundle = getattr(self, "ml_model", None)
+        try:
+            metrics = dict(getattr(model_bundle, "metrics", {}) or {})
+        except Exception:
+            metrics = {}
+        raw_name = str(metrics.get("label_policy") or "trade_quality_binary").strip()
+        policy_name = raw_name.split(":", 1)[0] or "trade_quality_binary"
+        horizon = max(1, int(metrics.get("horizon_bars") or 45))
+        try:
+            spec = get_label_policy_spec(policy_name, horizon)
+        except Exception:
+            spec = get_label_policy_spec("trade_quality_binary", horizon)
+        params = dict(spec.parameters or {})
+        return {
+            "policy_name": str(spec.name or policy_name),
+            "label_policy_version": f"{spec.name}:{spec.version}",
+            "profit_target_pct": float(params.get("profit_target_pct", 0.01) or 0.01),
+            "stop_loss_pct": float(params.get("stop_loss_pct", 0.005) or 0.005),
+            "max_duration_bars": max(1, int(params.get("max_duration_bars", min(horizon, 18)) or min(horizon, 18))),
+        }
+
+    def _build_triple_barrier_metadata(
+        self,
+        *,
+        fill_price: float,
+        prediction_id: str,
+        bar_timestamp: Optional[dt_datetime],
+    ) -> Dict[str, Any]:
+        cfg = self._active_label_policy_config()
+        state = initialize_triple_barrier_state(
+            fill_price=float(fill_price),
+            prediction_id=str(prediction_id or ""),
+            policy_name=str(cfg["policy_name"]),
+            profit_target_pct=float(cfg["profit_target_pct"]),
+            stop_loss_pct=float(cfg["stop_loss_pct"]),
+            max_duration_bars=int(cfg["max_duration_bars"]),
+            bar_timestamp=bar_timestamp,
+        )
+        payload = state.to_dict()
+        payload["enabled"] = True
+        payload["label_policy_version"] = str(cfg["label_policy_version"])
+        return payload
+
+    def _extract_triple_barrier_state(self, trade: Dict[str, Any]) -> Optional[TripleBarrierState]:
+        meta = trade.get("meta")
+        if not isinstance(meta, dict):
+            return None
+        payload = meta.get("triple_barrier")
+        return TripleBarrierState.from_dict(payload if isinstance(payload, dict) else None)
+
+    def _write_triple_barrier_state(self, trade: Dict[str, Any], state: TripleBarrierState) -> None:
+        meta = trade.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+            trade["meta"] = meta
+        existing = meta.get("triple_barrier")
+        payload = state.to_dict()
+        if isinstance(existing, dict):
+            for key, value in existing.items():
+                if key not in payload:
+                    payload[key] = value
+        payload["enabled"] = True
+        meta["triple_barrier"] = payload
+
+    def _triple_barrier_price(self, trade: Dict[str, Any], leg: Dict[str, Any]) -> Optional[float]:
+        symbol = str(leg.get("symbol") or trade.get("symbol") or "")
+        exchange = str(leg.get("exchange") or trade.get("exchange") or "").strip() or None
+        try:
+            bid, ask, ltp = self.client.get_bid_ask(symbol, exchange_hint=exchange)
+            if bid is not None and ask is not None:
+                return float((float(bid) + float(ask)) / 2.0)
+            if ltp is not None:
+                return float(ltp)
+        except Exception:
+            pass
+        return self._try_get_ltp_for_leg(leg)
+
+    def _persist_directional_trade_outcome(
+        self,
+        *,
+        trade: Dict[str, Any],
+        exit_reason: str,
+        realized_pnl: Optional[float],
+        estimated_slippage_pct: float,
+    ) -> None:
+        if self.db_manager is None:
+            return
+        meta = trade.get("meta")
+        meta = meta if isinstance(meta, dict) else {}
+        tb = meta.get("triple_barrier")
+        tb = tb if isinstance(tb, dict) else {}
+        prediction_id = str(meta.get("prediction_id") or tb.get("prediction_id") or "")
+        exit_time = dt_datetime.now(IST) if IST else dt_datetime.now()
+        try:
+            duration_minutes = max(0.0, (time.time() - float(trade.get("opened_ts") or time.time())) / 60.0)
+        except Exception:
+            duration_minutes = None
+        try:
+            self.db_manager.insert_trade_outcome(
+                {
+                    "trade_id": str(trade.get("trade_id") or ""),
+                    "prediction_id": prediction_id,
+                    "entry_time": str(trade.get("entry_time") or ""),
+                    "exit_time": str(exit_time),
+                    "duration_minutes": duration_minutes,
+                    "strategy": str(trade.get("name") or ""),
+                    "regime": str(meta.get("regime") or ""),
+                    "strategy_signal": str(meta.get("strategy_signal") or ""),
+                    "entry_reason": str(meta.get("reason") or ""),
+                    "exit_reason": str(exit_reason or ""),
+                    "probability": meta.get("ml_probability"),
+                    "threshold": meta.get("ml_threshold"),
+                    "gross_pnl": realized_pnl,
+                    "pnl": realized_pnl,
+                    "estimated_slippage": float(estimated_slippage_pct),
+                }
+            )
+        except Exception:
+            pass
+
+    def _close_directional_trade_via_triple_barrier(
+        self,
+        *,
+        trade: Dict[str, Any],
+        trigger_source: str,
+        reference_price: float,
+    ) -> bool:
+        trade_lock = trade.get("_triple_barrier_lock")
+        if not hasattr(trade_lock, "acquire"):
+            trade_lock = Lock()
+            trade["_triple_barrier_lock"] = trade_lock
+        if not trade_lock.acquire(blocking=False):
+            return False
+        try:
+            state = self._extract_triple_barrier_state(trade)
+            if state is None or state.exit_lock:
+                return False
+            state.exit_lock = True
+            state.exit_lock_ts = float(time.time())
+            state.exit_trigger_source = str(trigger_source or "")
+            if not state.final_execution_duration_bars:
+                state.final_execution_duration_bars = int(state.elapsed_bars)
+            self._write_triple_barrier_state(trade, state)
+
+            meta = trade.setdefault("meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+                trade["meta"] = meta
+
+            total_realized = 0.0
+            realized_any = False
+            exit_prices: List[float] = []
+            legs = trade.get("legs")
+            if not isinstance(legs, list) or not legs:
+                legs = [
+                    {
+                        "symbol": trade.get("symbol"),
+                        "token": trade.get("token"),
+                        "exchange": trade.get("exchange"),
+                        "side": trade.get("side"),
+                        "quantity": trade.get("quantity"),
+                        "entry_price": trade.get("entry_price"),
+                        "strike": trade.get("strike"),
+                        "option_type": trade.get("option_type"),
+                        "expiry": trade.get("expiry"),
+                    }
+                ]
+            emitted_legs: List[Dict[str, Any]] = []
+            for leg in legs:
+                if not isinstance(leg, dict) or int(leg.get("quantity") or 0) <= 0:
+                    continue
+                realized = self._close_single_leg(
+                    trade=trade,
+                    leg=leg,
+                    position_type="directional",
+                    reason=str(trigger_source or ""),
+                )
+                total_realized += float(realized)
+                realized_any = True
+                try:
+                    exit_prices.append(float(leg.get("exit_price")))
+                except Exception:
+                    pass
+                emitted_legs.append(dict(leg))
+
+            final_exit_price = float(sum(exit_prices) / len(exit_prices)) if exit_prices else float(reference_price)
+            ref_price = max(float(reference_price or 0.0), 1e-9)
+            realized_slippage_pct = abs(final_exit_price - ref_price) / ref_price if ref_price > 0.0 else 0.0
+            meta["exit_trigger_source"] = str(trigger_source or "")
+            meta["final_execution_duration_bars"] = int(state.final_execution_duration_bars)
+            meta["realized_slippage_pct"] = float(realized_slippage_pct)
+            self._write_triple_barrier_state(trade, state)
+
+            self.state.last_exit_ts = time.time()
+            if trigger_source == "stop_loss":
+                self._mark_stopout()
+            else:
+                self._mark_non_stop_exit()
+
+            res_for_note = float(total_realized) if realized_any else None
+            self._note_trade_result(res_for_note)
+            if res_for_note is not None:
+                self._strategy_winrate_record_result(str(trade.get("name") or ""), float(res_for_note) >= 0)
+
+            if emitted_legs:
+                try:
+                    self._emit(
+                        TradeLogEvent(
+                            ts=time.time(),
+                            event="CLOSE",
+                            trade_id=str(trade.get("trade_id") or "(unknown)"),
+                            position_type="directional",
+                            name=str(trade.get("name") or ""),
+                            legs=emitted_legs,
+                            realized=res_for_note,
+                            reason=str(trigger_source or ""),
+                        )
+                    )
+                except Exception:
+                    pass
+
+            self._persist_directional_trade_outcome(
+                trade=trade,
+                exit_reason=str(trigger_source or ""),
+                realized_pnl=res_for_note,
+                estimated_slippage_pct=float(realized_slippage_pct),
+            )
+            return True
+        finally:
+            trade_lock.release()
+
+    def _record_ml_prediction(
+        self,
+        *,
+        prediction_id: str,
+        candles: List[Candle],
+        probability: float,
+        threshold: float,
+        take: bool,
+        reason: str,
+        regime: str,
+        suggested_strategy: Optional[str],
+        feature_names: Sequence[str],
+        feature_values: Sequence[float],
+        ctx: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        if self.db_manager is None:
+            LOGGER.debug("Shadow/ML prediction skipped because db_manager is unavailable")
+            return None
+        latest = candles[-1] if candles else None
+        ts = float(getattr(latest.time, "timestamp", lambda: time.time())()) if latest is not None else float(time.time())
+        feature_snapshot = {
+            str(name): float(feature_values[idx])
+            for idx, name in enumerate(feature_names)
+            if idx < len(feature_values)
+        }
+        try:
+            feature_vector_checksum = hashlib.sha1(json.dumps(feature_snapshot, sort_keys=True).encode("utf-8")).hexdigest()
+        except Exception:
+            feature_vector_checksum = ""
+
+        model_bundle = getattr(self, "ml_model", None)
+        metrics: Dict[str, Any] = {}
+        trained_at = ""
+        try:
+            metrics = dict(getattr(model_bundle, "metrics", {}) or {})
+            trained_at = str(getattr(model_bundle, "trained_at", "") or "")
+        except Exception:
+            pass
+
+        probability = float(probability)
+        threshold = float(threshold)
+        shadow_mode = bool(getattr(self.cfg, "shadow_mode", False))
+        reason_text = str(reason or "")
+        if shadow_mode:
+            if "blocked" in reason_text or "missing" in reason_text:
+                source = "SHADOW_BLOCKED"
+            elif take:
+                source = "SHADOW"
+            else:
+                source = "SHADOW_FILTERED"
+        else:
+            source = "ACTIVE"
+        record = {
+            "prediction_id": str(prediction_id or ""),
+            "ts": ts,
+            "symbol": str(getattr(self.cfg, "underlying", "") or ""),
+            "exchange": str(getattr(self.cfg, "exchange", "") or ""),
+            "token": "",
+            "option_symbol": "",
+            "underlying_price": float(getattr(latest, "close", 0.0) or 0.0) if latest is not None else 0.0,
+            "direction": "bull" if probability >= threshold else "flat",
+            "regime": str(regime or ""),
+            "model_version": str(metrics.get("model_type") or trained_at or "ml_signal_model"),
+            "model_artifact_path": self._current_model_artifact_path(),
+            "model_checksum": self._current_model_checksum(),
+            "label_policy_version": str(metrics.get("label_policy") or "current_triple_barrier:v1"),
+            "feature_set_version": str(metrics.get("feature_set_version") or "target_features_v1"),
+            "threshold": threshold,
+            "probability": probability,
+            "prediction": probability,
+            "predicted_class": 1 if probability >= threshold else 0,
+            "confidence": abs(probability - 0.5) * 2.0,
+            "confidence_bucket": self._confidence_bucket(probability),
+            "strategy_context": json.dumps(ctx or {}, default=str),
+            "strategy_signal": str(suggested_strategy or ""),
+            "source": source,
+            "reason": str(reason or ""),
+            "trade_candidate": bool(take),
+            "trade_taken": False,
+            "no_trade_reason": "" if take else str(reason or "blocked"),
+            "feature_snapshot": feature_snapshot,
+            "features": feature_snapshot,
+            "feature_vector_checksum": feature_vector_checksum,
+            "future_label_status": "pending",
+            "horizon_bars": 45,
+        }
+        try:
+            LOGGER.debug(
+                "Recording ML prediction id=%s source=%s prob=%.4f threshold=%.4f take=%s reason=%s",
+                record["prediction_id"],
+                source,
+                probability,
+                threshold,
+                bool(take),
+                reason_text,
+            )
+            prediction_id = self.db_manager.insert_prediction(record)
+            self._last_prediction_id = prediction_id
+            self._last_prediction_record = record
+            LOGGER.debug("Recorded ML prediction id=%s successfully", prediction_id)
+            return prediction_id
+        except Exception as exc:
+            LOGGER.warning("Failed to record ML prediction id=%s: %s", record["prediction_id"], exc)
+            return None
 
     def _emit(self, evt: TradeLogEvent) -> None:
         if self.notifier and str(evt.event).upper() in {"OPEN", "CLOSE"}:
@@ -4527,8 +5564,8 @@ class NiftyScalper:
                 mid = (float(ask) + float(bid)) / 2.0
                 if mid > 0:
                     pct = (spread / mid) * 100.0
-                    if pct > max_pct:
-                        return False, f"Spread too wide for {symbol} ({pct:.2f}% > {max_pct:.2f}%)"
+                    if pct > max_pct * 100.0:
+                        return False, f"Spread too wide for {symbol} ({pct:.2f}% > {max_pct * 100.0:.2f}%)"
 
         return True, ""
 
@@ -4802,10 +5839,16 @@ class NiftyScalper:
 
     def _gpt_should_apply_now(self, *, is_paper: bool) -> bool:
         try:
-            if not bool(getattr(self.cfg, "gpt_enable", False)):
+            if not bool(getattr(self.cfg, "gpt_enabled", getattr(self.cfg, "gpt_enable", False))):
                 return False
         except Exception:
             return False
+        try:
+            import gpt_advisor as _ga  # type: ignore
+            if bool(getattr(_ga, "is_gpt_disabled_for_session", lambda: False)()):
+                return False
+        except Exception:
+            pass
 
         if is_paper:
             try:
@@ -5272,8 +6315,30 @@ class NiftyScalper:
 
         close_side = "BUY" if side == "SELL" else "SELL"
 
+        # For paper trades, use bid (for closing BUY) or ask (for closing SELL).
+        # Block if bid/ask is unavailable — do NOT silently fall back to LTP.
+        paper_exit_price: Optional[float] = None
+        paper_spread_deduct: float = 0.0
+        price_source: str = "bid" if side == "BUY" else "ask"
         if not self.cfg.enable_live_trading:
-            print(f"[PAPER] Close leg: {close_side} {symbol} x{qty} ({reason})")
+            bid_raw, ask_raw, _ = self.client.get_bid_ask(symbol, exchange_hint=exchange)
+            if side == "BUY":
+                # Closing a BUY position = selling → use bid (what we receive).
+                if bid_raw is None:
+                    print(f"[PAPER][BLOCKED] Close leg {symbol}: bid price unavailable — bid/ask required")
+                    return 0.0
+                paper_exit_price = float(bid_raw)
+                if ask_raw is not None and paper_exit_price is not None:
+                    paper_spread_deduct = float((float(ask_raw) - float(bid_raw)) * float(qty))
+            else:
+                # Closing a SELL position = buying back → use ask (what we pay).
+                if ask_raw is None:
+                    print(f"[PAPER][BLOCKED] Close leg {symbol}: ask price unavailable — bid/ask required")
+                    return 0.0
+                paper_exit_price = float(ask_raw)
+                if bid_raw is not None:
+                    paper_spread_deduct = float((float(ask_raw) - float(bid_raw)) * float(qty))
+            print(f"[PAPER] Close leg: {close_side} {symbol} x{qty} @ {paper_exit_price:.2f} ({price_source}) ({reason})")
         else:
             try:
                 self.client.place_order(
@@ -5292,16 +6357,47 @@ class NiftyScalper:
             entry_f = float(entry) if entry is not None else None
         except Exception:
             entry_f = None
-        cur = self._try_get_ltp_for_leg(leg)
+
+        if not self.cfg.enable_live_trading:
+            cur = paper_exit_price
+        else:
+            cur = self._try_get_ltp_for_leg(leg)
         try:
             leg["exit_price"] = cur
         except Exception:
             pass
+        try:
+            leg["execution_price_source"] = price_source if not self.cfg.enable_live_trading else "ltp"
+        except Exception:
+            pass
 
         realized = 0.0
+        # Track gross P&L before costs for reporting.
+        gross_pnl = 0.0
+        total_slippage = 0.0
+        total_brokerage = 0.0
         if entry_f is not None and cur is not None:
             sign = 1.0 if side == "BUY" else -1.0
-            realized = (float(cur) - float(entry_f)) * sign * float(qty)
+            gross_pnl = (float(cur) - float(entry_f)) * sign * float(qty)
+            realized = gross_pnl
+            # Spread cost: already embedded in ask/bid execution prices, so NOT deducted again.
+            # Only deduct slippage + brokerage here (paper cost model).
+            try:
+                from cost_model import estimate_paper_execution_costs
+                _exit_costs = estimate_paper_execution_costs(
+                    execution_price=float(cur),
+                    quantity=int(qty),
+                    slippage_pct=float(getattr(self.cfg, "paper_slippage_pct", 0.001) or 0.001),
+                    extra_market_impact_pct=float(getattr(self.cfg, "paper_extra_market_impact_pct", 0.0) or 0.0),
+                    apply_brokerage=bool(getattr(self.cfg, "paper_apply_brokerage_costs", True)),
+                    cost_model_source=str(getattr(self.cfg, "paper_cost_model_source", "cost_model_assumptions") or "cost_model_assumptions"),
+                    side=close_side,
+                )
+                total_slippage = float(_exit_costs.get("slippage_cost", 0.0))
+                total_brokerage = float(_exit_costs.get("total_brokerage_charges", 0.0))
+                realized -= total_slippage + total_brokerage
+            except Exception:
+                pass
 
         # Mark leg as closed in-place.
         try:
@@ -5326,6 +6422,12 @@ class NiftyScalper:
                     legs=[out_leg],
                     realized=float(realized),
                     reason=str(reason or ""),
+                    gross_pnl=float(gross_pnl),
+                    net_pnl=float(realized),
+                    exit_price_source=price_source if not self.cfg.enable_live_trading else "ltp",
+                    spread_cost=paper_spread_deduct,  # logged for audit (embedded, not double-deducted)
+                    slippage_cost=total_slippage,
+                    brokerage_cost=total_brokerage,
                 )
             )
 
@@ -6076,6 +7178,11 @@ class NiftyScalper:
                 return None
             except Exception:
                 return None
+        try:
+            if bool(getattr(gpt_advisor, "is_gpt_disabled_for_session", lambda: False)()):
+                return None
+        except Exception:
+            pass
 
         try:
             api_key = (os.getenv("MSTOCK_GPT_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
@@ -6486,7 +7593,9 @@ class NiftyScalper:
         self._auto_gpt_directional_steps = None
 
         try:
-            if not bool(getattr(self.cfg, "gpt_enable", False)):
+            if not bool(getattr(self.cfg, "gpt_enabled", getattr(self.cfg, "gpt_enable", False))):
+                return None
+            if not bool(getattr(self.cfg, "use_gpt_market_analysis", False)):
                 return None
             if not bool(getattr(self.cfg, "gpt_auto_select", True)):
                 return None
@@ -6511,6 +7620,11 @@ class NiftyScalper:
                 gpt_advisor = _ga
             except Exception:
                 return None
+        try:
+            if bool(getattr(gpt_advisor, "is_gpt_disabled_for_session", lambda: False)()):
+                return None
+        except Exception:
+            pass
 
         allowed = self._gpt_allowed_strategies_for_auto()
         preset = ""
@@ -6819,9 +7933,13 @@ class NiftyScalper:
         if not self._can_open_trade_type(position_type="directional", name=str(name)):
             return None
 
-        symbol = str(opt.get("symbol") or "")
-        if not symbol:
+        contract = self._option_contract_from_row(opt)
+        if contract is None or not contract.tradingsymbol:
             return None
+        if not str(contract.instrument_token or "").isdigit():
+            self._entry_block_for_missing_contract_token(row=opt, context=str(name))
+            return None
+        symbol = str(contract.tradingsymbol)
 
         entry_side = "SELL" if str(name or "").strip().lower().startswith("short_") else "BUY"
         qty = self._entry_qty(atr_val)
@@ -6853,23 +7971,59 @@ class NiftyScalper:
                         print(f"[PYRAMID] Max pyramiding reached for {name} (level={lev}, max={max_pyr}); skipping add")
                         return existing
 
-        exchange = str(opt.get("exchange") or "").strip() or None
-        # Defensive: option contracts trade on NFO. If exchange is missing/aliased,
-        # force NFO so LTP resolution + order placement use the correct segment.
-        if not exchange:
-            if str(symbol).strip().upper().endswith(("CE", "PE")):
-                exchange = "NFO"
-        elif str(exchange).strip().upper() in {"NSEFO", "NFO"}:
-            exchange = "NFO"
-        token = opt.get("token")
-        strike = opt.get("strike")
-        opt_type = str(opt.get("option_type") or "CE" if "call" in str(name).lower() else "PE").strip().upper()
-        if opt_type in {"CALL", "C"}:
-            opt_type = "CE"
-        elif opt_type in {"PUT", "P"}:
-            opt_type = "PE"
-        expiry = opt.get("expiry")
-        entry_price = self._try_get_ltp(symbol, exchange=exchange)
+        exchange = str(contract.exchange or "").strip() or None
+        token = str(contract.instrument_token or "").strip()
+        strike = contract.strike
+        opt_type = contract.option_type
+        expiry = contract.expiry
+        print(f"[CONTRACT] selected tradingsymbol={symbol} token={token} exchange={exchange}")
+
+        # ----------------------------------------------------------------
+        # Paper execution: use bid/ask for realistic price discovery.
+        # - BUY entry  (going long): pay the ask  (seller's price)
+        # - SELL entry (going short): receive bid (buyer's bid)
+        # Block if bid/ask is unavailable unless LTP fallback is explicitly
+        # enabled via paper_allow_ltp_fallback.
+        # ----------------------------------------------------------------
+        use_bid_ask = bool(getattr(self.cfg, "paper_use_bid_ask_execution", True))
+        allow_ltp_fallback = bool(getattr(self.cfg, "paper_allow_ltp_fallback", False))
+        ltp_fallback_penalty = float(getattr(self.cfg, "paper_ltp_fallback_spread_pct", 0.05) or 0.05)
+
+        entry_price = None
+        price_source = "ltp"
+        if use_bid_ask and not self.cfg.enable_live_trading:
+            bid_raw, ask_raw, _ = self.client.get_bid_ask(symbol, exchange_hint=exchange)
+            if entry_side == "BUY":
+                # Long entry: pay ask (you are the buyer paying seller's ask)
+                if ask_raw is None:
+                    if allow_ltp_fallback:
+                        print(f"[PAPER][LTP FALLBACK] {symbol}: ask unavailable, using LTP -{ltp_fallback_penalty*100:.1f}%")
+                        raw_ltp = self._try_get_ltp_for_leg({"symbol": symbol, "exchange": exchange, "token": token, "option_type": opt_type})
+                        entry_price = float(raw_ltp) * (1.0 - ltp_fallback_penalty) if raw_ltp is not None else None
+                        price_source = "ltp_fallback"
+                    else:
+                        print(f"[PAPER][BLOCKED] {name}: ask price unavailable for {symbol} — bid/ask required for paper realism")
+                        return None
+                else:
+                    entry_price = float(ask_raw)
+                    price_source = "ask"
+            else:  # SELL entry (short)
+                # Short entry: receive bid (you are the seller receiving buyer's bid)
+                if bid_raw is None:
+                    if allow_ltp_fallback:
+                        print(f"[PAPER][LTP FALLBACK] {symbol}: bid unavailable, using LTP +{ltp_fallback_penalty*100:.1f}%")
+                        raw_ltp = self._try_get_ltp_for_leg({"symbol": symbol, "exchange": exchange, "token": token, "option_type": opt_type})
+                        entry_price = float(raw_ltp) * (1.0 + ltp_fallback_penalty) if raw_ltp is not None else None
+                        price_source = "ltp_fallback"
+                    else:
+                        print(f"[PAPER][BLOCKED] {name}: bid price unavailable for {symbol} — bid/ask required for paper realism")
+                        return None
+                else:
+                    entry_price = float(bid_raw)
+                    price_source = "bid"
+        else:
+            entry_price = self._try_get_ltp_for_leg({"symbol": symbol, "exchange": exchange, "token": token, "option_type": opt_type})
+            price_source = "ltp"
         projected_legs = [
             {
                 "symbol": symbol,
@@ -6936,18 +8090,9 @@ class NiftyScalper:
                 print(f"[ENTRY BLOCKED] {reason}")
                 return None
 
-        # Execution Enhancements: Limit Orders
-        order_type = "MARKET"
-        limit_price = None
-        if bool(getattr(self.cfg, "enable_limit_orders", False)) and entry_price:
-            order_type = "LIMIT"
-            buffer_pct = float(getattr(self.cfg, "limit_price_buffer_pct", 0.05) or 0.05)
-            if entry_side == "BUY":
-                limit_price = entry_price * (1 + buffer_pct / 100.0)
-            else:
-                limit_price = entry_price * (1 - buffer_pct / 100.0)
-            # Round to nearest 0.05
-            limit_price = round(limit_price * 20) / 20.0
+        # Execution Enhancements: midpoint-pegged limit routing
+        order_type = "LIMIT"
+        limit_price = self._round_limit_price(entry_price)
 
         # Optional GPT entry gate (applies before placing any orders).
         try:
@@ -6981,23 +8126,33 @@ class NiftyScalper:
             # Block new entry or pyramid add-on.
             return existing
 
+        friction_preview: Dict[str, Any] = {}
+        live_meta: Dict[str, Any] = {}
         if not self.cfg.enable_live_trading:
+            friction_preview = evaluate_live_execution_friction(
+                {
+                    "client": self.client,
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "cost_model": CostModel(),
+                    "enforce_cost_boundary": False,
+                }
+            )
             p_price = f" @ {limit_price:.2f}" if limit_price else ""
             print(f"[PAPER] {entry_side} {symbol} x{qty} {order_type}{p_price}")
         else:
-            bracket = self._build_bracket_levels(entry_price=entry_price, side=entry_side, quantity=qty)
-            self._place_order_with_retry(
+            route_result = self._route_midpoint_pegged_limit_order(
                 symbol=symbol,
                 side=entry_side,
                 quantity=qty,
-                order_type=order_type,
-                price=limit_price,
                 exchange=exchange,
                 symbol_token=str(token or "") or None,
-                stoploss=bracket.get("stoploss"),
-                target_price=bracket.get("targetPrice"),
-                trailing_stop_loss=bracket.get("trailingStopLoss"),
+                meta=live_meta,
             )
+            if not bool(route_result.get("ok")):
+                print(f"[ENTRY BLOCKED] {route_result.get('status')}: {route_result.get('reason')}")
+                return existing
+            limit_price = float(route_result.get("fill_price") or limit_price or entry_price or 0.0)
 
         # IMPORTANT: Handle pyramiding BEFORE allocating a new trade_id.
         # The pyramiding path increases qty on an existing position; it should not
@@ -7040,6 +8195,37 @@ class NiftyScalper:
 
         trade_id = self._new_trade_id("D")
         legs_for_trade: List[Dict[str, object]] = [dict(lg) for lg in projected_legs]
+        prediction_id = str(getattr(self, "_last_prediction_id", "") or "")
+        meta: Dict[str, Any] = {
+            "reason": "directional_entry",
+            "prediction_id": prediction_id,
+            "ml_probability": float(getattr(self, "_last_ml_pred", 0.0) or 0.0),
+            "ml_threshold": float(getattr(self, "_last_ml_threshold", 0.0) or 0.0),
+            "ml_bet_multiplier": float(getattr(self, "_last_ml_bet_multiplier", 0.0) or 0.0),
+            "baseline_vol_lots": int(getattr(self, "_last_baseline_vol_lots", 0) or 0),
+            "final_allocated_lots": int(getattr(self, "_last_final_allocated_lots", qty) or qty),
+            "order_routing_style": "midpoint_pegged_limit",
+        }
+        try:
+            if not self.cfg.enable_live_trading:
+                meta["live_bid_ask_spread_pct"] = float(friction_preview.get("relative_spread_pct") or 0.0)
+                meta["realized_slippage_pct"] = 0.0
+                meta["execution_friction_status"] = str(friction_preview.get("status") or "")
+                meta["execution_price_source"] = str(price_source)
+            else:
+                meta.update(dict(live_meta or {}))
+                meta["execution_price_source"] = "live"
+        except Exception:
+            pass
+        if prediction_id and entry_price:
+            try:
+                meta["triple_barrier"] = self._build_triple_barrier_metadata(
+                    fill_price=float(limit_price or entry_price),
+                    prediction_id=prediction_id,
+                    bar_timestamp=dt_datetime.now(IST) if IST else dt_datetime.now(),
+                )
+            except Exception:
+                pass
 
         tr: Dict[str, object] = {
             "trade_id": trade_id,
@@ -7050,13 +8236,13 @@ class NiftyScalper:
             "side": entry_side,
             "quantity": int(qty),
             "entry_spot": float(spot),
-            "entry_price": entry_price,
+            "entry_price": float(limit_price or entry_price) if (limit_price or entry_price) is not None else entry_price,
             "atr": float(atr_val),
             "strike": strike,
             "option_type": opt_type,
             "expiry": expiry,
             "legs": legs_for_trade,
-            "meta": {},
+            "meta": meta,
             "opened_ts": time.time(),
             "entry_time": dt_datetime.now(IST) if IST else dt_datetime.now(),
             "pyramid_level": 0,
@@ -7262,9 +8448,15 @@ class NiftyScalper:
         except Exception:
             tok_str = ""
 
-        # Best-effort: resolve token/exchange for contracts missing token.
-        # This improves MTM and exit logic reliability in live mode.
-        if (not tok_str or not tok_str.isdigit()) and symbol:
+        is_option_contract = False
+        try:
+            opt_type = str(leg.get("option_type") or "").strip().upper()
+            is_option_contract = opt_type in {"CE", "PE", "CALL", "PUT", "C", "P"} or str(symbol).strip().upper().endswith(("CE", "PE"))
+        except Exception:
+            is_option_contract = False
+        # Best-effort token resolution is fine for non-option symbols. For
+        # option entries we require a tokenized contract before quoting.
+        if (not tok_str or not tok_str.isdigit()) and symbol and (not is_option_contract):
             try:
                 resolved_exch, resolved_tok = self.client.resolve_exchange_token(symbol, exchange_hint=exchange)
                 if resolved_tok is not None and str(resolved_tok).strip():
@@ -7306,6 +8498,92 @@ class NiftyScalper:
             except Exception:
                 continue
         return None
+
+    def _option_contract_from_row(self, row: Dict[str, Any]) -> Optional[OptionContract]:
+        if not isinstance(row, dict):
+            return None
+        try:
+            symbol = str(row.get("symbol") or "").strip()
+            exchange = str(row.get("exchange") or "NFO").strip().upper() or "NFO"
+            if exchange in {"NSEFO", "NFO"}:
+                exchange = "NFO"
+            token = str(row.get("token") or "").strip()
+            if (not token or not token.isdigit()) and symbol and hasattr(self.client, "resolve_exchange_token_symbol"):
+                try:
+                    res_exch, res_tok, res_sym = self.client.resolve_exchange_token_symbol(symbol, exchange_hint=exchange)
+                    if res_sym:
+                        symbol = str(res_sym).strip()
+                    if res_tok:
+                        token = str(res_tok).strip()
+                    if res_exch:
+                        exchange = str(res_exch).strip().upper() or exchange
+                except Exception:
+                    pass
+            strike = float(row.get("strike"))
+            option_type = str(row.get("option_type") or "").strip().upper()
+            if option_type in {"CALL", "C"}:
+                option_type = "CE"
+            elif option_type in {"PUT", "P"}:
+                option_type = "PE"
+            return OptionContract(
+                exchange=exchange,
+                tradingsymbol=symbol,
+                instrument_token=token,
+                expiry=row.get("expiry"),
+                strike=strike,
+                option_type=option_type,
+            )
+        except Exception:
+            return None
+
+    def _entry_block_for_missing_contract_token(self, *, row: Dict[str, Any], context: str) -> None:
+        symbol = str(row.get("symbol") or "").strip()
+        print(f"[ENTRY BLOCKED] CONTRACT_TOKEN_MISSING context={context} symbol={symbol}")
+
+    def _normalize_close_reason(self, raw_reason: str, realized_pnl: Optional[float], exit_is_stop: bool) -> str:
+        reason = str(raw_reason or "").strip().lower()
+        try:
+            pnl = float(realized_pnl) if realized_pnl is not None else None
+        except Exception:
+            pnl = None
+        if reason in {"trail_stop", "trailing_stop", "gpt_leg_stop"}:
+            return "TRAILING_STOP"
+        if reason.startswith("pivot_target") or reason in {"target", "spot_target", "mtm_target", "profit_target", "partial_target"}:
+            return "TARGET_PROFIT"
+        if reason in {"time_exit", "max_hold", "max_hold_days"}:
+            return "TIME_EXIT"
+        if reason in {"manual_exit"}:
+            return "MANUAL_EXIT"
+        if reason in {"stop", "stop_loss", "mtm_stop", "stop_loss_hit"}:
+            if pnl is not None and pnl > 0:
+                return "TRAILING_STOP" if exit_is_stop else "SIGNAL_EXIT"
+            return "STOP_LOSS"
+        if exit_is_stop:
+            return "STOP_LOSS"
+        return "SIGNAL_EXIT"
+
+    def _log_directional_close_audit(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        qty: int,
+        entry_price: Optional[float],
+        exit_price: Optional[float],
+        realized_pnl: Optional[float],
+        reason: str,
+    ) -> None:
+        try:
+            print(
+                "[CLOSE AUDIT] "
+                f"symbol={symbol} side={side} qty={int(qty)} "
+                f"entry={'' if entry_price is None else f'{float(entry_price):.2f}'} "
+                f"exit={'' if exit_price is None else f'{float(exit_price):.2f}'} "
+                f"realized={'' if realized_pnl is None else f'{float(realized_pnl):.2f}'} "
+                f"reason={reason}"
+            )
+        except Exception:
+            pass
 
     def _annotate_legs_with_entry_price(self, legs: List[dict]) -> None:
         for leg in legs:
@@ -8046,7 +9324,7 @@ class NiftyScalper:
                         mid = (float(ask) + float(bid)) / 2.0
                         if mid > 0:
                             pct = (float(spread) / float(mid)) * 100.0
-                            if pct > float(max_spread_pct):
+                            if pct > float(max_spread_pct) * 100.0:
                                 meta["delta_hedge_last_ts"] = float(now_ts)
                                 trade["meta"] = meta
                                 return
@@ -8262,6 +9540,31 @@ class NiftyScalper:
                     pass
             refreshed.append(leg)
         return self._compute_legs_mtm_cached(refreshed)
+
+    def _compute_total_unrealized_mtm(self) -> float:
+        """Compute aggregate unrealized MTM across all open positions.
+
+        Iterates every leg in open_directional and open_multi, fetches current
+        LTP, and returns sum((ltp - entry_price) * qty * sign) for all legs.
+
+        This is used by _risk_status() so that the max_daily_loss guard fires
+        even when a large adverse move happens on positions that haven't been
+        closed yet (only realized P&L was counted before this fix).
+
+        Returns 0.0 if no open positions or if LTP cannot be fetched for any.
+        """
+        total = 0.0
+        all_trades = list(self.state.open_multi or []) + list(self.state.open_directional or [])
+        for tr in all_trades:
+            if not isinstance(tr, dict):
+                continue
+            legs = tr.get("legs")
+            if not isinstance(legs, list):
+                continue
+            mtm = self._compute_legs_mtm_cached(list(legs))
+            if mtm is not None:
+                total += float(mtm)
+        return float(total)
 
     def _entry_iv_percentile_factor(self) -> float:
         """Return a sizing multiplier based on the IV percentile of the underlying.
@@ -9567,6 +10870,41 @@ class NiftyScalper:
                     mtm=self._compute_legs_mtm(legs),
                 )
             )
+
+    def _safe_exit_all_positions(self, *, reason: str = "KILL_SWITCH") -> None:
+        """Exit every open position (directional + multi-leg) immediately.
+
+        Used by the SCALPER_KILL_SWITCH env-var to achieve a clean, safe
+        stopout of all positions when the operator needs an instant halt.
+        Does NOT send live orders in paper mode.
+        """
+        try:
+            self._ensure_daily_risk_counters_day()
+        except Exception:
+            pass
+
+        # Close multi-leg trades first.
+        for tr in list(self.state.open_multi or []):
+            if not isinstance(tr, dict):
+                continue
+            try:
+                self._close_multi_trade(tr, reason=reason)
+            except Exception as exc:
+                print(f"[_safe_exit_all] error closing multi trade {tr.get('trade_id')}: {exc}")
+
+        # Close directional trades.
+        for tr in list(self.state.open_directional or []):
+            if not isinstance(tr, dict):
+                continue
+            try:
+                self._close_directional_trade(tr, reason=reason)
+            except Exception as exc:
+                print(f"[_safe_exit_all] error closing directional trade {tr.get('trade_id')}: {exc}")
+
+        self.state.open_multi = []
+        self.state.open_directional = []
+        self.state.open_orders = []
+        print(f"[_safe_exit_all] All positions exited. reason={reason}")
 
     def _mark_stopout(self) -> None:
         self._ensure_daily_risk_counters_day()
@@ -11142,16 +12480,23 @@ class NiftyScalper:
         except Exception:
             pass
 
-        if max_dd > 0 and current_pnl <= -max_dd:
+        # Risk gap fix: include unrealized MTM on open positions in total loss.
+        # total_loss = realized_pnl + sum(ltp - entry_price for each open leg)
+        unrealized = self._compute_total_unrealized_mtm()
+        total_pnl = current_pnl + unrealized
+
+        if max_dd > 0 and total_pnl <= -max_dd:
             return (
                 False,
-                f"max_daily_loss hit (realized_pnl={current_pnl:.2f} <= -{max_dd:.2f})",
+                f"max_daily_loss hit (total_pnl={total_pnl:.2f} <= -{max_dd:.2f}, "
+                f"realized={current_pnl:.2f} + unrealized={unrealized:.2f})",
             )
-            
-        if max_prof > 0 and current_pnl >= max_prof:
+
+        if max_prof > 0 and total_pnl >= max_prof:
             return (
                 False,
-                f"max_daily_profit hit (realized_pnl={current_pnl:.2f} >= {max_prof:.2f})",
+                f"max_daily_profit hit (total_pnl={total_pnl:.2f} >= {max_prof:.2f}, "
+                f"realized={current_pnl:.2f} + unrealized={unrealized:.2f})",
             )
 
         return True, ""
@@ -11527,7 +12872,7 @@ class NiftyScalper:
 
         # Intraday-only warmup fallback: if the intraday candle endpoint returns empty,
         # synthesize candles from live LTP samples (no historical endpoints).
-        if (not candles) and self._intraday_only_enabled():
+        if (not candles) and self._prefer_synthetic_warmup():
             candles = self._synth_candles_from_ltp(timeframe=tf_str, limit=int(candle_limit))
             using_synth_candles = bool(candles)
             if candles and self._bool_env("MSTOCK_DEBUG_INTRADAY", False):
@@ -11560,7 +12905,7 @@ class NiftyScalper:
                     timeframe=mtf_tf,
                     limit=mtf_limit,
                 )
-                if (not m_candles) and self._intraday_only_enabled():
+                if (not m_candles) and self._prefer_synthetic_warmup():
                     m_candles = self._synth_candles_from_ltp(timeframe=mtf_tf, limit=int(mtf_limit))
                 if m_candles and len(m_candles) >= e_s:
                     m_candles = sorted(m_candles, key=lambda c: c.time)
@@ -11594,18 +12939,7 @@ class NiftyScalper:
                     if maybe_reroute_entry_block(reason, current_strategy=str(forced_directional_name or effective_strat)):
                         return
 
-        # --- ML / Combined signal quick path ---
-        try:
-            # Evaluate combined ML + indicators signal; if it returns `take`, execute
-            # a conservative simulated or live underlying directional entry.
-            eval_res = self.evaluate_entry_signals(candles)
-            if isinstance(eval_res, dict) and bool(eval_res.get("take")):
-                tr = self._simulate_or_place_basic_directional(take=True, size=int(eval_res.get("size") or 0), reason=str(eval_res.get("reason") or "ml_take"), candles=candles)
-                if tr is not None:
-                    # We opened a trade; stop further decision processing this bucket.
-                    return
-        except Exception:
-            pass
+        deferred_eval_res = None
 
         # Some sources return candles newest-first. Indicators assume oldest->newest.
         # Sort defensively so EMA/RSI direction is correct.
@@ -12546,11 +13880,25 @@ class NiftyScalper:
                 enable_vol = False
             if enable_vol:
                 if vol_sma is not None and current_vol > 0:
-                     if current_vol < float(vol_sma):
-                         reason = f"Volume {int(current_vol)} < SMA {int(vol_sma)} (Low Activity)"
-                         if maybe_reroute_entry_block(reason, current_strategy=str(forced_directional_name or effective_strat)):
-                             return
-                         return
+                    if current_vol < float(vol_sma):
+                        reason = f"Volume {int(current_vol)} < SMA {int(vol_sma)} (Low Activity)"
+                        if maybe_reroute_entry_block(reason, current_strategy=str(forced_directional_name or effective_strat)):
+                            return
+                        return
+
+            try:
+                deferred_eval_res = self.evaluate_entry_signals(candles)
+                if isinstance(deferred_eval_res, dict) and bool(deferred_eval_res.get("take")):
+                    tr = self._simulate_or_place_basic_directional(
+                        take=True,
+                        size=int(deferred_eval_res.get("size") or 0),
+                        reason=str(deferred_eval_res.get("reason") or "ml_take"),
+                        candles=candles,
+                    )
+                    if tr is not None:
+                        return
+            except Exception:
+                pass
 
             # Supertrend Filter
             st_val = None
@@ -13722,6 +15070,7 @@ class NiftyScalper:
 
         # ---- Manage directional exits (underlying-based) ----
         if self.state.open_directional:
+            latest_bar_ts = getattr(candles[-1], "time", None) if candles else None
             try:
                 spot = float(self.client.get_ltp(self.cfg.underlying))
             except Exception:
@@ -13757,6 +15106,14 @@ class NiftyScalper:
 
             remaining_dir: List[Dict[str, object]] = []
             for tr in self.state.open_directional:
+                if tr.get("close_failed") is True:
+                    remaining_dir.append(tr)
+                    continue
+                if tr.get("close_attempts", 0) > 0:
+                    last_attempt = float(tr.get("last_close_attempt_ts") or 0.0)
+                    if time.time() - last_attempt < 30.0:
+                        remaining_dir.append(tr)
+                        continue
                 # Keep current risk levels on the trade so UI snapshots can display them.
                 # These are recomputed each management cycle and represent the *current* thresholds.
                 try:
@@ -13773,6 +15130,45 @@ class NiftyScalper:
                 token = tr.get("token")
                 exchange = str(tr.get("exchange") or "") or None
                 entry_price = tr.get("entry_price")
+                tb_state = self._extract_triple_barrier_state(tr)
+                if tb_state is not None:
+                    tb_legs = tr.get("legs")
+                    tb_leg = None
+                    if isinstance(tb_legs, list):
+                        for candidate_leg in tb_legs:
+                            if isinstance(candidate_leg, dict) and not bool(candidate_leg.get("is_hedge")) and int(candidate_leg.get("quantity") or 0) > 0:
+                                tb_leg = candidate_leg
+                                break
+                    if tb_leg is None:
+                        tb_leg = {
+                            "symbol": symbol,
+                            "token": token,
+                            "exchange": exchange,
+                            "side": tr.get("side"),
+                            "quantity": tr.get("quantity"),
+                            "entry_price": entry_price,
+                            "strike": tr.get("strike"),
+                            "option_type": tr.get("option_type"),
+                            "expiry": tr.get("expiry"),
+                        }
+                    current_price = self._triple_barrier_price(tr, tb_leg)
+                    if current_price is not None:
+                        evaluation = evaluate_triple_barrier_state(
+                            tb_state,
+                            current_price=float(current_price),
+                            bar_timestamp=latest_bar_ts,
+                            count_bar_close=True,
+                        )
+                        self._write_triple_barrier_state(tr, tb_state)
+                        if evaluation.trigger_source:
+                            if self._close_directional_trade_via_triple_barrier(
+                                trade=tr,
+                                trigger_source=str(evaluation.trigger_source),
+                                reference_price=float(evaluation.current_price),
+                            ):
+                                continue
+                    remaining_dir.append(tr)
+                    continue
 
                 be_mult_local = float(be_mult)
                 trail_mult_local = float(trail_mult)
@@ -14548,6 +15944,16 @@ class NiftyScalper:
                         res_for_note = total_realized if total_realized is not None else realized
                         if res_for_note is None and hedge_realized != 0.0:
                             res_for_note = hedge_realized
+                        close_reason = self._normalize_close_reason(str(reason or ""), res_for_note, bool(exit_is_stop))
+                        self._log_directional_close_audit(
+                            symbol=str(symbol),
+                            side=str(tr.get("side") or ""),
+                            qty=int(qty),
+                            entry_price=entry_f,
+                            exit_price=cur,
+                            realized_pnl=res_for_note,
+                            reason=close_reason,
+                        )
                         self._note_trade_result(res_for_note)
                         if res_for_note is not None:
                             self._strategy_winrate_record_result(str(tr.get("name") or ""), float(res_for_note) >= 0)
@@ -14575,7 +15981,7 @@ class NiftyScalper:
                                 name=str(tr.get("name") or ""),
                                 legs=legs,
                                 realized=float(total_realized) if total_realized is not None else (float(realized) if realized is not None else None),
-                                reason=reason or None,
+                                reason=close_reason,
                             )
                         )
 
@@ -14651,6 +16057,16 @@ class NiftyScalper:
                                 sign = 1.0 if side == "BUY" else -1.0
                                 realized = (float(cur) - float(entry_f)) * sign * float(qty)
                                 self.state.realized_pnl += float(realized)
+                                close_reason = self._normalize_close_reason(str(reason or ""), realized, bool(exit_is_stop))
+                                self._log_directional_close_audit(
+                                    symbol=str(symbol),
+                                    side=str(tr.get("side") or ""),
+                                    qty=int(qty),
+                                    entry_price=entry_f,
+                                    exit_price=cur,
+                                    realized_pnl=realized,
+                                    reason=close_reason,
+                                )
                                 self._note_trade_result(realized)
                                 self._strategy_winrate_record_result(str(tr.get("name") or ""), float(realized) >= 0)
 
@@ -14672,6 +16088,10 @@ class NiftyScalper:
                                     new_dir_trades.append(new_tr)
                         except Exception as exc:  # noqa: BLE001
                             print(f"Failed to close {symbol}: {exc}")
+                            tr["close_attempts"] = int(tr.get("close_attempts", 0)) + 1
+                            tr["last_close_attempt_ts"] = time.time()
+                            if tr["close_attempts"] >= 3:
+                                tr["close_failed"] = True
                             remaining_dir.append(tr)
                     continue
 
@@ -15000,6 +16420,27 @@ class NiftyScalper:
             if stop_event is not None and stop_event.is_set():
                 print("Stop requested. Exiting scalper loop.")
                 break
+
+            # External env-var kill switch: SCALPER_KILL_SWITCH=true instantly halts
+            # all new entries and safely exits all open positions. No code change
+            # required — purely env-driven and works even mid-loop.
+            try:
+                kill_raw = os.getenv("SCALPER_KILL_SWITCH", "").strip().lower()
+                if kill_raw in {"1", "true", "yes"}:
+                    print(
+                        "[KILL_SWITCH] SCALPER_KILL_SWITCH=true detected — "
+                        "blocking all entries and exiting open positions."
+                    )
+                    try:
+                        self._safe_exit_all_positions(
+                            reason="SCALPER_KILL_SWITCH"
+                        )
+                    except Exception as exc_kill:
+                        print(f"[KILL_SWITCH] Error during safe exit: {exc_kill}")
+                    break
+            except Exception:
+                pass
+
             ok, reason = self._risk_status()
             if not ok:
                 print(f"Risk limit hit ({reason}). Stopping scalper loop.")
@@ -15010,7 +16451,9 @@ class NiftyScalper:
             if not is_market_open():
                 if bool(self.cfg.enable_live_trading):
                     print(f"Market closed ({self._now_ist_time()} IST) — waiting...")
-                    time.sleep(120)
+                    if stop_event is not None and stop_event.wait(120):
+                        print("Stop requested. Exiting scalper loop.")
+                        break
                     continue
                 else:
                     # In paper mode, we still run the loop so that demo
@@ -15066,4 +16509,10 @@ class NiftyScalper:
             except Exception as exc:  # noqa: BLE001
                 print(f"Error in strategy loop: {exc}")
 
-            time.sleep(self.cfg.polling_interval_sec)
+            try:
+                sleep_sec = float(self.cfg.polling_interval_sec)
+            except Exception:
+                sleep_sec = 1.0
+            if stop_event is not None and stop_event.wait(max(0.0, sleep_sec)):
+                print("Stop requested. Exiting scalper loop.")
+                break

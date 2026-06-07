@@ -30,6 +30,18 @@ class StrategyConfig:
     max_daily_profit: float = 10000.0
     polling_interval_sec: float = 1.0
     enable_live_trading: bool = False
+    shadow_mode: bool = False
+    ml_shadow_mode_enabled: bool = False
+    ml_paper_mode_enabled: bool = False
+    ml_deployment_manifest_path: str = ""
+    ml_min_confidence_threshold: float = 0.0
+    ml_max_predictions_per_day: int = 1000
+    ml_log_feature_vector: bool = True
+    ml_log_prediction_reason: bool = True
+    ml_fail_closed_on_schema_mismatch: bool = True
+    ml_disable_all: bool = False
+    ml_max_daily_paper_loss: float = 5000.0
+    ml_max_consecutive_paper_losses: int = 3
 
     # ---- Notifier Settings ----
     telegram_bot_token: str = ""
@@ -268,18 +280,21 @@ class StrategyConfig:
     premium_mtm_target_pct: float = 0.18
     # Entry premium guardrails (per-leg and total, in absolute premium points).
     # 0 disables each guard.
-    entry_min_option_premium: float = 0.0
+    entry_min_option_premium: float = 5.0  # ₹5 minimum — blocks illiquid deep-OTM contracts
     entry_max_option_premium: float = 0.0
     entry_min_total_premium: float = 0.0
     entry_max_total_premium: float = 0.0
     # Liquidity guardrails.
     entry_require_bid_ask: bool = True
-    entry_max_bid_ask_spread_pct: float = 0.0
-    entry_max_bid_ask_spread_abs: float = 0.0
+    entry_max_bid_ask_spread_pct: float = 0.02   # 2% — block if spread exceeds 2%
+    entry_max_bid_ask_spread_abs: float = 5.0    # ₹5 absolute spread — block if wider
+    # Minimum option premium filter (₹). 0 disables.
+    # Low-premium options have disproportionately high brokerages and wider effective spreads.
+    min_option_premium: float = 5.0              # enable by default: block trades < ₹5 premium
     # Dynamic liquidity guard: block entries when current bid/ask spread is
     # much wider than the recent spread history for that exact option.
     # 0 disables. Example 2.5 => block if spread > 2.5x recent median.
-    entry_spread_shock_mult: float = 2.5
+    entry_spread_shock_mult: float = 1.0   # 1.0 = normal mode, no shock — safe paper default
     entry_spread_shock_lookback: int = 20
     entry_spread_shock_min_samples: int = 5
 
@@ -477,6 +492,8 @@ class StrategyConfig:
     # Enable and configure the GPT-based advisor for entry gating and (optionally)
     # auto-mode strategy selection. Keys are read from env at runtime.
     gpt_enable: bool = False
+    gpt_enabled: bool = False
+    use_gpt_market_analysis: bool = False
     # "gate" blocks entries unless GPT returns TAKE; "advice" only logs.
     gpt_mode: str = "gate"
     # Apply GPT gating in paper mode as well (README: default enabled).
@@ -578,6 +595,24 @@ class StrategyConfig:
     limit_price_buffer_pct: float = 0.05
     max_pyramid_levels: int = 1  # Add to winners once
 
+    # ---- Paper Execution Cost Model ----
+    # Deduct realistic execution costs from paper P&L to prevent optimistic bias.
+    # No double-counting: if execution_price uses ask/bid, spread is already embedded
+    # and only the "extra" slippage / brokerage / taxes are deducted separately.
+
+    # Slippage cost applied ON TOP of the embedded ask/bid execution price.
+    # Represented as a fraction of the execution price per leg.
+    # Default 0.001 = 0.1% slippage per leg (one-way).
+    paper_slippage_pct: float = 0.001
+    # Additional market-impact cost (fraction of execution price). 0 disables.
+    paper_extra_market_impact_pct: float = 0.0
+    # If True, deduct brokerage + taxes (STT/GST/exchange/sebi/stamp) per leg.
+    paper_apply_brokerage_costs: bool = True
+    # Source for brokerage/tax estimates:
+    # - "cost_model_assumptions"  : uses CostModelAssumptions (per-side %)
+    # - "ml_execution_costs"      : uses ml_execution_costs DEFAULT_EXECUTION_COST_CONFIG
+    paper_cost_model_source: str = "cost_model_assumptions"
+
     # ---- Dynamic Pyramiding ----
     # When enabled, max_pyramid_levels is computed at runtime based on
     # current market conditions (IV percentile, winrate, ATR regime, session time).
@@ -596,8 +631,33 @@ class StrategyConfig:
     order_retry_attempts: int = 2
     order_retry_delay_sec: float = 0.25
 
+    # ---- Paper Execution Realism ----
+    # When True (default), paper trades use real bid/ask prices:
+    #   - BUY entry: ask price (you pay what the seller asks)
+    #   - SELL exit (close BUY): bid price (you receive what buyer bids)
+    #   - SELL entry (short): bid price (you receive what buyer bids)
+    #   - BUY exit (close SELL): ask price (you pay what seller asks)
+    # When False, paper trades use LTP (last traded price) which is unrealistic.
+    paper_use_bid_ask_execution: bool = True
+    # When True and bid/ask is unavailable, fallback to LTP with spread penalty.
+    # When False (default), block the trade if bid/ask is missing.
+    paper_allow_ltp_fallback: bool = False
+    # Spread penalty (percentage) applied to LTP when fallback is triggered.
+    # Example: 0.05 = 5% worse than LTP to model realistic execution cost.
+    paper_ltp_fallback_spread_pct: float = 0.05
+
     # ---- Strategy Router / Diagnostics ----
     strategy_router_mode: str = "balanced"  # conservative | balanced | aggressive
+    enable_mean_reversion_engine: bool = True
+    mean_reversion_lookback: int = 20
+    mean_reversion_entry_zscore: float = 1.25
+    mean_reversion_exit_zscore: float = 0.35
+    enable_stat_arb_module: bool = True
+    stat_arb_lookback: int = 30
+    stat_arb_entry_zscore: float = 1.5
+    stat_arb_exit_zscore: float = 0.5
+    sleeve_reserve_cash_weight: float = 0.10
+    sleeve_max_single_weight: float = 0.50
     diagnostics_enabled: bool = True
 
     # ---- Regime-specific tuning ----
@@ -1058,6 +1118,22 @@ def load_strategy_config() -> StrategyConfig:
         cfg.gpt_enable = str(os.getenv("MSTOCK_GPT_ENABLE", "") or "").strip().lower() in {"1", "true", "yes", "y"}
     except Exception:
         pass
+    try:
+        cfg.gpt_enabled = str(
+            os.getenv("GPT_ENABLED", os.getenv("MSTOCK_GPT_ENABLED", str(cfg.gpt_enable))) or str(cfg.gpt_enable)
+        ).strip().lower() in {"1", "true", "yes", "y"}
+    except Exception:
+        cfg.gpt_enabled = bool(cfg.gpt_enable)
+    try:
+        cfg.use_gpt_market_analysis = str(
+            os.getenv(
+                "USE_GPT_MARKET_ANALYSIS",
+                os.getenv("MSTOCK_USE_GPT_MARKET_ANALYSIS", str(cfg.gpt_enabled)),
+            ) or str(cfg.gpt_enabled)
+        ).strip().lower() in {"1", "true", "yes", "y"}
+    except Exception:
+        cfg.use_gpt_market_analysis = bool(cfg.gpt_enabled)
+    cfg.gpt_enable = bool(cfg.gpt_enabled)
     try:
         cfg.gpt_mode = str(os.getenv("MSTOCK_GPT_MODE", cfg.gpt_mode) or cfg.gpt_mode).strip().lower()
     except Exception:
@@ -1796,6 +1872,12 @@ def load_strategy_config() -> StrategyConfig:
     except Exception:
         pass
     try:
+        cfg.min_option_premium = float(
+            os.getenv("MSTOCK_MIN_OPTION_PREMIUM", str(cfg.min_option_premium))
+        )
+    except Exception:
+        pass
+    try:
         cfg.entry_spread_shock_mult = float(
             os.getenv("MSTOCK_ENTRY_SPREAD_SHOCK_MULT", str(cfg.entry_spread_shock_mult))
         )
@@ -2125,6 +2207,47 @@ def load_strategy_config() -> StrategyConfig:
     if live is not None:
         cfg.enable_live_trading = str(live).strip().lower() in {"1", "true", "yes", "y"}
 
+    shadow = os.getenv("MSTOCK_SHADOW_MODE")
+    if shadow is not None:
+        cfg.shadow_mode = str(shadow).strip().lower() in {"1", "true", "yes", "y"}
+    shadow_mode = os.getenv("ML_SHADOW_MODE_ENABLED")
+    if shadow_mode is not None:
+        cfg.ml_shadow_mode_enabled = str(shadow_mode).strip().lower() in {"1", "true", "yes", "y"}
+    paper_mode = os.getenv("ML_PAPER_MODE_ENABLED")
+    if paper_mode is not None:
+        cfg.ml_paper_mode_enabled = str(paper_mode).strip().lower() in {"1", "true", "yes", "y"}
+    manifest_path = os.getenv("ML_DEPLOYMENT_MANIFEST_PATH")
+    if manifest_path is not None:
+        cfg.ml_deployment_manifest_path = str(manifest_path).strip()
+    try:
+        cfg.ml_min_confidence_threshold = float(os.getenv("ML_MIN_CONFIDENCE_THRESHOLD", str(cfg.ml_min_confidence_threshold)))
+    except Exception:
+        pass
+    try:
+        cfg.ml_max_predictions_per_day = int(os.getenv("ML_MAX_PREDICTIONS_PER_DAY", str(cfg.ml_max_predictions_per_day)))
+    except Exception:
+        pass
+    feature_log = os.getenv("ML_LOG_FEATURE_VECTOR")
+    if feature_log is not None:
+        cfg.ml_log_feature_vector = str(feature_log).strip().lower() in {"1", "true", "yes", "y"}
+    reason_log = os.getenv("ML_LOG_PREDICTION_REASON")
+    if reason_log is not None:
+        cfg.ml_log_prediction_reason = str(reason_log).strip().lower() in {"1", "true", "yes", "y"}
+    fail_closed = os.getenv("ML_FAIL_CLOSED_ON_SCHEMA_MISMATCH")
+    if fail_closed is not None:
+        cfg.ml_fail_closed_on_schema_mismatch = str(fail_closed).strip().lower() in {"1", "true", "yes", "y"}
+    kill_switch = os.getenv("ML_DISABLE_ALL")
+    if kill_switch is not None:
+        cfg.ml_disable_all = str(kill_switch).strip().lower() in {"1", "true", "yes", "y"}
+    try:
+        cfg.ml_max_daily_paper_loss = float(os.getenv("ML_MAX_DAILY_PAPER_LOSS", str(cfg.ml_max_daily_paper_loss)))
+    except Exception:
+        pass
+    try:
+        cfg.ml_max_consecutive_paper_losses = int(os.getenv("ML_MAX_CONSECUTIVE_PAPER_LOSSES", str(cfg.ml_max_consecutive_paper_losses)))
+    except Exception:
+        pass
+
     weekly_only = os.getenv("MSTOCK_NIFTY_WEEKLY_ONLY")
     if weekly_only is not None:
         cfg.nifty_weekly_only = str(weekly_only).strip().lower() in {"1", "true", "yes", "y"}
@@ -2378,6 +2501,27 @@ def load_strategy_config() -> StrategyConfig:
     if limit_enabled is not None:
         cfg.enable_limit_orders = str(limit_enabled).strip().lower() in {"1", "true", "yes", "y"}
     try:
+        cfg.paper_slippage_pct = float(os.getenv("MSTOCK_PAPER_SLIPPAGE_PCT", str(cfg.paper_slippage_pct)))
+    except Exception:
+        pass
+    try:
+        cfg.paper_extra_market_impact_pct = float(os.getenv("MSTOCK_PAPER_EXTRA_MARKET_IMPACT_PCT", str(cfg.paper_extra_market_impact_pct)))
+    except Exception:
+        pass
+    try:
+        cfg.paper_apply_brokerage_costs = str(
+            os.getenv("MSTOCK_PAPER_APPLY_BROKERAGE_COSTS", str(cfg.paper_apply_brokerage_costs))
+        ).strip().lower() in {"1", "true", "yes", "y"}
+    except Exception:
+        pass
+    try:
+        v_paper_src = str(os.getenv("MSTOCK_PAPER_COST_MODEL_SOURCE", str(cfg.paper_cost_model_source)) or "cost_model_assumptions").strip().lower()
+        if v_paper_src in {"cost_model_assumptions", "ml_execution_costs"}:
+            cfg.paper_cost_model_source = v_paper_src
+    except Exception:
+        pass
+
+    try:
         cfg.limit_price_buffer_pct = float(os.getenv("MSTOCK_LIMIT_PRICE_BUFFER_PCT", str(cfg.limit_price_buffer_pct)))
     except Exception:
         pass
@@ -2392,6 +2536,25 @@ def load_strategy_config() -> StrategyConfig:
         pass
     try:
         cfg.order_retry_delay_sec = float(os.getenv("MSTOCK_ORDER_RETRY_DELAY_SEC", str(cfg.order_retry_delay_sec)))
+    except Exception:
+        pass
+
+    try:
+        cfg.paper_use_bid_ask_execution = str(
+            os.getenv("MSTOCK_PAPER_USE_BID_ASK_EXECUTION", str(cfg.paper_use_bid_ask_execution))
+        ).strip().lower() in {"1", "true", "yes", "y"}
+    except Exception:
+        pass
+    try:
+        cfg.paper_allow_ltp_fallback = str(
+            os.getenv("MSTOCK_PAPER_ALLOW_LTP_FALLBACK", str(cfg.paper_allow_ltp_fallback))
+        ).strip().lower() in {"1", "true", "yes", "y"}
+    except Exception:
+        pass
+    try:
+        cfg.paper_ltp_fallback_spread_pct = float(
+            os.getenv("MSTOCK_PAPER_LTP_FALLBACK_SPREAD_PCT", str(cfg.paper_ltp_fallback_spread_pct))
+        )
     except Exception:
         pass
 
