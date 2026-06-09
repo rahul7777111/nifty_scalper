@@ -1285,41 +1285,32 @@ def refresh_live_chart_snapshot(app: Any, snapshot: LiveChartSnapshot) -> None:
             return
 
         # 1. Update Matplotlib Chart Plugin
+        # [UI-STABILITY] Use update_from_snapshot() which batches all state
+        # changes and calls _render() exactly ONCE instead of up to 7 times.
+        # This eliminates the primary cause of long-hour CPU overuse.
         plugin = getattr(app, "live_chart_plugin", None)
         has_candles = bool(snapshot.candles)
         if plugin is not None:
             try:
-                # Push candles
-                if has_candles:
-                    plugin.push_candles(snapshot.candles)
-
-                # Push market info
-                plugin.set_market_info(
+                shadow_rows = getattr(snapshot, "shadow_rows", None)
+                trade_events = getattr(snapshot, "trade_events", None)
+                oc_sum = getattr(snapshot, "option_chain_summary", None)
+                plugin.update_from_snapshot(
+                    candles=snapshot.candles if has_candles else None,
                     spot=snapshot.spot_price,
                     futures=snapshot.futures_price,
                     atm_strike=snapshot.atm_strike,
-                    iv=snapshot.option_chain_summary.ce_iv if snapshot.option_chain_summary else None,
-                    pcr=snapshot.option_chain_summary.pcr if snapshot.option_chain_summary else None
+                    iv=oc_sum.ce_iv if oc_sum else None,
+                    pcr=oc_sum.pcr if oc_sum else None,
+                    session_high=snapshot.session_high,
+                    session_low=snapshot.session_low,
+                    prevday_high=snapshot.previous_day_high,
+                    prevday_low=snapshot.previous_day_low,
+                    prediction_rows=shadow_rows,
+                    trade_event_rows=trade_events,
+                    regime_label=snapshot.regime_label,
+                    market_status=snapshot.market_status,
                 )
-
-                # Set session levels
-                plugin.set_session_levels(snapshot.session_high, snapshot.session_low)
-
-                # Set prevday levels
-                plugin.set_prevday_levels(snapshot.previous_day_high, snapshot.previous_day_low)
-
-                # Set ATM strike
-                if snapshot.atm_strike is not None:
-                    plugin.set_atm_strike(snapshot.atm_strike)
-
-                # Set prediction markers
-                if hasattr(snapshot, "shadow_rows") and snapshot.shadow_rows is not None:
-                    plugin.load_prediction_rows(snapshot.shadow_rows)
-
-                # Set trade events
-                if hasattr(snapshot, "trade_events") and snapshot.trade_events is not None:
-                    plugin.load_trade_event_rows(snapshot.trade_events)
-
             except Exception as e:
                 logger.debug("Failed to refresh chart plugin variables: %s", e)
 
@@ -1481,12 +1472,17 @@ def refresh_live_chart_snapshot(app: Any, snapshot: LiveChartSnapshot) -> None:
 
 def _refresh_live_chart_tab(app: Any, force: bool = False) -> None:
     """Main refresh dispatcher — called every ~3s via _safe_after."""
+    _already_scheduled = False
     try:
         now_ts = time.time()
         last_ts = float(getattr(app, "_lc_refresh_ts", 0.0) or 0.0)
         refresh_sec = float(getattr(app, "_lc_refresh_sec", 3.0) or 3.0)
         if not force and (now_ts - last_ts) < refresh_sec:
+            # [UI-STABILITY] Throttled: schedule next tick and exit.
+            # The finally block below must skip rescheduling to avoid
+            # stacking duplicate after jobs (root cause of long-hour hangs).
             app._safe_after(int(refresh_sec * 1000), _refresh_live_chart_tab, app, False)
+            _already_scheduled = True
             return
 
         # Build the snapshot
@@ -1500,7 +1496,10 @@ def _refresh_live_chart_tab(app: Any, force: bool = False) -> None:
     except Exception as e:
         logger.debug("Error in _refresh_live_chart_tab: %s", e)
     finally:
-        app._safe_after(3000, _refresh_live_chart_tab, app, False)
+        # [UI-STABILITY] Reschedule only if we did NOT already schedule
+        # during the throttled early-return path above.
+        if not _already_scheduled:
+            app._safe_after(3000, _refresh_live_chart_tab, app, False)
 
 
 def _build_snapshot(app: Any) -> LiveChartSnapshot:

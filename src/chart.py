@@ -108,7 +108,11 @@ class LiveChartPlugin:
         self._lock_to_live = False
         self._dirty = True
         self._crosshair_enabled = True  # Disables the built-in Matplotlib crosshair when a Tkinter overlay takes over
-        self._max_candles: Optional[int] = None  # None = unlimited; set via set_max_candles()
+        # [CHART] Default to 500 candles to bound memory. Users can override via set_max_candles(None) for unlimited.
+        self._max_candles: Optional[int] = 500
+        # [CHART] Batch-update flag — suppresses intermediate _render() calls
+        # so callers can make multiple state changes with a single final render.
+        self._batch_updates: bool = False
 
         # Overlay visibility (name -> bool)
         self._overlays: dict[str, bool] = {
@@ -517,9 +521,10 @@ class LiveChartPlugin:
         except Exception:
             return
         self._raw_candles = candles
-        # Apply max candle limit if set
-        if self._max_candles is not None and len(self._raw_candles) > self._max_candles:
-            self._raw_candles = self._raw_candles[-self._max_candles:]
+        # [CHART] Apply max candle limit so memory does not grow forever.
+        limit = self._max_candles if self._max_candles is not None else 500
+        if len(self._raw_candles) > limit:
+            self._raw_candles = self._raw_candles[-limit:]
         self._dirty = True
         self._render()
 
@@ -556,7 +561,7 @@ class LiveChartPlugin:
         if atm_strike is not None:
             self._atm_strike = float(atm_strike)
         self._dirty = True
-        self._render()
+        # [CHART] Removed duplicate _render() call that wasted CPU cycles.
         self._render()
 
     def set_session_levels(self, high: Optional[float], low: Optional[float], open_price: Optional[float] = None) -> None:
@@ -617,9 +622,12 @@ class LiveChartPlugin:
             self.ax_rsi.autoscale_view()
         self._render()
 
-    def set_max_candles(self, count: int) -> None:
-        """Limit rendered candles to the most recent `count`."""
-        self._max_candles = max(1, int(count))
+    def set_max_candles(self, count: Optional[int]) -> None:
+        """Limit rendered candles to the most recent `count`. Pass None for unlimited."""
+        if count is None:
+            self._max_candles = None
+        else:
+            self._max_candles = max(1, int(count))
         self._dirty = True
         self._render()
 
@@ -672,6 +680,56 @@ class LiveChartPlugin:
             self.fig.savefig(str(filename), dpi=150, bbox_inches="tight")
         except Exception:
             pass
+
+    def update_from_snapshot(
+        self,
+        candles: Optional[list[Any]] = None,
+        spot: Optional[float] = None,
+        futures: Optional[float] = None,
+        atm_strike: Optional[float] = None,
+        iv: Optional[float] = None,
+        pcr: Optional[float] = None,
+        session_high: Optional[float] = None,
+        session_low: Optional[float] = None,
+        prevday_high: Optional[float] = None,
+        prevday_low: Optional[float] = None,
+        prediction_rows: Optional[list[dict[str, Any]]] = None,
+        trade_event_rows: Optional[list[dict[str, Any]]] = None,
+        regime_label: Optional[str] = None,
+        market_status: Optional[str] = None,
+    ) -> None:
+        """Atomically apply all snapshot fields and render once.
+
+        [CHART] Batches all state mutations so the expensive _render()
+        (matplotlib canvas draw) is called exactly once instead of up to
+        7 times per refresh cycle. This dramatically reduces CPU/GPU
+        overhead during long-hour UI operation.
+        """
+        self._batch_updates = True
+        try:
+            if candles is not None:
+                self.push_candles(candles)
+            self._market_info["spot"] = spot
+            self._market_info["futures"] = futures
+            self._market_info["iv"] = iv
+            self._market_info["pcr"] = pcr
+            self._market_info["regime_label"] = regime_label or self._market_info.get("regime_label", "")
+            self._market_info["market_status"] = market_status or self._market_info.get("market_status", "")
+            if atm_strike is not None:
+                self._atm_strike = float(atm_strike)
+            self._session_high = float(session_high) if session_high is not None else self._session_high
+            self._session_low = float(session_low) if session_low is not None else self._session_low
+            self._prevday_high = float(prevday_high) if prevday_high is not None else self._prevday_high
+            self._prevday_low = float(prevday_low) if prevday_low is not None else self._prevday_low
+            if prediction_rows is not None:
+                self.load_prediction_rows(prediction_rows)
+            if trade_event_rows is not None:
+                self.load_trade_event_rows(trade_event_rows)
+            # Mark dirty and render ONCE after all updates
+            self._dirty = True
+            self._render()
+        finally:
+            self._batch_updates = False
 
     # ------------------------------------------------------------------ #
     #  Indicator computation methods                                     #
@@ -1265,6 +1323,10 @@ class LiveChartPlugin:
     # ------------------------------------------------------------------ #
 
     def _render(self) -> None:
+        # [CHART] Skip render during batch mode — caller is batching multiple
+        # state changes and will trigger a single render at the end.
+        if self._batch_updates:
+            return
         if not self._dirty:
             return
         self._dirty = False

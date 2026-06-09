@@ -535,6 +535,16 @@ class ScalperUI(tk.Tk):
         self._greeks_render_throttle_sec: float = 2.0
         self._gpt_inflight = False
 
+        # [UI-STABILITY] State guards to prevent duplicate after-loops and
+        # unsafe callbacks during application shutdown.
+        self._closing: bool = False
+        self._after_ids: dict[str, int] = {}
+        self._ui_queue: queue.Queue = queue.Queue()
+        self._max_log_lines: int = 1000
+        self._candle_limit: int = 500
+        self._diag_last_ts: float = 0.0
+        self._watchdog_last_ts: float = time.time()
+
         self._cred_path = self._default_credential_path()
 
         self._build_widgets()
@@ -559,6 +569,11 @@ class ScalperUI(tk.Tk):
         self._safe_after(800, self._pump_spot_ltp)
         self._safe_after(650, self._pump_option_ltp)
         self._safe_after(900, self._pump_engine_diagnostics)
+        # [UI-STABILITY] Start queue drainer + watchdog so background workers
+        # never touch widgets directly and we can detect event-loop freezes.
+        self._safe_after(100, self._drain_ui_queue)
+        self._safe_after(30000, self._watchdog_heartbeat)
+        self._safe_after(60000, self._run_periodic_diagnostics)
 
         # Optional: bring window to front on startup (useful if launched from CLI).
         try:
@@ -607,14 +622,100 @@ class ScalperUI(tk.Tk):
             pass
 
     def _safe_after(self, delay_ms: int, callback, *args) -> bool:
-        """Schedule a Tk callback only if the widget still exists."""
+        """Schedule a Tk callback only if the widget still exists.
+
+        [UI-STABILITY] Cancels any pending after job for the same named
+        callback before scheduling a new one. This prevents duplicate
+        refresh loops from stacking after long-hour usage. Also guards
+        against scheduling new callbacks once the app is closing.
+        """
         try:
-            if not self.winfo_exists():
+            if self._closing or not self.winfo_exists():
                 return False
-            self.after(int(delay_ms), callback, *args)
+            key = getattr(callback, "__name__", str(id(callback)))
+            old_id = self._after_ids.pop(key, None)
+            if old_id is not None:
+                try:
+                    self.after_cancel(old_id)
+                except Exception:
+                    pass
+            new_id = self.after(int(delay_ms), callback, *args)
+            self._after_ids[key] = new_id
             return True
         except Exception:
             return False
+
+    # [UI-STABILITY] Queue-based UI dispatcher.
+    # Background worker threads push (fn, args, kwargs) tuples here;
+    # the main Tkinter loop drains them safely.
+    def _drain_ui_queue(self) -> None:
+        try:
+            max_items = 50
+            processed = 0
+            while processed < max_items:
+                try:
+                    item = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    if callable(item):
+                        item()
+                    elif isinstance(item, tuple) and len(item) >= 1:
+                        fn = item[0]
+                        args = item[1] if len(item) > 1 else ()
+                        kwargs = item[2] if len(item) > 2 else {}
+                        fn(*args, **kwargs)
+                except Exception as exc:
+                    print(f"[UI-STABILITY] UI queue item failed: {exc}")
+                processed += 1
+        except Exception:
+            pass
+        if not self._closing:
+            self._safe_after(100, self._drain_ui_queue)
+
+    # [UI-STABILITY] Lightweight memory / thread diagnostics logged every
+    # few minutes so we can correlate UI hangs with resource pressure.
+    def _run_periodic_diagnostics(self) -> None:
+        try:
+            import gc
+            import os as _os
+            import threading as _th
+            now = time.time()
+            if now - self._diag_last_ts < 60:
+                return
+            self._diag_last_ts = now
+            mem_mb = 0
+            try:
+                import psutil
+                p = psutil.Process(_os.getpid())
+                mem_mb = p.memory_info().rss / 1024 / 1024
+            except Exception:
+                pass
+            thread_cnt = _th.active_count()
+            after_cnt = len(self._after_ids)
+            candle_cnt = len(getattr(self, "_latest_candles", []) or [])
+            queue_size = self._ui_queue.qsize()
+            print(
+                f"[DIAGNOSTICS] mem_mb={mem_mb:.1f} threads={thread_cnt} "
+                f"after_jobs={after_cnt} candles={candle_cnt} "
+                f"ui_queue={queue_size}"
+            )
+            gc.collect()
+        except Exception:
+            pass
+
+    # [WATCHDOG] Heartbeat that logs to console every 30 seconds.
+    # If the log stops, the Tkinter event loop has frozen.
+    def _watchdog_heartbeat(self) -> None:
+        try:
+            now = time.time()
+            since_last = now - self._watchdog_last_ts
+            self._watchdog_last_ts = now
+            print(f"[WATCHDOG] heartbeat delta={since_last:.2f}s")
+        except Exception:
+            pass
+        if not self._closing:
+            self._safe_after(30000, self._watchdog_heartbeat)
 
     def _refresh_pnl_totals(self) -> None:
         profit = 0.0
@@ -746,8 +847,14 @@ class ScalperUI(tk.Tk):
         """Refresh live spot LTP (best-effort, never blocks UI)."""
 
         try:
+            # [UI-STABILITY] If a previous worker thread hung, the inflight
+            # flag can stay True forever. Recover after a 10-second timeout.
             if bool(getattr(self, "_spot_refresh_inflight", False)):
-                return
+                start_ts = float(getattr(self, "_spot_refresh_start_ts", 0.0) or 0.0)
+                if start_ts > 0 and (time.time() - start_ts) > 10.0:
+                    self._spot_refresh_inflight = False
+                else:
+                    return
             client = getattr(self, "_client", None)
             if client is None:
                 return
@@ -767,6 +874,7 @@ class ScalperUI(tk.Tk):
                 return
 
             self._spot_refresh_inflight = True
+            self._spot_refresh_start_ts = time.time()
 
             def _worker() -> None:
                 ltp = None
@@ -2210,8 +2318,13 @@ class ScalperUI(tk.Tk):
 
     def _pump_option_ltp(self) -> None:
         try:
+            # [UI-STABILITY] Recover from a hung worker after 10 seconds.
             if bool(getattr(self, "_option_ltp_refresh_inflight", False)):
-                return
+                start_ts = float(getattr(self, "_option_ltp_refresh_start_ts", 0.0) or 0.0)
+                if start_ts > 0 and (time.time() - start_ts) > 10.0:
+                    self._option_ltp_refresh_inflight = False
+                else:
+                    return
             client = getattr(self, "_client", None)
             if client is None:
                 return
@@ -2248,6 +2361,7 @@ class ScalperUI(tk.Tk):
                 return
 
             self._option_ltp_refresh_inflight = True
+            self._option_ltp_refresh_start_ts = time.time()
 
             def _worker() -> None:
                 events: list[TradeLogEvent] = []
@@ -2396,8 +2510,13 @@ class ScalperUI(tk.Tk):
 
     def _pump_margin_required(self) -> None:
         try:
+            # [UI-STABILITY] Recover from a hung worker after 10 seconds.
             if self._margin_refresh_inflight:
-                return
+                start_ts = float(getattr(self, "_margin_refresh_start_ts", 0.0) or 0.0)
+                if start_ts > 0 and (time.time() - start_ts) > 10.0:
+                    self._margin_refresh_inflight = False
+                else:
+                    return
             client = self._client
             if client is None:
                 return
@@ -2416,6 +2535,7 @@ class ScalperUI(tk.Tk):
                 return
 
             self._margin_refresh_inflight = True
+            self._margin_refresh_start_ts = time.time()
 
             def _worker() -> None:
                 total = None
@@ -2443,8 +2563,13 @@ class ScalperUI(tk.Tk):
 
     def _pump_dashboard_portfolio(self) -> None:
         try:
+            # [UI-STABILITY] Recover from a hung worker after 10 seconds.
             if self._dash_portfolio_inflight:
-                return
+                start_ts = float(getattr(self, "_dash_portfolio_start_ts", 0.0) or 0.0)
+                if start_ts > 0 and (time.time() - start_ts) > 10.0:
+                    self._dash_portfolio_inflight = False
+                else:
+                    return
 
             now = time.time()
             if (now - float(self._dash_portfolio_ts or 0.0)) < float(self._dash_portfolio_refresh_sec):
@@ -2470,6 +2595,7 @@ class ScalperUI(tk.Tk):
             client = getattr(self, "_client", None)
 
             self._dash_portfolio_inflight = True
+            self._dash_portfolio_start_ts = time.time()
 
             def _worker() -> None:
                 def _to_float(x: object) -> float | None:
@@ -3641,12 +3767,12 @@ class ScalperUI(tk.Tk):
 
         try:
             if hasattr(self, "_render_option_legs"):
-                self.after(0, self._render_option_legs)
+                self._safe_after(0, self._render_option_legs)
         except Exception:
             pass
         try:
             if hasattr(self, "_render_managed_positions"):
-                self.after(0, self._render_managed_positions)
+                self._safe_after(0, self._render_managed_positions)
         except Exception:
             pass
 
@@ -4518,6 +4644,8 @@ class ScalperUI(tk.Tk):
         # Instantiate LiveChartPlugin matching default underlying
         underlying = (os.getenv("MSTOCK_UNDERLYING") or os.getenv("MSTOCK_SYMBOL") or "NIFTY").strip()
         self.live_chart_plugin = LiveChartPlugin(self.live_chart_frame, symbol=underlying, timeframe="1m")
+        # [UI-STABILITY] Cap chart candles so renderer memory stays bounded.
+        self.live_chart_plugin.set_max_candles(self._candle_limit)
         # Wire up the full Live Chart tab layout (right-panel cards + status bar + timeline)
         wire_live_chart_panels(self)
 
@@ -8444,8 +8572,10 @@ class ScalperUI(tk.Tk):
             if db is None:
                 return
 
-            trade_rows = db.list_recent_trade_events(limit=1200) if hasattr(db, "list_recent_trade_events") else []
-            prediction_rows = db.list_recent_prediction_markers(limit=3000) if hasattr(db, "list_recent_prediction_markers") else []
+            # [UI-STABILITY] Cap rows fetched so we never overwhelm the chart
+            # renderer with unbounded data after long-hour usage.
+            trade_rows = db.list_recent_trade_events(limit=500) if hasattr(db, "list_recent_trade_events") else []
+            prediction_rows = db.list_recent_prediction_markers(limit=500) if hasattr(db, "list_recent_prediction_markers") else []
 
             if trade_rows:
                 plugin.load_trade_event_rows(trade_rows)
@@ -8454,6 +8584,11 @@ class ScalperUI(tk.Tk):
             self._chart_overlay_refresh_ts = now_ts
         except Exception:
             pass
+        finally:
+            # [UI-STABILITY] Self-reschedule so overlays stay fresh even when
+            # _pump_trades is idle. Uses _safe_after to avoid duplicate loops.
+            if not getattr(self, "_closing", False):
+                self._safe_after(int(self._chart_overlay_refresh_sec * 1000), self._refresh_live_chart_overlays)
 
     def _export_trade_journal_csv(self) -> None:
         try:
@@ -9699,7 +9834,7 @@ class ScalperUI(tk.Tk):
                     pass
                 try:
                     self._dash_portfolio_ts = 0.0
-                    self.after(0, self._pump_dashboard_portfolio)
+                    self._safe_after(0, self._pump_dashboard_portfolio)
                 except Exception:
                     pass
                 try:
@@ -9727,7 +9862,10 @@ class ScalperUI(tk.Tk):
                 self._refresh_live_chart_overlays()
             except Exception:
                 pass
-            self.after(150, self._pump_trades)
+            # [UI-STABILITY] Use guarded _safe_after instead of raw after()
+            # so duplicate loops cannot stack and closing is respected.
+            if not self._closing:
+                self._safe_after(150, self._pump_trades)
 
     def _on_show_settings(self) -> None:
         """Show a small window with current strategy settings and allow tweaks.
@@ -12795,7 +12933,19 @@ class ScalperUI(tk.Tk):
                     break
         except queue.Empty:
             pass
-        self._safe_after(100, self._pump_logs)
+        # [UI-STABILITY] Trim the log widget so it cannot grow forever.
+        try:
+            line_count = int(self.log.index("end-1c").split(".")[0])
+            if line_count > self._max_log_lines:
+                trim_to = line_count - self._max_log_lines
+                self.log.configure(state=tk.NORMAL)
+                self.log.delete("1.0", f"{trim_to + 1}.0")
+                self.log.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+        # [UI-STABILITY] Only reschedule if we are not shutting down.
+        if not self._closing:
+            self._safe_after(100, self._pump_logs)
 
     # --- Login flow (TOTP) ---
 
@@ -12878,6 +13028,9 @@ class ScalperUI(tk.Tk):
     # --- Bot control ---
 
     def _on_start(self) -> None:
+        # [UI-STABILITY] Do not allow starting the bot while we are closing.
+        if getattr(self, "_closing", False):
+            return
         if self._bot_thread and self._bot_thread.is_alive():
             messagebox.showinfo("Already running", "Bot is already running.")
             return
@@ -13178,8 +13331,12 @@ class ScalperUI(tk.Tk):
         self._bot_thread.start()
 
     def _on_stop(self) -> None:
+        # [UI-STABILITY] Graceful stop: signal the bot and update UI.
         self._bot_stop.set()
-        self.btn_stop.configure(state=tk.DISABLED)
+        try:
+            self.btn_stop.configure(state=tk.DISABLED)
+        except Exception:
+            pass
         if hasattr(self, "status_var"):
             self.status_var.set("Stopping...")
 
@@ -13221,6 +13378,15 @@ class ScalperUI(tk.Tk):
         self.after(200, _poll)
 
     def _on_close(self) -> None:
+        # [UI-STABILITY] Graceful shutdown: prevent new after jobs, cancel
+        # existing ones, and close resources before destroying the window.
+        self._closing = True
+        for key, after_id in list(self._after_ids.items()):
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+        self._after_ids.clear()
         try:
             self._bot_stop.set()
             try:
