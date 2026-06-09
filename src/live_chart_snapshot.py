@@ -15,9 +15,12 @@ and degrade gracefully when data is unavailable.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -137,14 +140,229 @@ class LiveChartSnapshot:
 
 
 # ---------------------------------------------------------------------------
+# Candle normalizer
+# ---------------------------------------------------------------------------
+
+def normalize_live_chart_candles(
+    rows: Any,
+) -> list[Candle]:
+    """Normalize heterogeneous candle inputs into live_chart_snapshot.Candle objects.
+
+    Accepts:
+      - Objects with ``time`` or ``timestamp`` attribute
+        (e.g. market_data.Candle, live_chart_snapshot.Candle)
+      - Dicts with time/timestamp/ts/date keys
+      - List/tuple rows from broker API (6 elements: time, open, high, low, close, volume)
+
+    Returns a list of Candle objects with timestamp=, open=, high=, low=, close=,
+    volume= attributes. Logs rejected count and reason when rows are dropped.
+
+    Does NOT silently return an empty list when input has data.
+    """
+    if not rows:
+        return []
+
+    if not isinstance(rows, (list, tuple)):
+        rows = [rows]
+
+    output: list[Candle] = []
+    rejected: dict[str, int] = {}
+
+    for idx, row in enumerate(rows):
+        try:
+            normalized = _normalize_single_candle(row, idx)
+            if normalized is not None:
+                output.append(normalized)
+            else:
+                key = "invalid_candle_structure"
+                rejected[key] = rejected.get(key, 0) + 1
+        except Exception as exc:  # pragma: no cover — defensive
+            key = f"exception:{type(exc).__name__}"
+            rejected[key] = rejected.get(key, 0) + 1
+
+    total = len(rows)
+    kept = len(output)
+    dropped = total - kept
+
+    if dropped > 0:
+        reasons = "; ".join(f"{k}={v}" for k, v in rejected.items())
+        logger.warning(
+            "normalize_live_chart_candles: rejected %d/%d rows — %s",
+            dropped, total, reasons,
+        )
+    elif total > 0:
+        logger.debug(
+            "normalize_live_chart_candles: accepted %d/%d rows", kept, total
+        )
+
+    return output
+
+
+def _normalize_single_candle(row: Any, idx: int) -> Optional[Candle]:
+    """Normalize a single row into a Candle or return None on failure."""
+    # Case 1: dict-like
+    if isinstance(row, dict):
+        return _normalize_dict_candle(row)
+
+    # Case 2: object with time/timestamp attribute
+    if hasattr(row, "time") or hasattr(row, "timestamp"):
+        return _normalize_object_candle(row)
+
+    # Case 3: list/tuple from broker API (positional: time, open, high, low, close, volume)
+    if isinstance(row, (list, tuple)) and len(row) >= 6:
+        return _normalize_sequence_candle(row)
+
+    # Unrecognized
+    return None
+
+
+def _normalize_dict_candle(d: dict[str, Any]) -> Optional[Candle]:
+    """Normalize a dict with time/timestamp/ts/date keys."""
+    # Find the time value using multiple possible keys
+    t_raw = d.get("time") or d.get("timestamp") or d.get("ts") or d.get("date")
+    if t_raw is None:
+        return None
+
+    dt = _parse_datetime(t_raw)
+    if dt is None:
+        return None
+
+    def _float(v, default=0.0):
+        try:
+            return float(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    return Candle(
+        timestamp=dt,
+        open=_float(d.get("open")),
+        high=_float(d.get("high")),
+        low=_float(d.get("low")),
+        close=_float(d.get("close")),
+        volume=_float(d.get("volume")),
+    )
+
+
+def _normalize_object_candle(obj: Any) -> Optional[Candle]:
+    """Normalize an object with time or timestamp attribute."""
+    t_raw = getattr(obj, "time", None) or getattr(obj, "timestamp", None)
+    if t_raw is None:
+        return None
+
+    dt = _parse_datetime(t_raw)
+    if dt is None:
+        return None
+
+    def _float(v, default=0.0):
+        try:
+            return float(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    return Candle(
+        timestamp=dt,
+        open=_float(getattr(obj, "open", None)),
+        high=_float(getattr(obj, "high", None)),
+        low=_float(getattr(obj, "low", None)),
+        close=_float(getattr(obj, "close", None)),
+        volume=_float(getattr(obj, "volume", None)),
+    )
+
+
+def _normalize_sequence_candle(seq: Any) -> Optional[Candle]:
+    """Normalize a list/tuple: (time, open, high, low, close, volume)."""
+    if len(seq) < 6:
+        return None
+
+    t_raw = seq[0]
+    dt = _parse_datetime(t_raw)
+    if dt is None:
+        return None
+
+    def _float(v, default=0.0):
+        try:
+            return float(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    return Candle(
+        timestamp=dt,
+        open=_float(seq[1]),
+        high=_float(seq[2]),
+        low=_float(seq[3]),
+        close=_float(seq[4]),
+        volume=_float(seq[5]),
+    )
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    """Parse a datetime from various timestamp representations."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromtimestamp(float(value))
+    except (TypeError, ValueError, OSError):
+        pass
+    try:
+        # Handle ISO strings
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Option chain parser
 # ---------------------------------------------------------------------------
+
+# Known broker key variants for option chain fields.
+_STRIKE_KEYS = ("strike", "strike_price", "strikePrice")
+_BID_KEYS    = ("bid", "bid_price", "best_bid", "bestBidPrice", "best_bid_price")
+_ASK_KEYS    = ("ask", "ask_price", "best_ask", "bestAskPrice", "best_ask_price")
+_LTP_KEYS    = ("ltp", "last_price", "lastPrice", "lastTradedPrice", "LastTradedPrice", "last_traded_price", "LTP")
+_IV_KEYS     = ("iv", "implied_volatility", "impliedVolatility", "IV", "ImpliedVolatility")
+_OI_KEYS     = ("oi", "open_interest", "openInterest", "OpenInterest")
+
+
+def _multi_get(row: dict, keys: tuple[str, ...], default=None):
+    """Try each key in order and return the first non-None value."""
+    for k in keys:
+        v = row.get(k)
+        if v is not None:
+            return v
+    return default
+
+
+def _strike_from_row(row: dict) -> float:
+    v = _multi_get(row, _STRIKE_KEYS, 0.0)
+    try:
+        return float(v) if v is not None else 0.0
+    except Exception:
+        return 0.0
+
 
 def option_chain_to_summary(
     payload: Optional[dict[str, Any]],
     spot: Optional[float] = None,
 ) -> OptionChainSummary:
-    """Parse a raw option chain payload into OptionChainSummary."""
+    """Parse a raw option chain payload into OptionChainSummary.
+
+    Handles the following broker payload shapes:
+      - Flat list under ``payload["chain"]``
+      - Nested ``payload["call_options"]`` / ``payload["put_options"]``
+      - Nested ``payload["call"]`` / ``payload["put"]`` (contract model style)
+      - Rows where each entry has nested ``{"CE": {...}, "PE": {...}}``
+
+    All field names are normalised across broker variants:
+      strike / strike_price / strikePrice
+      bid / bid_price / best_bid / bestBidPrice / best_bid_price
+      ask / ask_price / best_ask / bestAskPrice / best_ask_price
+      ltp / last_price / lastPrice / lastTradedPrice / last_traded_price / LTP
+      iv / implied_volatility / impliedVolatility / IV / ImpliedVolatility
+      oi / open_interest / openInterest / OpenInterest
+    """
     summary = OptionChainSummary()
 
     if payload is None:
@@ -155,34 +373,64 @@ def option_chain_to_summary(
         if spot is not None:
             summary.atm_strike = round(float(spot) / 50) * 50
 
-        # Find CE and PE nearest to ATM
-        chain = payload if isinstance(payload, list) else payload.get("chain", [])
+        # -----------------------------------------------------------------
+        # Normalise the chain to a flat list of row dicts.
+        # -----------------------------------------------------------------
+        chain: list[dict[str, Any]] = []
+
+        if isinstance(payload, list):
+            chain = payload
+        elif isinstance(payload, dict):
+            # Nested call_options / put_options  (broker variant)
+            call_opts = payload.get("call_options") or payload.get("call") or []
+            put_opts  = payload.get("put_options")  or payload.get("put")  or []
+
+            if isinstance(call_opts, list) and call_opts and isinstance(put_opts, list) and put_opts:
+                for row in call_opts:
+                    if isinstance(row, dict):
+                        chain.append({**row, "option_type": "CE"})
+                for row in put_opts:
+                    if isinstance(row, dict):
+                        chain.append({**row, "option_type": "PE"})
+                if not chain:
+                    chain = payload.get("chain", [])
+            else:
+                # Flat chain list, possibly inside payload
+                chain = payload.get("chain", [])
+
+                # Handle rows that are dicts with CE/PE sub-dicts (broker variant)
+                if chain and all(isinstance(r, dict) and ("CE" in r or "PE" in r) for r in chain):
+                    normalised = []
+                    for r in chain:
+                        strike_val = _strike_from_row(r)
+                        for opt_type in ("CE", "PE"):
+                            leg = r.get(opt_type)
+                            if isinstance(leg, dict):
+                                normalised.append({**leg, "option_type": opt_type, "strike": strike_val})
+                    chain = normalised
+
         if not isinstance(chain, list):
             return summary
 
-        ce_contracts = []
-        pe_contracts = []
+        ce_contracts: list[dict] = []
+        pe_contracts: list[dict] = []
         for row in chain:
             if not isinstance(row, dict):
                 continue
-            ot = str(row.get("option_type", "") or row.get("instrument", "")).upper()
+            ot = str(_multi_get(row, ("option_type", "instrument", "right", "type")) or "").upper()
             if ot in ("CE", "CALL"):
                 ce_contracts.append(row)
             elif ot in ("PE", "PUT"):
                 pe_contracts.append(row)
 
         def _strike_key(c: dict) -> float:
-            try:
-                return float(c.get("strike", 0))
-            except Exception:
-                return 0.0
+            return _strike_from_row(c)
 
         ce_contracts.sort(key=_strike_key)
         pe_contracts.sort(key=_strike_key)
 
         atm = summary.atm_strike
         if atm is not None:
-            # Nearest ATM CE and PE
             ce_nearest = min(ce_contracts, key=lambda c: abs(_strike_key(c) - atm), default=None) if ce_contracts else None
             pe_nearest = min(pe_contracts, key=lambda c: abs(_strike_key(c) - atm), default=None) if pe_contracts else None
 
@@ -199,37 +447,49 @@ def option_chain_to_summary(
                     return default
 
             if ce_nearest:
-                summary.ce_ltp    = _float(ce_nearest.get("ltp") or ce_nearest.get("last_price"))
-                summary.ce_iv     = _float(ce_nearest.get("iv") or ce_nearest.get("implied_volatility"))
-                summary.ce_oi     = _int(ce_nearest.get("oi") or ce_nearest.get("open_interest"))
-                ce_bid = _float(ce_nearest.get("bid"))
-                ce_ask = _float(ce_nearest.get("ask"))
+                summary.ce_ltp = _float(_multi_get(ce_nearest, _LTP_KEYS))
+                summary.ce_iv  = _float(_multi_get(ce_nearest, _IV_KEYS))
+                summary.ce_oi  = _int(_multi_get(ce_nearest, _OI_KEYS))
+                ce_bid = _float(_multi_get(ce_nearest, _BID_KEYS))
+                ce_ask = _float(_multi_get(ce_nearest, _ASK_KEYS))
                 if ce_bid is not None and ce_ask is not None:
                     summary.ce_bid_ask_spread = ce_ask - ce_bid
 
             if pe_nearest:
-                summary.pe_ltp    = _float(pe_nearest.get("ltp") or pe_nearest.get("last_price"))
-                summary.pe_iv     = _float(pe_nearest.get("iv") or pe_nearest.get("implied_volatility"))
-                summary.pe_oi     = _int(pe_nearest.get("oi") or pe_nearest.get("open_interest"))
-                pe_bid = _float(pe_nearest.get("bid"))
-                pe_ask = _float(pe_nearest.get("ask"))
+                summary.pe_ltp = _float(_multi_get(pe_nearest, _LTP_KEYS))
+                summary.pe_iv  = _float(_multi_get(pe_nearest, _IV_KEYS))
+                summary.pe_oi  = _int(_multi_get(pe_nearest, _OI_KEYS))
+                pe_bid = _float(_multi_get(pe_nearest, _BID_KEYS))
+                pe_ask = _float(_multi_get(pe_nearest, _ASK_KEYS))
                 if pe_bid is not None and pe_ask is not None:
                     summary.pe_bid_ask_spread = pe_ask - pe_bid
 
-        # PCR
-        ce_oi_total = sum(
-            int(c.get("oi", 0) or 0) for c in ce_contracts
-            if c.get("oi") is not None
-        )
-        pe_oi_total = sum(
-            int(c.get("oi", 0) or 0) for c in pe_contracts
-            if c.get("oi") is not None
-        )
+        # -----------------------------------------------------------------
+        # PCR — sum OI across all strikes using all key variants
+        # -----------------------------------------------------------------
+        ce_oi_total = 0
+        pe_oi_total = 0
+        for c in chain:
+            if not isinstance(c, dict):
+                continue
+            ot = str(_multi_get(c, ("option_type", "instrument", "right", "type")) or "").upper()
+            oi_raw = _multi_get(c, _OI_KEYS)
+            if oi_raw is None:
+                continue
+            try:
+                oi_val = int(oi_raw)
+            except Exception:
+                oi_val = 0
+            if ot in ("CE", "CALL"):
+                ce_oi_total += oi_val
+            elif ot in ("PE", "PUT"):
+                pe_oi_total += oi_val
+
         if ce_oi_total > 0:
             summary.pcr = pe_oi_total / ce_oi_total
 
         # Staleness
-        ts = payload.get("timestamp") or payload.get("ts")
+        ts = _multi_get(payload, ("timestamp", "ts")) if isinstance(payload, dict) else None
         if ts is not None:
             try:
                 if isinstance(ts, (int, float)):
@@ -250,7 +510,7 @@ def option_chain_to_summary(
             summary.iv_spike_warning = True
 
         # Liquidity score
-        wide = summary.wide_spread_warning
+        wide  = summary.wide_spread_warning
         spike = summary.iv_spike_warning
         stale = summary.is_stale
         if stale:
@@ -283,6 +543,8 @@ def compute_shadow_metrics(
         try:
             now = datetime.now()
             today_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+            if now < today_start:
+                today_start = today_start - timedelta(days=1)  # pre-market: use yesterday
             today_start_ts = today_start.timestamp()
 
             # Filter today's predictions
