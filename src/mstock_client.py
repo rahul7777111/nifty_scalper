@@ -5,12 +5,14 @@ import sys
 import json
 import time
 import math
+import threading
 import urllib.request
 import urllib.error
+from collections import OrderedDict
 from pathlib import Path
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     from tradingapi_b.mconnect import MConnectB
@@ -27,11 +29,156 @@ try:
     from .config import APIConfig
     from .market_data import Candle
     from .scripmaster import ScripMaster
+    from .auth import (
+        decode_mstock_jwt,
+        is_mstock_token_expiring,
+        safe_refresh_mstock_token,
+    )
 except ImportError:
     import yahoo_data
     from config import APIConfig
     from market_data import Candle
     from scripmaster import ScripMaster
+    try:
+        from auth import (
+            decode_mstock_jwt,
+            is_mstock_token_expiring,
+            safe_refresh_mstock_token,
+        )
+    except ImportError:
+        # Graceful degradation if auth helpers are missing
+        def decode_mstock_jwt(token: str) -> dict:
+            return {}
+        def is_mstock_token_expiring(token: str, within_seconds: int = 900) -> bool:
+            return False
+        def safe_refresh_mstock_token() -> Optional[str]:
+            return None
+
+
+# --- Caching and Metrics for Token Resolution ---
+FAILED_LOOKUPS: "OrderedDict[tuple[str, str], float]" = OrderedDict()
+FAILED_LOOKUPS_LOCK = threading.Lock()
+FAILED_LOOKUP_TTL_SECONDS = 60.0
+FAILED_LOOKUP_MAX_KEYS = 500
+lookup_success = 0
+lookup_failure = 0
+cache_hits = 0
+cache_evictions = 0
+
+
+def clear_failed_lookup_cache() -> None:
+    global lookup_success, lookup_failure, cache_hits, cache_evictions
+    with FAILED_LOOKUPS_LOCK:
+        FAILED_LOOKUPS.clear()
+    lookup_success = 0
+    lookup_failure = 0
+    cache_hits = 0
+    cache_evictions = 0
+
+
+def get_failed_lookup_cache_metrics() -> Dict[str, int]:
+    with FAILED_LOOKUPS_LOCK:
+        current_size = len(FAILED_LOOKUPS)
+    return {
+        "lookup_success": int(lookup_success),
+        "lookup_failure": int(lookup_failure),
+        "cache_hits": int(cache_hits),
+        "cache_evictions": int(cache_evictions),
+        "failed_lookups_size": int(current_size),
+    }
+
+
+def _prune_failed_lookup_cache(now_ts: Optional[float] = None) -> None:
+    global cache_evictions
+    now_ts = float(now_ts if now_ts is not None else time.time())
+    with FAILED_LOOKUPS_LOCK:
+        expired = [key for key, fail_ts in FAILED_LOOKUPS.items() if now_ts - fail_ts >= FAILED_LOOKUP_TTL_SECONDS]
+        for key in expired:
+            FAILED_LOOKUPS.pop(key, None)
+        while len(FAILED_LOOKUPS) > FAILED_LOOKUP_MAX_KEYS:
+            FAILED_LOOKUPS.popitem(last=False)
+            cache_evictions += 1
+
+
+def should_skip_failed_lookup(cache_key: tuple[str, str], now_ts: Optional[float] = None) -> bool:
+    global cache_hits
+    now_ts = float(now_ts if now_ts is not None else time.time())
+    with FAILED_LOOKUPS_LOCK:
+        fail_ts = FAILED_LOOKUPS.get(cache_key)
+        if fail_ts is None:
+            return False
+        if now_ts - fail_ts < FAILED_LOOKUP_TTL_SECONDS:
+            cache_hits += 1
+            return True
+        FAILED_LOOKUPS.pop(cache_key, None)
+        return False
+
+
+def remember_failed_lookup(cache_key: tuple[str, str], now_ts: Optional[float] = None) -> None:
+    global lookup_failure, cache_evictions
+    now_ts = float(now_ts if now_ts is not None else time.time())
+    with FAILED_LOOKUPS_LOCK:
+        FAILED_LOOKUPS.pop(cache_key, None)
+        FAILED_LOOKUPS[cache_key] = now_ts
+        while len(FAILED_LOOKUPS) > FAILED_LOOKUP_MAX_KEYS:
+            FAILED_LOOKUPS.popitem(last=False)
+            cache_evictions += 1
+    lookup_failure += 1
+
+
+def record_lookup_success(cache_key: Optional[tuple[str, str]] = None) -> None:
+    global lookup_success
+    if cache_key is not None:
+        with FAILED_LOOKUPS_LOCK:
+            FAILED_LOOKUPS.pop(cache_key, None)
+    lookup_success += 1
+
+
+# ── CF-001: HTTP 429 rate-limit exponential backoff helpers ─────────────────
+# Module-level state shared by all MStockTypeBClient instances.
+_RATE_LIMIT_BACKOFF: Dict[str, float] = {}  # context -> last_backoff_used
+_RATE_LIMIT_BACKOFF_LOCK = threading.Lock()
+
+
+def _parse_retry_after(exc: "urllib.error.HTTPError") -> float:
+    """Extract Retry-After seconds from an HTTPError, or return 0."""
+    try:
+        hdrs = dict(getattr(exc, "headers", {}) or {})
+        ra = hdrs.get("Retry-After") or hdrs.get("retry-after") or ""
+        if not ra:
+            return 0.0
+        ra_s = str(ra).strip()
+        try:
+            return max(0.0, float(ra_s))
+        except ValueError:
+            # HTTP-date format — compute delta from now
+            try:
+                from email.utils import parsedate_to_datetime
+                dt_future = parsedate_to_datetime(ra_s)
+                return max(0.0, (dt_future - datetime.now()).total_seconds())
+            except Exception:
+                return 0.0
+    except Exception:
+        return 0.0
+
+
+def _apply_rate_limit_backoff(context: str, retry_after: float = 0.0) -> None:
+    """Apply exponential backoff for rate-limited endpoints.
+
+    When the broker provides a Retry-After header, respect it directly.
+    Otherwise use exponential backoff starting at 1s, doubling each call,
+    max 60s.  Prints a warning so operators know backoff is active.
+    """
+    with _RATE_LIMIT_BACKOFF_LOCK:
+        prev = float(_RATE_LIMIT_BACKOFF.get(context, 0.0))
+        if retry_after > 0:
+            backoff = float(retry_after)
+            print(f"[RATE] {context}: HTTP 429, Retry-After={backoff:.1f}s")
+        else:
+            backoff = min(60.0, max(1.0, prev * 2.0)) if prev else 1.0
+            print(f"[RATE] {context}: HTTP 429, exponential backoff={backoff:.1f}s (was {prev:.1f}s)")
+        _RATE_LIMIT_BACKOFF[context] = backoff
+        time.sleep(backoff)
 
 
 # --- m.Stock valid candle intervals ---
@@ -71,6 +218,12 @@ class MStockTypeBClient:
     ``MConnectB`` client) and exposes a simplified interface that the
     strategy uses. You are responsible for providing a valid access
     token via configuration or environment variables.
+
+    Safety guards (CF-001 audit fixes):
+    - JWT token expiry checked before every API call; safe-refresh attempted
+      via TOTP or live orders are blocked if refresh fails.
+    - HTTP 429 responses handled with Retry-After + exponential backoff.
+    - Market orders are polled for fill confirmation before strategy proceeds.
     """
 
     def __init__(self, cfg: APIConfig) -> None:
@@ -104,13 +257,77 @@ class MStockTypeBClient:
         self._startup_historical_bootstrap_done: bool = False
         self._startup_historical_bootstrap_logged: bool = False
 
-    def _ensure_valid_token(self) -> None:
-        """Sync and push any fresh/changed MSTOCK_ACCESS_TOKEN directly into the SDK."""
+        # ── CF-001: Token-expiry tracking ────────────────────────────────────
+        self._token_refresh_attempted: bool = False
+        self._token_refresh_succeeded: bool = False
+
+    def _ensure_valid_token(self, *, allow_refresh: bool = True) -> None:
+        """Sync and push any fresh/changed MSTOCK_ACCESS_TOKEN directly into the SDK.
+
+        CF-001 fix: Also checks JWT expiry and attempts safe TOTP refresh before
+        any live order.  Raises RuntimeError if token is expired and refresh fails,
+        so that live orders are blocked rather than attempted with a stale token.
+        """
         token = os.getenv("MSTOCK_ACCESS_TOKEN", "").strip()
         if not token:
             return
 
-        # Check if the token has changed or is not set in raw SDK client
+        # ── CF-001: JWT expiry check ────────────────────────────────────────
+        self._token_refresh_attempted = False
+        self._token_refresh_succeeded = False
+
+        if is_mstock_token_expiring(token, within_seconds=900):
+            exp_epoch: Optional[int] = None
+            try:
+                from auth import mstock_token_expiry_epoch
+                exp_epoch = mstock_token_expiry_epoch(token)
+            except Exception:
+                pass
+
+            exp_display = "unknown"
+            if exp_epoch is not None:
+                try:
+                    exp_display = datetime.fromtimestamp(exp_epoch).isoformat()
+                except Exception:
+                    exp_display = str(exp_epoch)
+
+            print(
+                f"[TOKEN] m.Stock JWT expiring soon (exp={exp_display}). "
+                f"Attempting safe TOTP refresh..."
+            )
+
+            if allow_refresh:
+                self._token_refresh_attempted = True
+                new_token = safe_refresh_mstock_token()
+                if new_token:
+                    self._token_refresh_succeeded = True
+                    self._raw.access_token = new_token
+                    if hasattr(self._raw, "set_access_token"):
+                        try:
+                            self._raw.set_access_token(new_token)
+                        except Exception:
+                            pass
+                    os.environ["MSTOCK_ACCESS_TOKEN"] = new_token
+                    print("[TOKEN] m.Stock token refreshed successfully.")
+                    return
+                else:
+                    print(
+                        "[TOKEN] m.Stock token refresh FAILED. "
+                        "Blocking live orders: set fresh MSTOCK_ACCESS_TOKEN before trading."
+                    )
+                    raise RuntimeError(
+                        "m.Stock access token is expired or expiring within 15 minutes, "
+                        "and automatic TOTP refresh failed. "
+                        "Generate a new token via: python -m src.auth "
+                        "and set MSTOCK_ACCESS_TOKEN before live trading."
+                    )
+            else:
+                raise RuntimeError(
+                    f"m.Stock access token is expired or expiring soon (exp={exp_display}). "
+                    "Set MSTOCK_ACCESS_TOKEN to a fresh token before live trading."
+                )
+
+        # Sync env token into the raw SDK client if it changed
         raw_token = getattr(self._raw, "access_token", None)
         if raw_token != token:
             self._raw.access_token = token
@@ -119,6 +336,170 @@ class MStockTypeBClient:
                     self._raw.set_access_token(token)
                 except Exception:
                     pass
+
+    # ── CF-001: HTTP 429 rate-limit helpers (mirrors dhan pattern) ──────────
+
+    def _handle_http_429(
+        self,
+        exc: "urllib.error.HTTPError",
+        context: str,
+    ) -> None:
+        """Log and apply backoff for an HTTP 429 response.
+
+        Reads Retry-After header (seconds or HTTP-date) and sleeps.
+        If no Retry-After header, applies exponential backoff starting at 1s,
+        doubling each call, max 60s.
+        """
+        retry_after = 0
+        try:
+            hdrs = exc.headers or {}
+            ra = hdrs.get("Retry-After") or hdrs.get("retry-after") or ""
+            if ra:
+                ra_s = str(ra).strip()
+                try:
+                    retry_after = max(0, int(ra_s))
+                except ValueError:
+                    # HTTP-date: parse as struct_time; use delta
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        dt_future = parsedate_to_datetime(ra_s)
+                        retry_after = max(0, int((dt_future - datetime.now()).total_seconds()))
+                    except Exception:
+                        retry_after = 0
+        except Exception:
+            retry_after = 0
+
+        _apply_rate_limit_backoff(context, retry_after)
+        body = ""
+        try:
+            body = (exc.read() or b"")[:200].decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        raise RuntimeError(
+            f"{context} hit rate limit (HTTP 429). "
+            f"Retry-After={retry_after}s. Body: {body!r}"
+        ) from exc
+
+    # ── CF-001: Order status polling ────────────────────────────────────────
+
+    def get_order_status(self, order_id: str) -> Dict[str, Any]:
+        """Return a compact dict describing the current state of an order.
+
+        Polls the TypeB order book via SDK.  Returns empty dict on error.
+        Keys: order_id, status, filled_qty, remaining_qty, message.
+        """
+        self._ensure_valid_token(allow_refresh=False)
+        try:
+            resp = self._raw.order_book()
+            payload = self._safe_json(resp, context="order_book")
+
+            if isinstance(payload, dict):
+                data = payload.get("data") or payload.get("orderBook") or []
+            elif isinstance(payload, list):
+                data = payload
+            else:
+                data = []
+
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                oid = str(row.get("order_id") or row.get("orderId") or "").strip()
+                if oid == str(order_id).strip():
+                    return {
+                        "order_id": oid,
+                        "status": str(row.get("status") or row.get("orderStatus") or "").strip().upper(),
+                        "filled_qty": int(float(row.get("filled_quantity") or row.get("filledQty") or 0)),
+                        "remaining_qty": int(float(row.get("remaining_quantity") or row.get("remainingQty") or 0)),
+                        "message": str(row.get("message") or row.get("description") or "").strip(),
+                        "raw": row,
+                    }
+            return {"order_id": str(order_id), "status": "", "filled_qty": 0, "remaining_qty": 0, "message": "Order not found in order book"}
+        except Exception as exc:
+            return {"order_id": str(order_id), "status": "", "filled_qty": 0, "remaining_qty": 0, "message": str(exc)}
+
+    def poll_order_until_terminal(
+        self,
+        order_id: str,
+        *,
+        timeout_sec: float = 30.0,
+        interval_sec: float = 2.0,
+    ) -> Dict[str, Any]:
+        """Poll order status until terminal (filled/complete/traded/rejected/cancelled).
+
+        Returns a dict with keys: order_id, status, filled_qty, remaining_qty,
+        message, timed_out.
+
+        Safe to call — never raises. Returns timed_out=True on timeout.
+        """
+        terminal_statuses = {
+            "filled", "complete", "traded", "rejected", "cancelled", "error", ""
+        }
+        start = float(time.time())
+        poll_interval = max(0.5, float(interval_sec))
+
+        while (float(time.time()) - start) < float(timeout_sec):
+            info = self.get_order_status(order_id)
+            status = str(info.get("status") or "").lower()
+            if status in terminal_statuses or int(info.get("filled_qty", 0) or 0) > 0:
+                return {**info, "timed_out": False}
+            time.sleep(poll_interval)
+
+        # Timed out — return last known state with timed_out flag.
+        last = self.get_order_status(order_id)
+        return {**last, "timed_out": True}
+
+    def _poll_for_order_fill(
+        self,
+        order_id: str,
+        *,
+        max_wait_seconds: float = 5.0,
+        poll_interval_seconds: float = 1.0,
+    ) -> Dict[str, Any]:
+        """Poll get_order_status until terminal state or timeout.
+
+        Terminal states (case-insensitive): FILLED, COMPLETE, REJECTED, CANCELLED.
+        Partial states: PARTIALLY_FILLED, OPEN, PENDING.
+
+        Returns the last status dict.  Callers should check status before proceeding.
+        """
+        deadline = float(time.time()) + float(max_wait_seconds)
+        poll_interval = max(0.5, float(poll_interval_seconds))
+        terminal_states = {"FILLED", "COMPLETE", "REJECTED", "CANCELLED", ""}
+        partial_states = {"PARTIALLY_FILLED", "OPEN", "PENDING", "MODIFIED"}
+
+        last_status: Dict[str, Any] = {"order_id": str(order_id), "status": "", "filled_qty": 0, "remaining_qty": 0, "message": ""}
+        while float(time.time()) < float(deadline):
+            last_status = self.get_order_status(order_id)
+            status = str(last_status.get("status") or "").strip().upper()
+            filled = int(last_status.get("filled_qty") or 0)
+            remaining = int(last_status.get("remaining_qty") or 0)
+            msg = str(last_status.get("message") or "").strip()
+
+            if status in terminal_states:
+                print(
+                    f"[ORDER] order_id={order_id} status={status!r} "
+                    f"filled={filled} remaining={remaining} msg={msg!r}"
+                )
+                return last_status
+
+            if status in partial_states:
+                print(
+                    f"[ORDER] order_id={order_id} status={status!r} "
+                    f"filled={filled} remaining={remaining} — still pending, polling..."
+                )
+
+            # Sleep until next poll or deadline
+            remaining_time = max(0.1, float(deadline) - float(time.time()))
+            sleep_for = min(float(poll_interval), remaining_time)
+            if sleep_for > 0:
+                time.sleep(float(sleep_for))
+
+        # Timed out — log and return last known status
+        print(
+            f"[ORDER] order_id={order_id} TIMEOUT after {max_wait_seconds}s — "
+            f"last status: {last_status.get('status')!r} filled={last_status.get('filled_qty')}"
+        )
+        return last_status
 
     def _log_intraday_failure(self, key: str, msg: str) -> None:
         """Log intraday failures only when explicitly debugging.
@@ -335,6 +716,12 @@ class MStockTypeBClient:
                     raw = resp.read()
                     return raw.decode("utf-8", errors="replace")
             except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    _apply_rate_limit_backoff("intraday_post", _parse_retry_after(exc))
+                    raise RuntimeError(
+                        f"intraday chart hit rate limit (HTTP 429). "
+                        f"Body preview: {(exc.read() or b'')[:200].decode('utf-8','replace')!r}"
+                    ) from exc
                 body = ""
                 try:
                     body = (exc.read() or b"")[:400].decode("utf-8", errors="replace")
@@ -370,6 +757,12 @@ class MStockTypeBClient:
                     raw = resp.read()
                     return raw.decode("utf-8", errors="replace")
             except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    _apply_rate_limit_backoff("intraday_get", _parse_retry_after(exc))
+                    raise RuntimeError(
+                        f"intraday chart hit rate limit (HTTP 429). "
+                        f"Body preview: {(exc.read() or b'')[:200].decode('utf-8','replace')!r}"
+                    ) from exc
                 body = ""
                 try:
                     body = (exc.read() or b"")[:400].decode("utf-8", errors="replace")
@@ -523,6 +916,12 @@ class MStockTypeBClient:
                 raw = resp.read()
                 text = raw.decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                _apply_rate_limit_backoff("historical_chart", _parse_retry_after(exc))
+                raise RuntimeError(
+                    f"get_historical_chart hit rate limit (HTTP 429). "
+                    f"Body preview: {(exc.read() or b'')[:200].decode('utf-8','replace')!r}"
+                ) from exc
             body = ""
             try:
                 body = (exc.read() or b"")[:400].decode("utf-8", errors="replace")
@@ -781,7 +1180,132 @@ class MStockTypeBClient:
                 break
         return "".join(out)
 
+    def _parse_option_chain_api_data(self, payload: Any, *, underlying: str = "") -> List[Dict[str, Any]]:
+        """Compatibility parser for older option-chain API payload shapes used in tests."""
+
+        symbol_root = str(underlying or "").strip().upper()
+        chain: List[Dict[str, Any]] = []
+
+        def append_row(
+            *,
+            option_type: str,
+            strike: Any,
+            token: Any,
+            symbol: Optional[str] = None,
+            expiry: Any = None,
+            exchange: str = "NFO",
+            iv: Any = None,
+        ) -> None:
+            opt_type = str(option_type or "").strip().upper()
+            if opt_type in {"CALL", "C"}:
+                opt_type = "CE"
+            elif opt_type in {"PUT", "P"}:
+                opt_type = "PE"
+            if opt_type not in {"CE", "PE"}:
+                return
+            try:
+                strike_val = float(strike) if strike is not None else 0.0
+            except Exception:
+                strike_val = 0.0
+            expiry_val = expiry
+            if expiry_val is not None and not hasattr(expiry_val, "year"):
+                try:
+                    expiry_val = self._parse_date_loose(expiry_val)
+                except Exception:
+                    expiry_val = None
+            token_val = str(token or "").strip()
+            symbol_val = str(symbol or "").strip()
+            root = symbol_root or self._derive_symbol_root(symbol_val)
+            if not symbol_val:
+                exp_txt = expiry_val.strftime("%d%b%y").upper() if expiry_val else ""
+                symbol_val = f"{root}{exp_txt}{int(strike_val or 0)}{opt_type}"
+            row = {
+                "symbol": symbol_val,
+                "token": token_val,
+                "exchange": str(exchange or "NFO").strip().upper(),
+                "strike": strike_val,
+                "option_type": opt_type,
+                "expiry": expiry_val,
+                "symbol_root": root,
+            }
+            if iv is not None:
+                try:
+                    row["iv"] = float(iv)
+                except Exception:
+                    row["iv"] = iv
+            chain.append(row)
+
+        if isinstance(payload, dict) and isinstance(payload.get("call"), list) and isinstance(payload.get("put"), list):
+            contract_model = payload.get("contractModel") or {}
+            root = str(contract_model.get("sym") or symbol_root or "").strip().upper()
+            if root:
+                symbol_root = root
+            expiry_val = None
+            raw_exp = contract_model.get("exp")
+            try:
+                if raw_exp is not None:
+                    expiry_val = datetime.fromtimestamp(float(raw_exp), timezone.utc).date()
+            except Exception:
+                expiry_val = self._parse_date_loose(raw_exp)
+            for option_type, rows in (("CE", payload.get("call") or []), ("PE", payload.get("put") or [])):
+                for item in rows:
+                    if isinstance(item, str):
+                        parts = [part.strip() for part in item.split(",")]
+                        token = parts[0] if len(parts) > 0 else ""
+                        strike = parts[1] if len(parts) > 1 else 0.0
+                        append_row(option_type=option_type, strike=strike, token=token, expiry=expiry_val, exchange="NFO")
+            return chain
+
+        if isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                if "CE" in item or "PE" in item:
+                    strike_val = item.get("strike") or item.get("strikePrice") or item.get("strike_price")
+                    for option_type in ("CE", "PE"):
+                        leg = item.get(option_type)
+                        if not isinstance(leg, dict):
+                            continue
+                        append_row(
+                            option_type=option_type,
+                            strike=strike_val,
+                            token=leg.get("symboltoken") or leg.get("symbolToken") or leg.get("token"),
+                            symbol=leg.get("tradingsymbol") or leg.get("symbol"),
+                            expiry=leg.get("expiry") or leg.get("expiryDate"),
+                            exchange=leg.get("exchange") or "NFO",
+                            iv=leg.get("iv"),
+                        )
+                    continue
+
+                append_row(
+                    option_type=item.get("optionType") or item.get("option_type") or item.get("opt_type"),
+                    strike=item.get("strikePrice") or item.get("strike_price") or item.get("strike"),
+                    token=item.get("symboltoken") or item.get("symbolToken") or item.get("token") or item.get("instrumentToken"),
+                    symbol=item.get("tradingsymbol") or item.get("tradingSymbol") or item.get("symbol"),
+                    expiry=item.get("expiry") or item.get("expiryDate") or item.get("expDate"),
+                    exchange=item.get("exchange") or item.get("exch_seg") or item.get("exchangeSegment") or "NFO",
+                    iv=item.get("iv") or item.get("impliedVolatility"),
+                )
+        return chain
+
     def _resolve_token_for_quote(self, symbol: str, *, exchange_hint: Optional[str] = None) -> tuple[str, str]:
+        raw = str(symbol or "").strip()
+        if not raw:
+            return "", ""
+
+        cache_key = (raw, str(exchange_hint or "").strip().upper())
+        _prune_failed_lookup_cache()
+        if should_skip_failed_lookup(cache_key):
+            return "", ""
+
+        exch, tok = self._resolve_token_for_quote_inner(symbol, exchange_hint=exchange_hint)
+        if exch and tok:
+            record_lookup_success(cache_key)
+            return exch, tok
+        remember_failed_lookup(cache_key)
+        return "", ""
+
+    def _resolve_token_for_quote_inner(self, symbol: str, *, exchange_hint: Optional[str] = None) -> tuple[str, str]:
         """Resolve (exchange, token) for quote/LTP calls.
 
         Accepts:
@@ -902,6 +1426,61 @@ class MStockTypeBClient:
                 "or configure ScripMaster/instruments for resolution."
             )
         return exch, tok
+
+    def resolve_exchange_token_symbol(self, symbol: str, exchange_hint: Optional[str] = None) -> tuple[str, str, str]:
+        exch, tok = self._resolve_token_for_quote(symbol, exchange_hint=exchange_hint)
+        if not exch or not tok:
+            return "", "", symbol
+        
+        resolved_sym = symbol
+        try:
+            row = self._get_instrument_by_token().get(tok)
+            if row:
+                name_blob = str(
+                    row.get("tradingsymbol")
+                    or row.get("tradingSymbol")
+                    or row.get("symbol")
+                    or row.get("name")
+                    or row.get("tokenName")
+                    or ""
+                ).strip()
+                if name_blob:
+                    resolved_sym = name_blob
+        except Exception:
+            pass
+            
+        return exch, tok, resolved_sym
+
+    def get_historical_candles(
+        self,
+        symbol_token: str,
+        exchange: str,
+        interval: str,
+        from_date: str,
+        to_date: str,
+    ) -> List[Candle]:
+        """Fetch historical candles from chart direct."""
+        self._ensure_valid_token()
+        api_interval = self._normalize_interval(interval)
+        data = self._fetch_historical_chart_direct(
+            exchange=exchange,
+            symboltoken=symbol_token,
+            interval=api_interval,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        return self._parse_candles_payload(data, limit=1000)
+
+    def _parse_option_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        import re
+        s = str(symbol).strip().upper()
+        match = re.search(r"(\d+)(CE|PE)$", s)
+        if not match:
+            return None
+        return {
+            "strike": float(match.group(1)),
+            "option_type": match.group(2)
+        }
 
     def _get_option_chain_from_csv(self, underlying: str) -> List[Dict[str, Any]]:
         sm = self._get_scripmaster()
@@ -1889,6 +2468,193 @@ class MStockTypeBClient:
 
     # ---- Market data ----
 
+    def _is_token_expiring_unsafe(self) -> bool:
+        """Check if token is expiring without raising. Used by safe wrapper."""
+        try:
+            from src.auth import is_mstock_token_expiring
+            return is_mstock_token_expiring(self.access_token, within_seconds=900)
+        except Exception:
+            return True  # fail closed
+
+    def safe_place_real_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        exchange: str = "NFO",
+        order_type: str = "MARKET",
+        limit_price: Optional[float] = None,
+        product_type: str = "INTRADAY",
+        max_notional: float = 100000.0,
+        max_lots: int = 1,
+        config: Optional[Any] = None,
+    ) -> dict:
+        """
+        Safe wrapper for real orders. Enforces all safety checks before placing any order.
+        Returns dict with keys: allowed (bool), order_id (str or None), status (str),
+        blockers (list), rejection_reason (str or None).
+        """
+        from src.config import real_trading_allowed, RealTradingGate
+
+        blockers: list[str] = []
+
+        # Step 1: Validate inputs
+        if not symbol or not symbol.strip():
+            blockers.append("symbol is empty")
+        if not exchange or not exchange.strip():
+            blockers.append("exchange is empty")
+        if side not in ("BUY", "SELL"):
+            blockers.append(f"invalid side: {side}")
+        if quantity <= 0:
+            blockers.append(f"quantity must be positive, got {quantity}")
+        if quantity > max_lots:
+            blockers.append(f"quantity {quantity} exceeds max_lots {max_lots}")
+        if order_type not in ("MARKET", "LIMIT"):
+            blockers.append(f"order_type must be MARKET or LIMIT, got {order_type}")
+        if order_type == "LIMIT" and (limit_price is None or limit_price <= 0):
+            blockers.append("limit_price required for LIMIT orders")
+        if product_type not in ("INTRADAY", "DELIVERY"):
+            blockers.append(f"product_type must be INTRADAY or DELIVERY, got {product_type}")
+
+        # Step 2: Check notional limit
+        ltp: Optional[float] = None
+        try:
+            ltp = self.get_ltp(symbol)
+        except Exception:
+            pass
+        if ltp and ltp * quantity > max_notional:
+            blockers.append(f"notional \u20b9{ltp * quantity:.0f} exceeds max_notional \u20b9{max_notional:.0f}")
+
+        # Step 3: Check bid/ask spread (if available)
+        bid: Optional[float]
+        ask: Optional[float]
+        spread_pct: float = 999.0
+        bid, ask, _ = self.get_bid_ask(symbol, exchange_hint=exchange)
+        if bid and ask:
+            mid = (bid + ask) / 2.0
+            if mid > 0:
+                spread_pct = (ask - bid) / mid
+                max_allowed_spread_pct = 0.02  # 2%
+                if spread_pct > max_allowed_spread_pct:
+                    blockers.append(f"spread {spread_pct*100:.2f}% > max {max_allowed_spread_pct*100:.2f}%")
+
+        # Step 4: Check real trading gate if config provided
+        if config is not None:
+            gate = RealTradingGate(
+                enable_live_trading=getattr(config, "enable_live_trading", False),
+                scalper_allow_live_orders=bool(
+                    os.getenv("SCALPER_ALLOW_LIVE_ORDERS", "").lower() == "true"
+                ),
+                scalper_real_trading_ack=bool(
+                    os.getenv("SCALPER_REAL_TRADING_ACK", "").lower() == "true"
+                ),
+                broker_token_valid=not self._is_token_expiring_unsafe(),
+                broker_token_expiring=self._is_token_expiring_unsafe(),
+                order_polling_available=hasattr(self, "poll_order_until_terminal"),
+                kill_switch_active=getattr(config, "kill_switch_active", False),
+                paper_readiness_pass=getattr(config, "paper_readiness_pass", False),
+                broker_safety_pass=getattr(config, "broker_safety_pass", False),
+                dry_run_coverage_pct=getattr(config, "dry_run_coverage_pct", 0.0),
+                model_pkl_exists=getattr(config, "model_pkl_exists", False),
+                current_probability=getattr(config, "current_probability", 0.0),
+                probability_threshold=getattr(config, "ml_probability_threshold", 0.5),
+                spread_pct=spread_pct,
+                max_spread_pct=getattr(config, "entry_max_bid_ask_spread_pct", 0.02),
+                premium=ltp or 0.0,
+                min_premium=getattr(config, "entry_min_option_premium", 5.0),
+                max_daily_loss_breached=getattr(config, "max_daily_loss_breached", False),
+                max_trades_per_day_breached=getattr(config, "max_trades_per_day_breached", False),
+                market_hours_valid=getattr(config, "market_hours_valid", True),
+                open_stale_position=getattr(config, "open_stale_position", False),
+            )
+            allowed, gate_blockers = real_trading_allowed(gate)
+            if not allowed:
+                blockers.extend(gate_blockers)
+
+        if blockers:
+            return {
+                "allowed": False,
+                "order_id": None,
+                "status": "blocked",
+                "blockers": blockers,
+                "rejection_reason": "; ".join(blockers),
+            }
+
+        # Step 5: Place the order
+        try:
+            order_id = self.place_order(
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                exchange=exchange,
+                order_type=order_type,
+                price=limit_price,
+                product_type=product_type,
+            )
+
+            # Step 6: Poll for terminal status
+            poll_result: dict = {}
+            if order_id and hasattr(self, "poll_order_until_terminal"):
+                try:
+                    poll_result = self.poll_order_until_terminal(str(order_id), timeout_sec=30.0)
+                except Exception as poll_exc:
+                    poll_result = {"status": "poll_error", "error": str(poll_exc)}
+
+            final_status = poll_result.get("status", "unknown")
+            filled_qty = int(poll_result.get("filled_qty", 0) or 0)
+            rejection_reason = str(poll_result.get("rejection_reason", "") or "")
+
+            if final_status in ("rejected", "cancelled"):
+                return {
+                    "allowed": True,
+                    "order_id": str(order_id),
+                    "status": final_status,
+                    "blockers": [],
+                    "rejection_reason": rejection_reason,
+                    "filled_qty": filled_qty,
+                    "stop_further_trading": True,
+                }
+            elif final_status == "partial":
+                return {
+                    "allowed": True,
+                    "order_id": str(order_id),
+                    "status": "partial_fill",
+                    "blockers": [],
+                    "rejection_reason": "",
+                    "filled_qty": filled_qty,
+                    "stop_further_trading": True,
+                }
+            elif poll_result.get("timed_out"):
+                return {
+                    "allowed": True,
+                    "order_id": str(order_id),
+                    "status": "timeout",
+                    "blockers": [],
+                    "rejection_reason": "order timed out without terminal status",
+                    "filled_qty": filled_qty,
+                    "stop_further_trading": True,
+                }
+            else:
+                return {
+                    "allowed": True,
+                    "order_id": str(order_id),
+                    "status": final_status,
+                    "blockers": [],
+                    "rejection_reason": "",
+                    "filled_qty": filled_qty,
+                    "stop_further_trading": False,
+                }
+
+        except Exception as exc:
+            return {
+                "allowed": False,
+                "order_id": None,
+                "status": "exception",
+                "blockers": [str(exc)],
+                "rejection_reason": str(exc),
+                "stop_further_trading": True,
+            }
+
     def get_ltp(self, symbol: str) -> float:
         """Return last traded price (LTP) for given symbol.
 
@@ -2036,6 +2802,180 @@ class MStockTypeBClient:
             "Unable to parse LTP from quote response. Inspect `get_market_quote().json()` and update "
             f"MStockTypeBClient.get_ltp accordingly.{err_suffix}"
         )
+
+    # -------------------------------------------------------------------------
+    # Bid/Ask extraction helper
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def extract_bid_ask(contract_data: dict) -> Tuple[Optional[float], Optional[float], Optional[int], Optional[int]]:
+        """Extract bid/ask price and quantity from a broker contract data dict.
+
+        Supports these broker payload variants:
+          - bid_price / best_bid_price / bid
+          - ask_price / best_ask_price / ask
+          - depth.buy[0].price / market_depth.buy[0].price
+          - depth.sell[0].price / market_depth.sell[0].price
+          - bid_qty / best_bid_qty / depth.buy[0].quantity / depth.buy[0].qty
+          - ask_qty / best_ask_qty / depth.sell[0].quantity / depth.sell[0].qty
+
+        Returns (bid, ask, bid_qty, ask_qty). Any component may be None if unavailable.
+        When bid/ask is None, logs debug info showing available keys so operators
+        can see what the broker actually returned.
+        """
+        import logging
+        _log = logging.getLogger(__name__)
+
+        # Guard: None or non-dict input must not crash
+        if not isinstance(contract_data, dict):
+            return None, None, None, None
+
+        def _as_float(v: object) -> Optional[float]:
+            try:
+                if v is None:
+                    return None
+                return float(v)
+            except Exception:
+                return None
+
+        def _as_int(v: object) -> Optional[int]:
+            try:
+                if v is None:
+                    return None
+                return int(float(v))
+            except Exception:
+                return None
+
+        # ── Top-level flat keys (most common) ─────────────────────────────
+        bid = _as_float(
+            contract_data.get("bid_price")
+            or contract_data.get("best_bid_price")
+            or contract_data.get("bid")
+            or contract_data.get("bestBid")
+            or contract_data.get("bestBidPrice")
+            or contract_data.get("bidPrice")
+            or contract_data.get("buyPrice")
+            or contract_data.get("bp")
+        )
+        ask = _as_float(
+            contract_data.get("ask_price")
+            or contract_data.get("best_ask_price")
+            or contract_data.get("ask")
+            or contract_data.get("bestAsk")
+            or contract_data.get("bestAskPrice")
+            or contract_data.get("askPrice")
+            or contract_data.get("sellPrice")
+            or contract_data.get("sp")
+        )
+
+        # ── Top-level quantity keys ───────────────────────────────────────
+        bid_qty = _as_int(
+            contract_data.get("bid_qty")
+            or contract_data.get("best_bid_qty")
+            or contract_data.get("bidQty")
+            or contract_data.get("bestBidQty")
+            or contract_data.get("bid_quantity")
+            or contract_data.get("bq")
+        )
+        ask_qty = _as_int(
+            contract_data.get("ask_qty")
+            or contract_data.get("best_ask_qty")
+            or contract_data.get("askQty")
+            or contract_data.get("bestAskQty")
+            or contract_data.get("ask_quantity")
+            or contract_data.get("sq")
+        )
+
+        # ── Depth-based extraction ─────────────────────────────────────────
+        depth = contract_data.get("depth") or contract_data.get("marketDepth") or contract_data.get("depthData") or contract_data.get("mDepth") or contract_data.get("market_depth")
+
+        if isinstance(depth, dict):
+            buy = depth.get("buy") or depth.get("bids") or depth.get("buyDepth") or depth.get("b")
+            sell = depth.get("sell") or depth.get("asks") or depth.get("sellDepth") or depth.get("s")
+
+            if isinstance(buy, list) and buy:
+                b0 = buy[0]
+                if isinstance(b0, dict):
+                    if bid is None:
+                        bid = _as_float(b0.get("price") or b0.get("rate") or b0.get("bidPrice") or b0.get("bp") or b0.get("bestBid") or b0.get("bestBidPrice"))
+                    if bid_qty is None:
+                        bid_qty = _as_int(b0.get("quantity") or b0.get("qty") or b0.get("bq") or b0.get("bestBidQty") or b0.get("bidQty"))
+                elif bid is None:
+                    bid = _as_float(b0)
+
+            if isinstance(sell, list) and sell:
+                s0 = sell[0]
+                if isinstance(s0, dict):
+                    if ask is None:
+                        ask = _as_float(s0.get("price") or s0.get("rate") or s0.get("askPrice") or s0.get("sp") or s0.get("bestAsk") or s0.get("bestAskPrice"))
+                    if ask_qty is None:
+                        ask_qty = _as_int(s0.get("quantity") or s0.get("qty") or s0.get("sq") or s0.get("bestAskQty") or s0.get("askQty"))
+                elif ask is None:
+                    ask = _as_float(s0)
+
+        elif isinstance(depth, list) and depth:
+            # Some APIs return a flat list of depth rows with side indicator.
+            for drow in depth:
+                if not isinstance(drow, dict):
+                    continue
+                side = str(drow.get("side") or drow.get("type") or "").strip().upper()
+                px = _as_float(drow.get("price") or drow.get("rate") or drow.get("bp") or drow.get("sp"))
+                qty = _as_int(drow.get("quantity") or drow.get("qty") or drow.get("bq") or drow.get("sq"))
+                if px is None:
+                    continue
+                if side in {"B", "BUY", "BID"}:
+                    if bid is None:
+                        bid = px
+                    if bid_qty is None and qty is not None:
+                        bid_qty = qty
+                elif side in {"S", "SELL", "ASK"}:
+                    if ask is None:
+                        ask = px
+                    if ask_qty is None and qty is not None:
+                        ask_qty = qty
+
+            # Fallback: first two rows as bid/ask if side not present
+            if (bid is None or ask is None) and len(depth) >= 2:
+                try:
+                    if bid is None:
+                        bid = _as_float(depth[0].get("price") or depth[0].get("rate"))
+                    if ask is None:
+                        ask = _as_float(depth[1].get("price") or depth[1].get("rate"))
+                except Exception:
+                    pass
+
+        # ── Debug logging when bid/ask is missing ─────────────────────────
+        if bid is None or ask is None:
+            available_keys = [k for k in contract_data.keys() if k not in ("raw", "_raw")]
+            # Also collect keys from nested depth if present
+            if isinstance(depth, dict):
+                for k in depth.keys():
+                    if k not in available_keys:
+                        available_keys.append(k)
+                if isinstance(depth.get("buy"), list) and depth["buy"]:
+                    if isinstance(depth["buy"][0], dict):
+                        for k in depth["buy"][0].keys():
+                            if k not in available_keys:
+                                available_keys.append(f"depth.buy[0].{k}")
+                if isinstance(depth.get("sell"), list) and depth["sell"]:
+                    if isinstance(depth["sell"][0], dict):
+                        for k in depth["sell"][0].keys():
+                            if k not in available_keys:
+                                available_keys.append(f"depth.sell[0].{k}")
+
+            symbol_hint = contract_data.get("symbol") or contract_data.get("tradingsymbol") or contract_data.get("token") or "?"
+            _log.debug(
+                "[BID_ASK] bid/ask not extracted for %s. "
+                "Available keys: %s. "
+                "depth type: %s depth keys: %s. "
+                "This is normal when broker does not provide depth data for this contract.",
+                symbol_hint,
+                available_keys,
+                type(depth).__name__ if depth is not None else "None",
+                list(depth.keys()) if isinstance(depth, dict) else "N/A",
+            )
+
+        return bid, ask, bid_qty, ask_qty
 
     def get_bid_ask(
         self,
@@ -2239,9 +3179,31 @@ class MStockTypeBClient:
                 candidates.sort(key=lambda c: c[0], reverse=True)
                 _, bid, ask, ltp = candidates[0]
                 return bid, ask, ltp
-        except Exception:
+        except Exception as exc:
+            import logging
+            _log = logging.getLogger(__name__)
+            _log.debug(
+                "[BID_ASK] get_bid_ask(%s) raised exception: %s. "
+                "This may indicate the broker API is unavailable or returned an unexpected response.",
+                symbol,
+                exc,
+            )
             return (None, None, None)
 
+        # ── Debug logging when bid/ask is not found ────────────────────────
+        # This point is reached when get_market_quote returned data but no valid
+        # bid/ask could be extracted. Log the response structure for debugging.
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.debug(
+            "[BID_ASK] get_bid_ask(%s) returned (None, None, None). "
+            "Exchange=%s token=%s. "
+            "This is normal when the broker does not provide depth/bid/ask data for this contract. "
+            "PAPER WILL REMAIN BLOCKED until bid/ask is available from broker payload.",
+            symbol,
+            exch if 'exch' in dir() else '?',
+            token if 'token' in dir() else '?',
+        )
         return (None, None, None)
 
     def get_option_chain(self, underlying: str) -> List[Dict[str, Any]]:
@@ -3255,6 +4217,10 @@ class MStockTypeBClient:
     ) -> Order:
         """Place order via the official SDK and return a compact view.
 
+        Central real-trading gate: blocks ALL real order placement unless
+        ``real_trading_allowed()`` passes.  This is the single choke-point
+        for m.Stock live orders.
+
         ``symbol`` here is the trading symbol (e.g. ``"ACC-EQ"``) and
         you also need the corresponding symbol token and exchange. For
         now these are taken from environment variables so you can wire
@@ -3263,6 +4229,48 @@ class MStockTypeBClient:
         - ``MSTOCK_SYMBOL_TOKEN`` – numeric token for the instrument
         - ``MSTOCK_EXCHANGE`` – exchange string (e.g. ``"NSE"``)
         """
+        # ── Central Real-Trading Gate ──────────────────────────────────────────
+        try:
+            from .config import RealTradingGate, real_trading_allowed
+        except ImportError:
+            from config import RealTradingGate, real_trading_allowed  # type: ignore[no-redef]
+
+        _token = os.getenv("MSTOCK_ACCESS_TOKEN", "").strip()
+        _token_expiring = True
+        if _token:
+            try:
+                from .auth import is_mstock_token_expiring
+            except ImportError:
+                from auth import is_mstock_token_expiring  # type: ignore[no-redef]
+            _token_expiring = is_mstock_token_expiring(_token, within_seconds=900)
+
+        _kill_raw = os.getenv("SCALPER_KILL_SWITCH", "").strip().lower()
+        _kill_active = _kill_raw in {"1", "true", "yes"}
+
+        gate = RealTradingGate(
+            # Use env var — consistent with how strategy.py reads enable_live_trading
+            enable_live_trading=os.getenv("MSTOCK_ENABLE_LIVE_TRADING", "").strip().lower() in {"1", "true", "yes"},
+            scalper_allow_live_orders=os.getenv("SCALPER_ALLOW_LIVE_ORDERS", "").strip().lower() == "true",
+            scalper_real_trading_ack=os.getenv("SCALPER_REAL_TRADING_ACK", "").strip().lower() == "true",
+            broker_token_valid=bool(_token),
+            broker_token_expiring=_token_expiring,
+            order_polling_available=True,      # CF-001: poll_order_until_terminal always available
+            kill_switch_active=_kill_active,
+            paper_readiness_pass=False,         # set True after paper-readiness audit passes
+            broker_safety_pass=False,           # set True after broker-safety audit passes
+            dry_run_coverage_pct=0.0,
+            model_pkl_exists=False,
+        )
+        allowed, blockers = real_trading_allowed(gate)
+        if not allowed:
+            blocker_str = "; ".join(blockers)
+            raise RuntimeError(
+                f"[REAL_TRADING_GATE] m.Stock live order BLOCKED. "
+                f"Blockers ({len(blockers)}): {blocker_str}. "
+                f"Set all required SCALPER_* / MSTOCK_* env vars before enabling live trading."
+            )
+        # ── End Central Gate ────────────────────────────────────────────────────
+
         self._ensure_valid_token()
         exchange_val = (exchange or os.getenv("MSTOCK_EXCHANGE", "NSE")).strip() or "NSE"
 
@@ -3328,6 +4336,27 @@ class MStockTypeBClient:
         payload = self._safe_json(resp, context="place_order")
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
         order_id = str(data.get("order_id", ""))
+        raw_status = str(data.get("status", "") or "").strip().upper()
+
+        # ── CF-001: Market orders — poll for fill confirmation ───────────────
+        final_status = raw_status
+        if order_id and str(order_type or "").strip().upper() == "MARKET":
+            poll_result = self._poll_for_order_fill(order_id)
+            final_status = str(poll_result.get("status") or raw_status or "").strip().upper()
+            filled = int(poll_result.get("filled_qty") or 0)
+            msg = str(poll_result.get("message") or "").strip()
+            remaining = int(poll_result.get("remaining_qty") or 0)
+
+            if final_status in {"FILLED", "COMPLETE"}:
+                print(f"[ORDER] order_id={order_id} FILLED qty={filled}")
+            elif final_status in {"REJECTED", "CANCELLED"}:
+                print(f"[ORDER] order_id={order_id} {final_status}: {msg}")
+            elif filled > 0 and remaining > 0:
+                print(f"[ORDER] order_id={order_id} PARTIAL: filled={filled} remaining={remaining}")
+                final_status = "PARTIALLY_FILLED"
+            else:
+                print(f"[ORDER] order_id={order_id} status={final_status!r} "
+                      f"filled={filled} msg={msg!r}")
 
         return Order(
             order_id=order_id,
@@ -3335,7 +4364,7 @@ class MStockTypeBClient:
             side=side_upper,
             quantity=quantity,
             price=float(price_str),
-            status=str(data.get("status", "")),
+            status=final_status,
         )
 
     def cancel_order(self, order_id: str) -> None:
