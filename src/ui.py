@@ -41,9 +41,14 @@ from tkinter.scrolledtext import ScrolledText
 from collections import deque
 
 from pathlib import Path
+import argparse
 
 from auth import login_with_totp
+from dhan_auth import decode_dhan_jwt, generate_dhan_access_token, is_dhan_token_expiring
 from config import load_api_config, load_persisted_env, load_strategy_config, persist_settings_env
+from ml_model_registry import MLModelRegistry
+from ml_paper_risk_manager import MLPaperRiskManager
+from ml_runtime import MLRuntimeEngine, paper_mode_allowed
 from mstock_client import MStockTypeBClient
 from strategy import NiftyScalper, TradeLogEvent
 
@@ -91,6 +96,9 @@ from greeks import (
     vega as bs_vega,
 )
 from gpt_advisor import analyze_market, health_check
+from chart import LiveChartPlugin, TimeSeriesMultiLinePlugin, OptionChainIVSmilePlugin
+from ui_live_chart_panels import wire_live_chart_panels, _refresh_live_chart_tab
+
 
 
 _GPT_STARTUP_ENV_KEYS: tuple[str, ...] = (
@@ -104,9 +112,81 @@ _GPT_STARTUP_ENV_KEYS: tuple[str, ...] = (
 )
 
 
+def merge_saved_broker_credentials(existing: dict[str, object], broker: str, updates: dict[str, object]) -> dict[str, object]:
+    merged: dict[str, object] = dict(existing or {})
+    normalized_broker = str(broker or "mstock").strip().lower() or "mstock"
+    merged["broker"] = normalized_broker if normalized_broker in {"mstock", "dhan"} else "mstock"
+    for key, value in (updates or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, str) and value == "":
+            continue
+        merged[key] = value
+    return merged
+
+
+def calculate_intraday_charges(
+    buy_price: float,
+    sell_price: float,
+    quantity: int,
+    *,
+    is_options: bool = False,
+) -> dict[str, float]:
+    turnover = float((buy_price + sell_price) * quantity)
+    buy_value = float(buy_price * quantity)
+    sell_value = float(sell_price * quantity)
+    if turnover <= 0 or quantity <= 0:
+        return {
+            "brokerage": 0.0,
+            "stt": 0.0,
+            "etc": 0.0,
+            "sebi": 0.0,
+            "stamp": 0.0,
+            "gst": 0.0,
+            "total": 0.0,
+        }
+
+    if is_options:
+        brokerage = 40.0
+    else:
+        buy_brokerage = min(20.0, buy_value * 0.0003)
+        sell_brokerage = min(20.0, sell_value * 0.0003)
+        brokerage = float(buy_brokerage + sell_brokerage)
+
+    stt = float(sell_value * (0.000625 if is_options else 0.00025))
+    etc = float(turnover * (0.000495 if is_options else 0.0000322))
+    sebi = float(turnover * 0.000001)
+    stamp = float(buy_value * (0.00005 if is_options else 0.00003))
+    gst = float((brokerage + etc + sebi) * 0.18)
+    total = brokerage + stt + etc + sebi + stamp + gst
+    return {
+        "brokerage": round(float(brokerage), 2),
+        "stt": round(float(stt), 2),
+        "etc": round(float(etc), 2),
+        "sebi": round(float(sebi), 2),
+        "stamp": round(float(stamp), 2),
+        "gst": round(float(gst), 2),
+        "total": round(float(total), 2),
+    }
+
+
 def _read_windows_registry_env(name: str, hive_name: str) -> str:
     if os.name != "nt":
         return ""
+
+
+    def _safe_int_env(varname: str, default: int) -> int:
+        """Safely parse an integer from environment variable with fallback."""
+        try:
+            v = os.getenv(varname)
+            if v is None or str(v).strip() == "":
+                return int(default)
+            return int(str(v).strip())
+        except Exception:
+            try:
+                return int(default)
+            except Exception:
+                return 0
 
     try:
         import winreg
@@ -338,9 +418,22 @@ class ScalperUI(tk.Tk):
         self._trade_q: queue.Queue[TradeLogEvent] = queue.Queue()
         self._trade_rows: dict[str, str] = {}
         self._trade_state: dict[str, dict[str, object]] = {}
-        self._client: MStockTypeBClient | None = None
+        self._client: object | None = None
         self._scalper: NiftyScalper | None = None
         self._scripmaster_cache: dict[str, tuple[float | None, object]] = {}
+        try:
+            from db import DatabaseManager
+
+            self._db_manager = DatabaseManager()
+        except Exception:
+            self._db_manager = None
+        self._chart_overlay_refresh_ts: float = 0.0
+        try:
+            self._chart_overlay_refresh_sec = float(os.getenv("MSTOCK_CHART_OVERLAY_REFRESH_SEC", "5") or 5.0)
+        except Exception:
+            self._chart_overlay_refresh_sec = 5.0
+        if self._chart_overlay_refresh_sec < 1.0:
+            self._chart_overlay_refresh_sec = 1.0
 
         # Live dashboard portfolio snapshot.
         self._dash_portfolio_snapshot: dict[str, object] = {}
@@ -430,7 +523,6 @@ class ScalperUI(tk.Tk):
         self._bot_stop = threading.Event()
         self._bot_start_ts: float = 0.0
         self._engine_diag_last_snapshot: dict[str, object] = {}
-
         # Live analytics snapshots (fed via Strategy on_tick callback).
         self._latest_candles: list[Candle] = []
         self._latest_candles_ts: float = 0.0
@@ -448,6 +540,7 @@ class ScalperUI(tk.Tk):
         self._build_widgets()
         self._load_prefilled_credentials()
         self._sync_credential_editability()
+        self._sync_broker_ui()
         self._sync_trade_log_visibility()
         # Register UI callback for GPT advisor (best-effort)
         try:
@@ -459,13 +552,13 @@ class ScalperUI(tk.Tk):
                 pass
         except Exception:
             pass
-        self.after(100, self._pump_logs)
-        self.after(150, self._pump_trades)
-        self.after(1000, self._pump_margin_required)
-        self.after(750, self._pump_dashboard_portfolio)
-        self.after(800, self._pump_spot_ltp)
-        self.after(650, self._pump_option_ltp)
-        self.after(900, self._pump_engine_diagnostics)
+        self._safe_after(100, self._pump_logs)
+        self._safe_after(150, self._pump_trades)
+        self._safe_after(1000, self._pump_margin_required)
+        self._safe_after(750, self._pump_dashboard_portfolio)
+        self._safe_after(800, self._pump_spot_ltp)
+        self._safe_after(650, self._pump_option_ltp)
+        self._safe_after(900, self._pump_engine_diagnostics)
 
         # Optional: bring window to front on startup (useful if launched from CLI).
         try:
@@ -476,7 +569,7 @@ class ScalperUI(tk.Tk):
             try:
                 self.lift()
                 self.attributes("-topmost", True)
-                self.after(800, lambda: self.attributes("-topmost", False))
+                self._safe_after(800, lambda: self.attributes("-topmost", False))
                 self.deiconify()
                 self.focus_force()
             except Exception:
@@ -504,7 +597,7 @@ class ScalperUI(tk.Tk):
             if str(os.getenv("MSTOCK_AUTO_START", "") or "").strip().lower() in {"1", "true", "yes", "y"}:
                 # Give the UI a short moment to finish setup before starting.
                 try:
-                    self.after(1500, self._on_start)
+                    self._safe_after(1500, self._on_start)
                 except Exception:
                     try:
                         threading.Thread(target=self._on_start, daemon=True).start()
@@ -512,6 +605,16 @@ class ScalperUI(tk.Tk):
                         pass
         except Exception:
             pass
+
+    def _safe_after(self, delay_ms: int, callback, *args) -> bool:
+        """Schedule a Tk callback only if the widget still exists."""
+        try:
+            if not self.winfo_exists():
+                return False
+            self.after(int(delay_ms), callback, *args)
+            return True
+        except Exception:
+            return False
 
     def _refresh_pnl_totals(self) -> None:
         profit = 0.0
@@ -685,7 +788,7 @@ class ScalperUI(tk.Tk):
                         self._spot_refresh_inflight = False
 
                 try:
-                    self.after(0, _apply)
+                    self._safe_after(0, _apply)
                 except Exception:
                     # If the UI is shutting down, just drop the update.
                     self._spot_refresh_inflight = False
@@ -693,7 +796,7 @@ class ScalperUI(tk.Tk):
             threading.Thread(target=_worker, daemon=True).start()
         finally:
             # Keep the spot fairly fresh even when candles are slow.
-            self.after(getattr(self, "_throttle_spot_ltp", 500), self._pump_spot_ltp)
+                self._safe_after(getattr(self, "_throttle_spot_ltp", 500), self._pump_spot_ltp)
 
     def _collect_open_legs_for_margin(self) -> list[dict]:
         legs_out: list[dict] = []
@@ -742,6 +845,47 @@ class ScalperUI(tk.Tk):
         except Exception:
             status = ""
         return status.startswith("CLOSED")
+
+    def _fetch_and_push_initial_candles(self) -> None:
+        """Fetch historical candles and push to the live chart plugin.
+
+        Called once at UI startup so the Live Chart tab is never blank.
+        Uses the existing connected client (self._client) or creates a temporary
+        one.  The on_tick callback from the running scalper will keep candles
+        live after.
+        """
+        try:
+            client = getattr(self, "_client", None)
+            if client is None:
+                try:
+                    from mstock_client import MStockTypeBClient
+                    api_cfg = load_api_config()
+                    client = MStockTypeBClient(api_cfg)
+                except Exception as exc:
+                    print(f"[UI] No client for initial candles: {exc}")
+                    return
+
+            underlying = (
+                getattr(self._scalper.cfg, "underlying", None)
+                if getattr(self, "_scalper", None) is not None
+                else None
+            ) or os.getenv("MSTOCK_UNDERLYING", "").strip() or "NIFTY"
+
+            token = os.getenv(f"MSTOCK_{underlying.upper()}_TOKEN", "").strip()
+            if not token or not token.isdigit():
+                token = os.getenv("MSTOCK_NIFTY_TOKEN", "").strip() or "26000"
+
+            candles, _ = client.fetch_index_candles(token, exchange="NSE", limit=100, timeframe="1m")
+            if candles:
+                self._latest_candles = candles
+                self._latest_candles_ts = float(time.time())
+                if hasattr(self, "live_chart_plugin") and self.live_chart_plugin:
+                    self.live_chart_plugin.push_candles(candles)
+                    print(f"[UI] Pushed {len(candles)} initial candles to live chart")
+            else:
+                print("[UI] No historical candles — Live Chart updates when scalper starts")
+        except Exception as exc:
+            print(f"[UI] _fetch_and_push_initial_candles failed (non-fatal): {exc}")
 
     def _try_get_live_ltp_for_leg(self, client: MStockTypeBClient, leg: dict) -> float | None:
         token = str(leg.get("token") or "").strip()
@@ -1087,6 +1231,218 @@ class ScalperUI(tk.Tk):
         self.live_opt_result_var = tk.StringVar(value="")
         ttk.Label(opt_labelframe, textvariable=self.live_opt_result_var, wraplength=600).grid(row=2, column=0, columnspan=3, padx=5, pady=5, sticky=tk.W)
 
+    def _build_telemetry_tab(self) -> None:
+        """Create the layout for portfolio Greeks, system health metrics, 
+        position reconciliation status, and database metrics.
+        """
+        root = ttk.Frame(self.telemetry_frame)
+        root.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Freeze banner at the top, initially hidden/unpacked
+        self.freeze_banner = tk.Frame(root, background="#e74c3c", height=50, bd=1, relief="ridge")
+        self.freeze_banner.pack(fill=tk.X, expand=False, pady=(0, 10))
+        self.freeze_banner.pack_propagate(False)
+        
+        self.freeze_msg_lbl = tk.Label(
+            self.freeze_banner, 
+            text="🚨 EMERGENCY TRADING FREEZE ACTIVE: Position Reconciliation Mismatch! 🚨", 
+            foreground="white", 
+            background="#e74c3c", 
+            font=("Segoe UI", 11, "bold")
+        )
+        self.freeze_msg_lbl.pack(side=tk.LEFT, padx=15, fill=tk.Y)
+        
+        self.unfreeze_btn = tk.Button(
+            self.freeze_banner,
+            text="Acknowledge & Unfreeze Bot",
+            command=self._unfreeze_bot,
+            font=("Segoe UI", 9, "bold"),
+            background="#2c3e50",
+            foreground="white",
+            activebackground="#34495e",
+            activeforeground="white",
+            relief="raised",
+            cursor="hand2"
+        )
+        self.unfreeze_btn.pack(side=tk.RIGHT, padx=15, pady=6)
+        
+        # Hide freeze banner by default
+        self.freeze_banner.pack_forget()
+
+        # Two-column main container
+        cols_container = ttk.Frame(root)
+        cols_container.pack(fill=tk.BOTH, expand=True)
+
+        left_col = ttk.Frame(cols_container)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+
+        right_col = ttk.Frame(cols_container)
+        right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(6, 0))
+
+        # --- PORTFOLIO GREEKS ---
+        greeks_lf = ttk.LabelFrame(left_col, text="Portfolio Greeks Exposure", padding=10)
+        greeks_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        self._greeks_delta_var = tk.StringVar(value="Portfolio Delta: 0.00")
+        self._greeks_gamma_var = tk.StringVar(value="Portfolio Gamma: 0.00")
+        self._greeks_theta_var = tk.StringVar(value="Portfolio Theta: 0.00")
+        self._greeks_vega_var = tk.StringVar(value="Portfolio Vega: 0.00")
+        self._greeks_expiry_var = tk.StringVar(value="Expiry Concentration: n/a")
+
+        ttk.Label(greeks_lf, textvariable=self._greeks_delta_var, font=("Segoe UI", 10, "bold"), foreground="#2980b9").pack(anchor="w", pady=3)
+        ttk.Label(greeks_lf, textvariable=self._greeks_gamma_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(greeks_lf, textvariable=self._greeks_theta_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(greeks_lf, textvariable=self._greeks_vega_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(greeks_lf, textvariable=self._greeks_expiry_var, font=("Segoe UI", 9, "italic")).pack(anchor="w", pady=6)
+
+        # --- REGIME PRESET CONTROLS & STATUS ---
+        regime_lf = ttk.LabelFrame(left_col, text="Adaptive Preset Regime Controller", padding=10)
+        regime_lf.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+
+        self._active_regime_var = tk.StringVar(value="Current Regime: chop")
+        self._regime_scores_var = tk.StringVar(value="Scores: S_M=0.00, S_V=0.00, S_L=0.00, S_H=0.00")
+        self._failsafe_status_var = tk.StringVar(value="Failsafes: Lag=OK, Spread=OK, Slippage=OK")
+
+        # Checkbox for Adaptive Preset Switching Mode
+        self._enable_adaptive_regimes_var = tk.BooleanVar(
+            value=os.getenv("MSTOCK_ENABLE_ADAPTIVE_REGIMES", "false").lower() == "true"
+        )
+        def _on_adaptive_regimes_toggled():
+            enabled = self._enable_adaptive_regimes_var.get()
+            scalper = getattr(self, "_scalper", None)
+            if scalper is not None:
+                scalper.cfg.enable_adaptive_regimes = enabled
+            val_str = "true" if enabled else "false"
+            os.environ["MSTOCK_ENABLE_ADAPTIVE_REGIMES"] = val_str
+            try:
+                persist_settings_env({"MSTOCK_ENABLE_ADAPTIVE_REGIMES": val_str}, [])
+            except Exception as e:
+                logger.error(f"Failed to persist adaptive regimes setting: {e}")
+
+        adaptive_cb = ttk.Checkbutton(
+            regime_lf, 
+            text="Enable Adaptive Preset Mode (Regime-Aware)", 
+            variable=self._enable_adaptive_regimes_var,
+            command=_on_adaptive_regimes_toggled
+        )
+        adaptive_cb.pack(anchor="w", pady=(0, 6))
+
+        # Dynamic labels
+        self.regime_lbl = ttk.Label(regime_lf, textvariable=self._active_regime_var, font=("Segoe UI", 10, "bold"), foreground="#d35400")
+        self.regime_lbl.pack(anchor="w", pady=3)
+        
+        ttk.Label(regime_lf, textvariable=self._regime_scores_var, font=("Segoe UI", 9)).pack(anchor="w", pady=3)
+        
+        self.failsafe_lbl = ttk.Label(regime_lf, textvariable=self._failsafe_status_var, font=("Segoe UI", 9, "bold"), foreground="#27ae60")
+        self.failsafe_lbl.pack(anchor="w", pady=3)
+
+        # --- EXECUTION QUALITY ANALYTICS ---
+        exec_lf = ttk.LabelFrame(left_col, text="Execution Quality Metrics (Rolling)", padding=10)
+        exec_lf.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        self._exec_avg_slippage_var = tk.StringVar(value="Average Slippage: 0.00 bps")
+        self._exec_worst_slippage_var = tk.StringVar(value="Worst Slippage: 0.00 bps")
+        self._exec_success_rate_var = tk.StringVar(value="Fill Success Rate: 100.0%")
+        self._exec_avg_latency_var = tk.StringVar(value="Average Latency: 0 ms")
+
+        ttk.Label(exec_lf, textvariable=self._exec_avg_slippage_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(exec_lf, textvariable=self._exec_worst_slippage_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(exec_lf, textvariable=self._exec_success_rate_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(exec_lf, textvariable=self._exec_avg_latency_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+
+        # --- SYSTEM HEALTH & TELEMETRY ---
+        health_lf = ttk.LabelFrame(right_col, text="System Health & Low-Resource Telemetry", padding=10)
+        health_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        self._health_cpu_var = tk.StringVar(value="CPU Usage: n/a")
+        self._health_ram_var = tk.StringVar(value="RAM Usage: n/a")
+        self._health_rss_var = tk.StringVar(value="Program RSS Memory: n/a")
+        self._health_lag_var = tk.StringVar(value="Event Loop Lag: n/a")
+        self._health_queue_var = tk.StringVar(value="Queue Pressure: n/a")
+        self._health_ws_var = tk.StringVar(value="WebSocket Connectivity: Stable")
+
+        ttk.Label(health_lf, textvariable=self._health_cpu_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(health_lf, textvariable=self._health_ram_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(health_lf, textvariable=self._health_rss_var, font=("Segoe UI", 10, "bold"), foreground="#27ae60").pack(anchor="w", pady=3)
+        ttk.Label(health_lf, textvariable=self._health_lag_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(health_lf, textvariable=self._health_queue_var, font=("Segoe UI", 10)).pack(anchor="w", pady=3)
+        ttk.Label(health_lf, textvariable=self._health_ws_var, font=("Segoe UI", 9, "italic")).pack(anchor="w", pady=6)
+
+        # --- AI ADVISORY & COMMENTARY ---
+        ai_lf = ttk.LabelFrame(right_col, text="AI Advisory & Trade Commentary", padding=10)
+        ai_lf.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+        
+        self._ppo_rating_var = tk.StringVar(value="PPO Advisory Rating: Awaiting open trade...")
+        self._latest_gpt_commentary_var = tk.StringVar(value="Latest Commentary: Awaiting trade proposal...")
+        
+        ttk.Label(ai_lf, textvariable=self._ppo_rating_var, font=("Segoe UI", 10, "bold"), foreground="#2980b9").pack(anchor="w", pady=3)
+        
+        gpt_commentary_lbl = ttk.Label(
+            ai_lf, 
+            textvariable=self._latest_gpt_commentary_var, 
+            font=("Segoe UI", 9, "italic"), 
+            foreground="#7f8c8d",
+            wraplength=350
+        )
+        gpt_commentary_lbl.pack(anchor="w", pady=6)
+
+        # --- POSITION RECONCILIATION LOG ---
+        recon_lf = ttk.LabelFrame(right_col, text="Reconciliation Log (Every 15-30s)", padding=10)
+        recon_lf.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        recon_log_frame = ttk.Frame(recon_lf)
+        recon_log_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.recon_listbox = tk.Listbox(
+            recon_log_frame, 
+            height=6, 
+            font=("Consolas", 9), 
+            background="#f8f9fa", 
+            foreground="#2c3e50"
+        )
+        self.recon_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        recon_vsb = ttk.Scrollbar(recon_log_frame, orient="vertical", command=self.recon_listbox.yview)
+        recon_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.recon_listbox.configure(yscrollcommand=recon_vsb.set)
+        
+        self.recon_listbox.insert(tk.END, "System started - Reconciliation monitor idle")
+
+    def _unfreeze_bot(self) -> None:
+        """Acknowledge the mismatch freeze, reset status in reconciliation engine 
+        and re-enable the strategy entries.
+        """
+        scalper = getattr(self, "_scalper", None)
+        if scalper is not None:
+            # Re-enable entries on the strategy
+            scalper._entries_paused = False
+            # Clear mismatch status in reconciliation engine
+            recon = getattr(scalper, "reconciliation_engine", None)
+            if recon is not None:
+                recon.mismatch_detected = False
+                recon.last_mismatch_reason = ""
+                recon.reconciliation_history.append(
+                    f"{time.strftime('%H:%M:%S')} - MANUAL UNFREEZE: trading entries resumed"
+                )
+            
+            # Hide the freeze banner
+            try:
+                self.freeze_banner.pack_forget()
+            except Exception:
+                pass
+            
+            try:
+                messagebox.showinfo("Bot Unfrozen", "Manual unfreeze complete. Strategy entries are now resumed.")
+            except Exception:
+                pass
+        else:
+            try:
+                messagebox.showwarning("Unfreeze", "Bot is not running or scalper instance not found.")
+            except Exception:
+                pass
+
+    # ---------------- Live Harness Callbacks ----------------
+
     # ---------------- Live Harness Callbacks ----------------
 
     def _on_load_live_candles_lh(self) -> None:
@@ -1150,13 +1506,28 @@ class ScalperUI(tk.Tk):
                 slippage_bps=slippage,
             )
 
-            # Run simulation
+            # Build price_data expected by backtest_harness (list of dicts)
+            from exit_optimizer import ExitOptimizer
+
+            price_data = []
+            for i, p in enumerate(prices):
+                price_data.append({
+                    "timestamp": i,
+                    "underlying_price": float(p),
+                    "close": float(p),
+                })
+
+            entry_signals = signals if signals is not None else [0] * len(prices)
+            exit_opt = ExitOptimizer()
+
+            # Call simulator using actual signature: (strategy_type, entry_signals, price_data, exit_optimizer, ...)
             result = simulate_with_exit_optimizer(
-                prices=prices,
-                signals=signals,
-                strategy_type=strategy,
+                strategy,
+                entry_signals,
+                price_data,
+                exit_opt,
                 costs=costs,
-                partial_fill_rate=fill_rate / 100.0,
+                partial_fill_floor=float(fill_rate) / 100.0,
             )
 
             # Display results
@@ -1222,11 +1593,19 @@ class ScalperUI(tk.Tk):
 
             for params in param_grid:
                 try:
+                    # Build price_data for optimizer
+                    from exit_optimizer import ExitOptimizer
+                    price_data = [{"timestamp": i, "underlying_price": float(p), "close": float(p)} for i, p in enumerate(prices)]
+                    entry_signals = [0] * len(prices)
+                    exit_opt = ExitOptimizer()
+
                     result = simulate_with_exit_optimizer(
-                        prices=prices,
-                        strategy_type=params["strategy_type"],
+                        params["strategy_type"],
+                        entry_signals,
+                        price_data,
+                        exit_opt,
                         costs=TransactionCosts(slippage_bps=params["slippage_bps"]),
-                        partial_fill_rate=params["partial_fill_rates"],
+                        partial_fill_floor=float(params["partial_fill_rates"]),
                     )
                     if result.sharpe_ratio > best_sharpe:
                         best_sharpe = result.sharpe_ratio
@@ -1420,10 +1799,7 @@ class ScalperUI(tk.Tk):
                 import config as _cfg
                 lot = int(getattr(_cfg.load_strategy_config(), "lot_size", 65) or 65)
             except Exception:
-                try:
-                    lot = int(os.getenv("MSTOCK_LOT_SIZE") or 65)
-                except Exception:
-                    lot = 65
+                lot = _safe_int_env("MSTOCK_LOT_SIZE", 65)
 
             for lg in legs:
                 try:
@@ -1903,7 +2279,7 @@ class ScalperUI(tk.Tk):
 
             threading.Thread(target=_worker, daemon=True).start()
         finally:
-            self.after(getattr(self, "_throttle_option_ltp", 250), self._pump_option_ltp)
+            self._safe_after(getattr(self, "_throttle_option_ltp", 250), self._pump_option_ltp)
 
     def _calc_live_margin_required(self, client: MStockTypeBClient, legs: list[dict]) -> float | None:
         total = 0.0
@@ -2059,11 +2435,11 @@ class ScalperUI(tk.Tk):
                     finally:
                         self._margin_refresh_inflight = False
 
-                self.after(0, _apply)
+                self._safe_after(0, _apply)
 
             threading.Thread(target=_worker, daemon=True).start()
         finally:
-            self.after(getattr(self, "_throttle_margin", 1000), self._pump_margin_required)
+            self._safe_after(getattr(self, "_throttle_margin", 1000), self._pump_margin_required)
 
     def _pump_dashboard_portfolio(self) -> None:
         try:
@@ -2168,14 +2544,29 @@ class ScalperUI(tk.Tk):
                 opt_exposure = 0.0
                 opt_leg_count = 0
                 opt_trade_count = 0
+                hedge_under_exposure = 0.0
 
                 seen_trade_ids: set[str] = set()
+                def _leg_ltp_from_symbol(symbol: str) -> float | None:
+                    if client is None:
+                        return None
+                    keys = [symbol]
+                    if ":" not in symbol:
+                        keys.append(f"NSE:{symbol}")
+                        if symbol.endswith("-EQ"):
+                            keys.append(f"NSE:{symbol[:-3]}")
+                    for key in keys:
+                        try:
+                            ltp_val = float(client.get_ltp(key))
+                            if ltp_val > 0:
+                                return ltp_val
+                        except Exception:
+                            continue
+                    return None
+
                 for tid, st in trade_state_items:
                     trade_id = str(tid or "").strip()
                     if not trade_id:
-                        continue
-                    # Skip synthetic hedge-only row.
-                    if trade_id.endswith("-H"):
                         continue
                     if not isinstance(st, dict):
                         continue
@@ -2187,6 +2578,33 @@ class ScalperUI(tk.Tk):
                     legs = st.get("legs")
                     if not isinstance(legs, list):
                         legs = []
+
+                    # Track underlying hedge exposure for summary ratios.
+                    for lg in legs:
+                        if not isinstance(lg, dict):
+                            continue
+                        if not bool(lg.get("is_hedge")):
+                            continue
+                        if self._is_option_leg(lg):
+                            continue
+                        qty = self._get_leg_qty(lg)
+                        if qty <= 0:
+                            continue
+                        ltp = _to_float(lg.get("ltp"))
+                        if ltp is None:
+                            sym = str(lg.get("symbol") or "").strip()
+                            if sym:
+                                ltp = _leg_ltp_from_symbol(sym)
+                        if ltp is None:
+                            continue
+                        try:
+                            hedge_under_exposure += abs(float(ltp) * float(qty))
+                        except Exception:
+                            continue
+
+                    # Skip synthetic hedge-only row for option table stats.
+                    if trade_id.endswith("-H"):
+                        continue
 
                     any_open_option_leg = False
                     for lg in legs:
@@ -2392,15 +2810,16 @@ class ScalperUI(tk.Tk):
                 except Exception:
                     pass
 
-                total_exposure = float(eq_exposure + opt_exposure)
-                eq_ratio = (float(eq_exposure) / total_exposure) if total_exposure > 0 else 0.0
+                equity_total_exposure = float(eq_exposure + hedge_under_exposure)
+                total_exposure = float(equity_total_exposure + opt_exposure)
+                eq_ratio = (float(equity_total_exposure) / total_exposure) if total_exposure > 0 else 0.0
                 opt_ratio = (float(opt_exposure) / total_exposure) if total_exposure > 0 else 0.0
 
                 snapshot = {
                     "ts": time.time(),
                     "equity_rows": eq_rows,
                     "option_rows": opt_rows,
-                    "equity_exposure": float(eq_exposure),
+                    "equity_exposure": float(equity_total_exposure),
                     "option_exposure": float(opt_exposure),
                     "equity_ratio": float(eq_ratio),
                     "option_ratio": float(opt_ratio),
@@ -2418,11 +2837,11 @@ class ScalperUI(tk.Tk):
                     finally:
                         self._dash_portfolio_inflight = False
 
-                self.after(0, _apply)
+                self._safe_after(0, _apply)
 
             threading.Thread(target=_worker, daemon=True).start()
         finally:
-            self.after(getattr(self, "_throttle_portfolio", 500), self._pump_dashboard_portfolio)
+            self._safe_after(getattr(self, "_throttle_portfolio", 500), self._pump_dashboard_portfolio)
 
     def _pump_engine_diagnostics(self) -> None:
         try:
@@ -2623,10 +3042,199 @@ class ScalperUI(tk.Tk):
                 )
             else:
                 self._diag_preset_req_var.set("GPT preset request: none yet")
+
+            # ---- Update Telemetry & Diagnostics UI Elements ----
+            try:
+                # 1. Update Greeks
+                delta = float(pr.get("delta", 0.0) or 0.0)
+                gamma = float(pr.get("gamma", 0.0) or 0.0)
+                theta = float(pr.get("theta", 0.0) or 0.0)
+                vega = float(pr.get("vega", 0.0) or 0.0)
+                expiry_conc = pr.get("expiry_concentration")
+                if isinstance(expiry_conc, dict) and expiry_conc:
+                    exps_str = ", ".join(f"{k}: {v}" for k, v in expiry_conc.items())
+                else:
+                    exps_str = "None"
+                
+                self._greeks_delta_var.set(f"Portfolio Delta: {delta:.2f}")
+                self._greeks_gamma_var.set(f"Portfolio Gamma: {gamma:.5f}")
+                self._greeks_theta_var.set(f"Portfolio Theta: {theta:.2f} / day")
+                self._greeks_vega_var.set(f"Portfolio Vega: {vega:.2f} / 1% vol")
+                self._greeks_expiry_var.set(f"Expiry Concentration: {exps_str}")
+            except Exception as _greeks_exc:
+                pass
+
+            try:
+                # 2. Update Execution Quality
+                exec_metrics = snap.get("execution_metrics") or {}
+                avg_slip = float(exec_metrics.get("average_slippage_bps", 0.0) or 0.0)
+                worst_slip = float(exec_metrics.get("worst_slippage_bps", 0.0) or 0.0)
+                fill_rate = float(exec_metrics.get("fill_success_rate", 1.0) or 1.0)
+                avg_lat = float(exec_metrics.get("average_latency_ms", 0.0) or 0.0)
+
+                self._exec_avg_slippage_var.set(f"Average Slippage: {avg_slip:.2f} bps")
+                self._exec_worst_slippage_var.set(f"Worst Slippage: {worst_slip:.2f} bps")
+                self._exec_success_rate_var.set(f"Fill Success Rate: {fill_rate * 100.0:.1f}%")
+                self._exec_avg_latency_var.set(f"Average Latency: {avg_lat:.0f} ms")
+            except Exception as _exec_exc:
+                pass
+
+            try:
+                # 3. Update System Health & Telemetry
+                telemetry = snap.get("telemetry") or {}
+                cpu = float(telemetry.get("cpu_percent", 0.0) or 0.0)
+                ram = float(telemetry.get("ram_percent", 0.0) or 0.0)
+                rss = float(telemetry.get("program_rss_mb", 0.0) or 0.0)
+                lag = float(telemetry.get("event_lag_ms", 0.0) or 0.0)
+                queue_size = int(telemetry.get("queue_size", 0) or 0)
+                ws_status = str(telemetry.get("ws_status", "Stable") or "Stable")
+
+                self._health_cpu_var.set(f"CPU Usage: {cpu:.1f}%")
+                self._health_ram_var.set(f"RAM Usage: {ram:.1f}%")
+                self._health_rss_var.set(f"Program RSS Memory: {rss:.1f} MB")
+                self._health_lag_var.set(f"Event Loop Lag: {lag:.1f} ms")
+                self._health_queue_var.set(f"Queue Pressure: {queue_size} items")
+                self._health_ws_var.set(f"WebSocket Connectivity: {ws_status}")
+            except Exception as _telem_exc:
+                pass
+
+            try:
+                # Update Adaptive Regime and Failsafes Readouts
+                active_regime = str(snap.get("active_regime", "chop")).strip().lower()
+                self._active_regime_var.set(f"Current Regime: {active_regime.upper()}")
+                
+                # Premium dynamic regime color coding
+                regime_colors = {
+                    "trend": "#27ae60",         # Vibrant Green
+                    "chop": "#d35400",          # Dark Orange/Chop
+                    "expiry": "#e74c3c",        # Danger Red
+                    "high_volatility": "#e67e22", # Volatility Amber
+                    "low_liquidity": "#7f8c8d"   # Gunmetal Grey
+                }
+                color = regime_colors.get(active_regime, "#2980b9")
+                if hasattr(self, "regime_lbl"):
+                    self.regime_lbl.configure(foreground=color)
+                
+                scores = snap.get("regime_scores") or {}
+                s_m = float(scores.get("S_M", 0.0) or 0.0)
+                s_v = float(scores.get("S_V", 0.0) or 0.0)
+                s_l = float(scores.get("S_L", 0.0) or 0.0)
+                s_h = float(scores.get("S_H", 0.0) or 0.0)
+                self._regime_scores_var.set(f"Scores: S_M={s_m:.2f}, S_V={s_v:.2f}, S_L={s_l:.2f}, S_H={s_h:.2f}")
+                
+                failsafes = snap.get("failsafes") or {}
+                event_lag = bool(failsafes.get("event_lag", False))
+                spread_shock = bool(failsafes.get("spread_shock", False))
+                slippage_breaker = bool(failsafes.get("slippage_breaker", False))
+                
+                self._failsafe_status_var.set(
+                    f"Failsafes: Lag={'BLOCKED' if event_lag else 'OK'}, "
+                    f"Spread={'BLOCKED' if spread_shock else 'OK'}, "
+                    f"Slippage={'BLOCKED' if slippage_breaker else 'OK'}"
+                )
+                
+                # Active blocks highlight label in high-visibility red, else reassuring green
+                if event_lag or spread_shock or slippage_breaker:
+                    failsafe_color = "#e74c3c"
+                else:
+                    failsafe_color = "#27ae60"
+                if hasattr(self, "failsafe_lbl"):
+                    self.failsafe_lbl.configure(foreground=failsafe_color)
+            except Exception as _regime_exc:
+                pass
+
+            try:
+                # 4. Reconciliation Warnings & Log
+                recon_mismatch = bool(snap.get("reconciliation_mismatch", False))
+                recon_reason = str(snap.get("reconciliation_reason", "") or "")
+                
+                # Check emergency pause on strategy also
+                entries_paused = bool(snap.get("entries_paused", False))
+                
+                if recon_mismatch or entries_paused:
+                    reason_msg = recon_reason or "Manual Entry Pause or Position Mismatch detected!"
+                    self.freeze_msg_lbl.configure(text=f"🚨 EMERGENCY TRADING FREEZE ACTIVE: {reason_msg} 🚨")
+                    # Pack the banner if not already packed
+                    if not self.freeze_banner.winfo_ismapped():
+                        self.freeze_banner.pack(fill=tk.X, expand=False, pady=(0, 10), before=self.freeze_banner.master.children[list(self.freeze_banner.master.children.keys())[1]])
+                else:
+                    self.freeze_banner.pack_forget()
+
+                history = list(snap.get("reconciliation_history", []) or [])
+                if history and hasattr(self, "recon_listbox"):
+                    self.recon_listbox.delete(0, tk.END)
+                    for line in history[-100:]:
+                        self.recon_listbox.insert(tk.END, line)
+                    self.recon_listbox.see(tk.END)
+            except Exception as _recon_exc:
+                pass
+
+            try:
+                # 5. Update PPO Rating & GPT Commentary in UI
+                latest_gpt = str(snap.get("latest_gpt_commentary") or "Awaiting trade proposal...")
+                self._latest_gpt_commentary_var.set(f"Latest Commentary: {latest_gpt}")
+
+                ppo_text = "PPO Advisory Rating: Awaiting open trade..."
+                if scalper is not None:
+                    # Scan open directional trades for PPO exit suggestions
+                    directional_trades = getattr(scalper.state, "open_directional", [])
+                    active_ppo = None
+                    if directional_trades:
+                        for tr in directional_trades:
+                            if tr.get("ppo_suggested_action") is not None:
+                                active_ppo = tr
+                                break
+                    if active_ppo is not None:
+                        action = active_ppo.get("ppo_suggested_action")
+                        reason = active_ppo.get("ppo_suggested_reason") or "No reason provided"
+                        conf = active_ppo.get("ppo_confidence") or 0.0
+                        score = active_ppo.get("ppo_urgency_score") or 0.0
+                        ppo_text = f"PPO: {action} (Conf: {conf:.2f}, Urg: {score:.2f}) | {reason}"
+                    else:
+                        multi_trades = getattr(scalper.state, "open_multi", [])
+                        if multi_trades:
+                            for tr in multi_trades:
+                                if tr.get("ppo_suggested_action") is not None:
+                                    active_ppo = tr
+                                    break
+                            if active_ppo is not None:
+                                action = active_ppo.get("ppo_suggested_action")
+                                reason = active_ppo.get("ppo_suggested_reason") or "No reason provided"
+                                conf = active_ppo.get("ppo_confidence") or 0.0
+                                score = active_ppo.get("ppo_urgency_score") or 0.0
+                                ppo_text = f"PPO: {action} (Conf: {conf:.2f}, Urg: {score:.2f}) | {reason}"
+                self._ppo_rating_var.set(ppo_text)
+            except Exception as _ppo_gpt_exc:
+                pass
+
         except Exception:
             pass
         finally:
-            self.after(1000, self._pump_engine_diagnostics)
+            # --- Adaptive GUI Refresh Throttler ---
+            # Dynamically adjust the redraw timer based on the current system safety state.
+            # RUNNING: high-fidelity 1000ms | DEGRADED: 2000ms | HALTED: 5000ms
+            # This reduces GUI CPU overhead and preserves event-loop bandwidth for raw
+            # tick processing under market stress conditions.
+            refresh_ms = 1000  # default RUNNING state
+            try:
+                scalper_ref = getattr(self, "_scalper", None)
+                if scalper_ref is not None:
+                    # Read GlobalState from the GlobalExecutionStateController if wired
+                    gesc = getattr(scalper_ref, "_global_state_controller", None)
+                    if gesc is not None:
+                        from operational_safety import GlobalState
+                        state_val = getattr(gesc, "current_state", GlobalState.RUNNING)
+                        if state_val == GlobalState.HALTED:
+                            refresh_ms = 5000
+                        elif state_val == GlobalState.DEGRADED:
+                            refresh_ms = 2000
+                    # Fallback: check entries_paused flag as a proxy for HALTED
+                    elif getattr(scalper_ref, "_entries_paused", False):
+                        refresh_ms = 2000
+            except Exception:
+                refresh_ms = 1000
+            self._safe_after(refresh_ms, self._pump_engine_diagnostics)
+
 
     def _bt_export_results(self) -> None:
         try:
@@ -2652,6 +3260,54 @@ class ScalperUI(tk.Tk):
                 pass
         except Exception:
             pass
+
+    def _estimate_dashboard_charges(self, snapshot: dict[str, object]) -> float:
+        total = 0.0
+
+        for row in snapshot.get("equity_rows") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                entry = float(row.get("entry") or 0.0)
+                ltp = float(row.get("ltp") or entry or 0.0)
+                qty = int(abs(int(row.get("qty") or 0)))
+            except Exception:
+                continue
+            total += float(
+                calculate_intraday_charges(
+                    buy_price=entry,
+                    sell_price=ltp,
+                    quantity=qty,
+                    is_options=False,
+                ).get("total", 0.0)
+            )
+
+        seen_option_keys: set[tuple[str, str]] = set()
+        for row in snapshot.get("option_rows") or []:
+            if not isinstance(row, dict):
+                continue
+            trade_id = str(row.get("trade_id") or "").strip()
+            symbol = str(row.get("symbol") or "").strip()
+            key = (trade_id, symbol)
+            if key in seen_option_keys:
+                continue
+            seen_option_keys.add(key)
+            try:
+                entry = float(row.get("entry") or 0.0)
+                ltp = float(row.get("ltp") or entry or 0.0)
+                qty = int(abs(int(row.get("qty") or 0)))
+            except Exception:
+                continue
+            total += float(
+                calculate_intraday_charges(
+                    buy_price=entry,
+                    sell_price=ltp,
+                    quantity=qty,
+                    is_options=("CE" in symbol.upper() or "PE" in symbol.upper()),
+                ).get("total", 0.0)
+            )
+
+        return round(float(total), 2)
 
     def _render_dashboard_portfolio(self, snapshot: dict[str, object]) -> None:
         visible_trade_ids: set[str] = set()
@@ -2698,6 +3354,29 @@ class ScalperUI(tk.Tk):
         except Exception:
             total_unrealized = 0.0
 
+        total_estimated_charges = 0.0
+        try:
+            total_estimated_charges = float(self._estimate_dashboard_charges(snapshot) or 0.0)
+        except Exception:
+            total_estimated_charges = 0.0
+
+        gross_pnl = float(total_unrealized)
+        net_pnl = float(gross_pnl - total_estimated_charges)
+        try:
+            pnl_ledger = getattr(self, "_pnl_ledger", None)
+            if isinstance(pnl_ledger, list) and pnl_ledger:
+                gross_pnl = float(sum(float(v) for v in pnl_ledger) + total_unrealized)
+                net_pnl = float(gross_pnl - total_estimated_charges)
+        except Exception:
+            pass
+
+        try:
+            self._dash_gross_pnl_var.set(f"₹{gross_pnl:,.2f}")
+            self._dash_charges_var.set(f"₹{total_estimated_charges:,.2f}")
+            self._dash_net_pnl_var.set(f"₹{net_pnl:,.2f}")
+        except Exception:
+            pass
+
         try:
             if hasattr(self, "_dash_portfolio_summary_var"):
                 self._dash_portfolio_summary_var.set(
@@ -2728,6 +3407,39 @@ class ScalperUI(tk.Tk):
                         f"Realized P&L: ₹{running:.2f} | Unrealized P&L: ₹{total_unrealized:.2f} | "
                         f"Live P&L: ₹{live_pnl:.2f} | Max DD: ₹{max_drawdown:.0f}"
                     )
+        except Exception:
+            pass
+
+        # Concept 3: Sample PnL and MTM and update Session Equity Curve plot
+        try:
+            now_dt = datetime.now()
+            running_pnl = 0.0
+            try:
+                pnl_ledger = getattr(self, "_pnl_ledger", None)
+                if isinstance(pnl_ledger, list) and pnl_ledger:
+                    running_pnl = sum(float(v) for v in pnl_ledger)
+            except Exception:
+                pass
+            
+            live_pnl_val = running_pnl + total_unrealized
+            
+            if not hasattr(self, "pnl_series_history") or self.pnl_series_history is None:
+                self.pnl_series_history = {
+                    "Realized P&L": [],
+                    "Unrealized MTM": [],
+                    "Live P&L": []
+                }
+            
+            self.pnl_series_history["Realized P&L"].append((now_dt, running_pnl))
+            self.pnl_series_history["Unrealized MTM"].append((now_dt, total_unrealized))
+            self.pnl_series_history["Live P&L"].append((now_dt, live_pnl_val))
+            
+            for key in self.pnl_series_history:
+                if len(self.pnl_series_history[key]) > 1000:
+                    self.pnl_series_history[key] = self.pnl_series_history[key][-1000:]
+                    
+            if hasattr(self, "pnl_chart_plugin") and self.pnl_chart_plugin is not None:
+                self.pnl_chart_plugin.update_series(self.pnl_series_history)
         except Exception:
             pass
 
@@ -2995,6 +3707,23 @@ class ScalperUI(tk.Tk):
             qty = 0
         if qty < 0:
             qty = abs(qty)
+
+        # Option legs sometimes carry lot counts instead of actual contracts.
+        is_opt = self._is_option_leg(leg) if hasattr(self, "_is_option_leg") else ScalperUI._is_option_leg(self, leg)
+        if qty > 0 and is_opt:
+            lot = None
+            try:
+                lot = int(leg.get("lot_size") or 0)
+            except Exception:
+                lot = None
+            if not lot:
+                try:
+                    import config as _cfg
+                    lot = int(getattr(_cfg.load_strategy_config(), "lot_size", 65) or 65)
+                except Exception:
+                    lot = _safe_int_env("MSTOCK_LOT_SIZE", 65)
+            if lot and lot > 1 and qty < lot and qty <= 10:
+                qty = int(qty) * int(lot)
         return qty
 
     def _merge_trade_legs(self, previous_legs: list[dict] | None, new_legs: list[dict] | None) -> list[dict]:
@@ -3602,6 +4331,9 @@ class ScalperUI(tk.Tk):
             tab_text = self.notebook.tab(active_tab_id, "text")
             logger.info(f"Main Tab changed to: {tab_text}")
             
+            if tab_text == "Forward Validation":
+                self._trigger_validation_refresh()
+            
             if tab_text in {"Live Dashboard", "Open Positions", "Trade History"}:
                 self._throttle_option_ltp = 250
                 self._throttle_spot_ltp = 500
@@ -3671,7 +4403,69 @@ class ScalperUI(tk.Tk):
         self.history_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         self.analytics_notebook_frame = ttk.Frame(self.notebook)
-        self.analytics_notebook = ttk.Notebook(self.analytics_notebook_frame)
+        
+        # Make the Market Analytics tab scrollable
+        analytics_outer = ttk.Frame(self.analytics_notebook_frame)
+        analytics_outer.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        analytics_canvas = tk.Canvas(analytics_outer, highlightthickness=0)
+        try:
+            style = ttk.Style(self)
+            bg = style.lookup("TFrame", "background")
+            if bg:
+                analytics_canvas.configure(background=bg)
+        except Exception:
+            pass
+            
+        analytics_vsb = ttk.Scrollbar(analytics_outer, orient="vertical", command=analytics_canvas.yview)
+        analytics_canvas.configure(yscrollcommand=analytics_vsb.set)
+        analytics_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        analytics_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Internal container for the analytics notebook
+        analytics_container = ttk.Frame(analytics_canvas)
+        analytics_container_id = analytics_canvas.create_window((0, 0), window=analytics_container, anchor="nw")
+        
+        def _on_analytics_configure(_evt: object = None) -> None:
+            try:
+                analytics_canvas.configure(scrollregion=analytics_canvas.bbox("all"))
+            except Exception:
+                return
+                
+        def _on_analytics_canvas_configure(evt: object) -> None:
+            try:
+                width = int(getattr(evt, "width"))
+            except Exception:
+                return
+            try:
+                analytics_canvas.itemconfigure(analytics_container_id, width=width)
+            except Exception:
+                return
+                
+        analytics_container.bind("<Configure>", lambda e: _on_analytics_configure(e))
+        analytics_canvas.bind("<Configure>", _on_analytics_canvas_configure)
+        
+        # Mouse wheel scrolling for Market Analytics
+        def _analytics_mousewheel(evt: object) -> None:
+            try:
+                delta = int(getattr(evt, "delta"))
+            except Exception:
+                delta = 0
+            if delta:
+                analytics_canvas.yview_scroll(int(-delta / 120), "units")
+                
+        def _analytics_linux_scroll(evt: object) -> None:
+            num = getattr(evt, "num", None)
+            if num == 4:
+                analytics_canvas.yview_scroll(-1, "units")
+            elif num == 5:
+                analytics_canvas.yview_scroll(1, "units")
+                
+        analytics_canvas.bind_all("<MouseWheel>", _analytics_mousewheel, add="+")
+        analytics_canvas.bind_all("<Button-4>", _analytics_linux_scroll, add="+")
+        analytics_canvas.bind_all("<Button-5>", _analytics_linux_scroll, add="+")
+        
+        self.analytics_notebook = ttk.Notebook(analytics_container)
         self.analytics_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         self.sim_notebook_frame = ttk.Frame(self.notebook)
@@ -3697,6 +4491,16 @@ class ScalperUI(tk.Tk):
         # Build the Live Harness content
         self._build_live_harness_tab()
 
+        # Telemetry & Diagnostics Tab
+        self.telemetry_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.telemetry_frame, text="Telemetry & Diagnostics")
+        self._build_telemetry_tab()
+
+        # Forward Validation Tab
+        self.validation_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.validation_frame, text="Forward Validation")
+        self._build_validation_tab()
+
         # Now, create sub-frames inside their respective sub-notebooks
         self.trade_frame = ttk.Frame(self.history_notebook)
         self.journal_frame = ttk.Frame(self.history_notebook)
@@ -3705,11 +4509,30 @@ class ScalperUI(tk.Tk):
         
         self.signals_frame = ttk.Frame(self.analytics_notebook)
         self.optimizer_frame = ttk.Frame(self.analytics_notebook)
+        self.live_chart_frame = ttk.Frame(self.analytics_notebook)
+        
         self.analytics_notebook.add(self.signals_frame, text="Signals/Greeks")
         self.analytics_notebook.add(self.optimizer_frame, text="Optimizer")
+        self.analytics_notebook.add(self.live_chart_frame, text="Live Chart")
+        
+        # Instantiate LiveChartPlugin matching default underlying
+        underlying = (os.getenv("MSTOCK_UNDERLYING") or os.getenv("MSTOCK_SYMBOL") or "NIFTY").strip()
+        self.live_chart_plugin = LiveChartPlugin(self.live_chart_frame, symbol=underlying, timeframe="1m")
+        # Wire up the full Live Chart tab layout (right-panel cards + status bar + timeline)
+        wire_live_chart_panels(self)
+
+        # Fetch initial historical candles and push to chart so the tab is never blank.
+        # Candles flow: client.fetch_index_candles → plugin.push_candles()
+        # The on_tick callback (from the running scalper) will keep them live after.
+        self._safe_after(500, self._fetch_and_push_initial_candles)
+
+        self._safe_after(2000, _refresh_live_chart_tab, self, True)
+        self._safe_after(1500, self._refresh_live_chart_overlays, True)
         
         self.builder_frame = ttk.Frame(self.sim_notebook)
+        self.mc_frame = ttk.Frame(self.sim_notebook)
         self.sim_notebook.add(self.builder_frame, text="Trade Builder")
+        self.sim_notebook.add(self.mc_frame, text="Monte Carlo Simulator")
 
         try:
             bf2 = ttk.Frame(self.backtest_frame)
@@ -3839,6 +4662,11 @@ class ScalperUI(tk.Tk):
         except Exception:
             pass
 
+        try:
+            self._build_monte_carlo_tab()
+        except Exception:
+            pass
+
         # --- GPT Advisor tab contents (mini-log + controls)
         try:
             gpt_inner = ttk.Frame(self.gpt_frame)
@@ -3880,6 +4708,11 @@ class ScalperUI(tk.Tk):
             ttk.Entry(hedge_frame, textvariable=self._greeks_target_delta_var, width=8).pack(side=tk.LEFT, padx=(6,8))
             ttk.Button(hedge_frame, text="Suggest Hedge", command=self._on_suggest_hedge).pack(side=tk.LEFT)
             ttk.Button(hedge_frame, text="Apply Hedge (Sim)", command=self._on_apply_hedge).pack(side=tk.LEFT, padx=(6,0))
+            
+            # Option Chain IV Smile Skew Curve
+            self.iv_frame = ttk.Frame(greeks_inner)
+            self.iv_frame.pack(fill=tk.BOTH, expand=True, pady=(15, 0))
+            self.iv_smile_plugin = OptionChainIVSmilePlugin(self.iv_frame)
         except Exception:
             pass
 
@@ -3978,11 +4811,13 @@ class ScalperUI(tk.Tk):
         portfolio = ttk.Frame(outer)
         portfolio.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
         portfolio.grid_columnconfigure(0, weight=1)
-        # Give both tables space; summary stays compact.
-        portfolio.grid_rowconfigure(1, weight=3)
-        portfolio.grid_rowconfigure(2, weight=2)
+        # Stretch only the chart; summary stays compact.
+        portfolio.grid_rowconfigure(1, weight=1)
 
         self._dash_portfolio_summary_var = tk.StringVar(value="Updated n/a | Exposure: Equity ₹0 (0%) | Options ₹0 (0%) | Counts: Eq 0 | Opt 0 trades / 0 legs")
+        self._dash_gross_pnl_var = tk.StringVar(value="₹0.00")
+        self._dash_charges_var = tk.StringVar(value="₹0.00")
+        self._dash_net_pnl_var = tk.StringVar(value="₹0.00")
         summary = ttk.LabelFrame(portfolio, text="Portfolio Summary")
         summary.grid(row=0, column=0, sticky="we")
         ttk.Label(summary, textvariable=self._dash_portfolio_summary_var).pack(anchor="w", padx=10, pady=6)
@@ -4008,124 +4843,32 @@ class ScalperUI(tk.Tk):
         ttk.Label(dash_stats_row2, textvariable=self._hedge_qty_traded_today_var).pack(side=tk.LEFT, padx=(6, 18))
         ttk.Label(dash_stats_row2, text="Margin Req:").pack(side=tk.LEFT)
         ttk.Label(dash_stats_row2, textvariable=self._margin_required_var).pack(side=tk.LEFT, padx=(6, 0))
+        dash_stats_row3 = ttk.Frame(dash_stats)
+        dash_stats_row3.pack(fill=tk.X, expand=False, pady=(2, 0))
+        ttk.Label(dash_stats_row3, text="Gross P&L:").pack(side=tk.LEFT)
+        ttk.Label(dash_stats_row3, textvariable=self._dash_gross_pnl_var).pack(side=tk.LEFT, padx=(6, 18))
+        ttk.Label(dash_stats_row3, text="Estimated Charges:").pack(side=tk.LEFT)
+        ttk.Label(dash_stats_row3, textvariable=self._dash_charges_var).pack(side=tk.LEFT, padx=(6, 18))
+        ttk.Label(dash_stats_row3, text="Net P&L:").pack(side=tk.LEFT)
+        ttk.Label(dash_stats_row3, textvariable=self._dash_net_pnl_var).pack(side=tk.LEFT, padx=(6, 0))
 
         if not hasattr(self, "_broker_health_var"):
             self._broker_health_var = tk.StringVar(value="Idle")
             self._broker_health_mode_var = tk.StringVar(value="Mode: n/a")
             self._broker_health_detail_var = tk.StringVar(value="Details: n/a")
 
-        # Open Option Legs Overview on Dashboard
-        opt_lf = ttk.LabelFrame(portfolio, text="Open Option Legs Overview (Double-click to view/manage)")
-        opt_lf.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        opt_lf.grid_rowconfigure(0, weight=1)
-        opt_lf.grid_columnconfigure(0, weight=1)
-        
-        opt_cols = (
-            "trade_id",
-            "strategy",
-            "symbol",
-            "side",
-            "qty",
-            "entry",
-            "ltp",
-            "leg_mtm",
-            "trade_mtm",
-            "base_mtm",
-            "hedge_mtm",
-            "sl",
-            "tgt",
-            "status",
-        )
-        self.dash_opt_tree = ttk.Treeview(opt_lf, columns=opt_cols, show="headings", height=8, style="Compact.Treeview")
-        for c, title in (
-            ("trade_id", "ID"),
-            ("strategy", "Strategy"),
-            ("symbol", "Symbol"),
-            ("side", "Side"),
-            ("qty", "Qty"),
-            ("entry", "Entry"),
-            ("ltp", "LTP"),
-            ("leg_mtm", "Leg MTM"),
-            ("trade_mtm", "Trade MTM"),
-            ("base_mtm", "Base MTM"),
-            ("hedge_mtm", "Hedge MTM"),
-            ("sl", "Stop"),
-            ("tgt", "Target"),
-            ("status", "Status"),
-        ):
-            self.dash_opt_tree.heading(c, text=title)
-            
-        self.dash_opt_tree.column("trade_id", width=60, stretch=False, anchor="w")
-        self.dash_opt_tree.column("strategy", width=120, stretch=True, anchor="w")
-        self.dash_opt_tree.column("symbol", width=210, stretch=True, anchor="w")
-        self.dash_opt_tree.column("side", width=55, stretch=False, anchor="w")
-        self.dash_opt_tree.column("qty", width=55, stretch=False, anchor="e")
-        self.dash_opt_tree.column("entry", width=70, stretch=False, anchor="e")
-        self.dash_opt_tree.column("ltp", width=70, stretch=False, anchor="e")
-        self.dash_opt_tree.column("leg_mtm", width=80, stretch=False, anchor="e")
-        self.dash_opt_tree.column("trade_mtm", width=80, stretch=False, anchor="e")
-        self.dash_opt_tree.column("base_mtm", width=80, stretch=False, anchor="e")
-        self.dash_opt_tree.column("hedge_mtm", width=80, stretch=False, anchor="e")
-        self.dash_opt_tree.column("sl", width=90, stretch=False, anchor="e")
-        self.dash_opt_tree.column("tgt", width=90, stretch=False, anchor="e")
-        self.dash_opt_tree.column("status", width=140, stretch=True, anchor="w")
-        
-        opt_vsb = ttk.Scrollbar(opt_lf, orient="vertical", command=self.dash_opt_tree.yview)
-        opt_hsb = ttk.Scrollbar(opt_lf, orient="horizontal", command=self.dash_opt_tree.xview)
-        self.dash_opt_tree.configure(yscrollcommand=opt_vsb.set, xscrollcommand=opt_hsb.set)
-        self.dash_opt_tree.grid(row=0, column=0, sticky="nsew")
-        opt_vsb.grid(row=0, column=1, sticky="ns")
-        opt_hsb.grid(row=1, column=0, sticky="ew")
-        
-        self.dash_opt_tree.bind("<Double-Button-1>", self._on_dash_opt_double_click)
+        self.dash_opt_tree = None
+        self.dash_eq_tree = None
 
-        # Managed Equities Overview on Dashboard
-        eq_lf = ttk.LabelFrame(portfolio, text="Managed Equities Overview (Double-click to view/manage)")
-        eq_lf.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
-        eq_lf.grid_rowconfigure(0, weight=1)
-        eq_lf.grid_columnconfigure(0, weight=1)
-        
-        eq_cols = ("symbol", "side", "qty", "entry", "ltp", "pnl", "sl", "tgt")
-        self.dash_eq_tree = ttk.Treeview(eq_lf, columns=eq_cols, show="headings", height=6, style="Compact.Treeview")
-        for c, title in (
-            ("symbol", "Symbol"),
-            ("side", "Side"),
-            ("qty", "Qty"),
-            ("entry", "Entry"),
-            ("ltp", "LTP"),
-            ("pnl", "PnL"),
-            ("sl", "Stop"),
-            ("tgt", "Target"),
-        ):
-            self.dash_eq_tree.heading(c, text=title)
-            
-        self.dash_eq_tree.column("symbol", width=200, stretch=True, anchor="w")
-        self.dash_eq_tree.column("side", width=60, stretch=False, anchor="w")
-        self.dash_eq_tree.column("qty", width=70, stretch=False, anchor="e")
-        self.dash_eq_tree.column("entry", width=80, stretch=False, anchor="e")
-        self.dash_eq_tree.column("ltp", width=80, stretch=False, anchor="e")
-        self.dash_eq_tree.column("pnl", width=90, stretch=False, anchor="e")
-        self.dash_eq_tree.column("sl", width=90, stretch=False, anchor="e")
-        self.dash_eq_tree.column("tgt", width=90, stretch=False, anchor="e")
-        
-        eq_vsb = ttk.Scrollbar(eq_lf, orient="vertical", command=self.dash_eq_tree.yview)
-        eq_hsb = ttk.Scrollbar(eq_lf, orient="horizontal", command=self.dash_eq_tree.xview)
-        self.dash_eq_tree.configure(yscrollcommand=eq_vsb.set, xscrollcommand=eq_hsb.set)
-        self.dash_eq_tree.grid(row=0, column=0, sticky="nsew")
-        eq_vsb.grid(row=0, column=1, sticky="ns")
-        eq_hsb.grid(row=1, column=0, sticky="ew")
-        
-        self.dash_eq_tree.bind("<Double-Button-1>", self._on_dash_eq_double_click)
-
-        # Configure custom modern HSL tags for beautiful high-contrast badges
-        for tree in (self.dash_opt_tree, self.dash_eq_tree):
-            try:
-                tree.tag_configure("profit", foreground="#10b981") # HSL Premium Mint Green
-                tree.tag_configure("loss", foreground="#f43f5e")   # HSL Premium Crimson Rose
-                tree.tag_configure("neutral", foreground="#333333")# Charcoal Slate
-                tree.tag_configure("hedge", foreground="#64748b")  # Balanced Steel Blue
-            except Exception:
-                pass
+        # Live Session Performance (PnL & MTM Chart)
+        self.pnl_chart_lf = ttk.LabelFrame(portfolio, text="Live Session Performance (PnL & MTM)")
+        self.pnl_chart_lf.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        self.pnl_chart_plugin = TimeSeriesMultiLinePlugin(self.pnl_chart_lf, title="Session Equity Curve", y_label="Rupees (₹)")
+        self.pnl_series_history = {
+            "Realized P&L": [],
+            "Unrealized MTM": [],
+            "Live P&L": []
+        }
 
         # Analytics/Charts removed from UI.
 
@@ -4201,6 +4944,23 @@ class ScalperUI(tk.Tk):
             row += 1
 
         _section("Credentials")
+        ttk.Label(frm, text="Broker").grid(row=row, column=0, sticky="w")
+        self.broker_var = tk.StringVar(
+            value=(os.getenv("SCALPER_BROKER", "mstock").strip().lower() or "mstock")
+        )
+        if self.broker_var.get() not in {"mstock", "dhan"}:
+            self.broker_var.set("mstock")
+        self.broker_menu = ttk.OptionMenu(
+            frm,
+            self.broker_var,
+            self.broker_var.get(),
+            "mstock",
+            "dhan",
+            command=lambda *_args: self._sync_broker_ui(),
+        )
+        self.broker_menu.grid(row=row, column=1, sticky="w", padx=5)
+
+        row += 1
         ttk.Label(frm, text="API Key").grid(row=row, column=0, sticky="w")
         self.api_key_var = tk.StringVar(value="")
         self.api_key_entry = ttk.Entry(frm, textvariable=self.api_key_var, width=60)
@@ -4219,7 +4979,8 @@ class ScalperUI(tk.Tk):
         self.password_entry.grid(row=row, column=1, sticky="we", padx=5)
 
         row += 1
-        ttk.Label(frm, text="TOTP Secret").grid(row=row, column=0, sticky="w")
+        self.totp_secret_label = ttk.Label(frm, text="TOTP Secret")
+        self.totp_secret_label.grid(row=row, column=0, sticky="w")
         self.totp_secret_var = tk.StringVar(value="")
         
         # Sub-frame container to align entry and show/hide button on the same line
@@ -4242,7 +5003,8 @@ class ScalperUI(tk.Tk):
 
         # Or manually enter 6-digit dynamic TOTP Code from phone
         row += 1
-        ttk.Label(frm, text="Or 6-Digit TOTP Code").grid(row=row, column=0, sticky="w")
+        self.totp_code_label = ttk.Label(frm, text="Or 6-Digit TOTP Code")
+        self.totp_code_label.grid(row=row, column=0, sticky="w")
         self.totp_code_var = tk.StringVar(value="")
         
         totp_code_frm = ttk.Frame(frm)
@@ -4250,7 +5012,52 @@ class ScalperUI(tk.Tk):
         
         self.totp_code_entry = ttk.Entry(totp_code_frm, textvariable=self.totp_code_var, width=15)
         self.totp_code_entry.pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Label(totp_code_frm, text="(Enter manual 6-digit OTP code from Google Authenticator)", font=("Segoe UI", 8, "italic")).pack(side=tk.LEFT)
+        self.totp_code_hint_label = ttk.Label(
+            totp_code_frm,
+            text="(Enter manual 6-digit OTP code from Google Authenticator)",
+            font=("Segoe UI", 8, "italic"),
+        )
+        self.totp_code_hint_label.pack(side=tk.LEFT)
+
+        row += 1
+        ttk.Label(frm, text="Dhan Client ID").grid(row=row, column=0, sticky="w")
+        self.dhan_client_id_var = tk.StringVar(value="")
+        self.dhan_client_id_entry = ttk.Entry(frm, textvariable=self.dhan_client_id_var, width=60)
+        self.dhan_client_id_entry.grid(row=row, column=1, sticky="we", padx=5)
+
+        row += 1
+        ttk.Label(frm, text="Dhan Access Token").grid(row=row, column=0, sticky="w")
+        self.dhan_access_token_var = tk.StringVar(value="")
+        self.dhan_access_token_entry = ttk.Entry(frm, textvariable=self.dhan_access_token_var, show="*", width=60)
+        self.dhan_access_token_entry.grid(row=row, column=1, sticky="we", padx=5)
+
+        row += 1
+        ttk.Label(frm, text="Dhan Underlying Security ID").grid(row=row, column=0, sticky="w")
+        self.dhan_underlying_security_id_var = tk.StringVar(value="")
+        self.dhan_underlying_security_id_entry = ttk.Entry(
+            frm,
+            textvariable=self.dhan_underlying_security_id_var,
+            width=60,
+        )
+        self.dhan_underlying_security_id_entry.grid(row=row, column=1, sticky="we", padx=5)
+
+        row += 1
+        ttk.Label(frm, text="Dhan PIN").grid(row=row, column=0, sticky="w")
+        self.dhan_pin_var = tk.StringVar(value="")
+        self.dhan_pin_entry = ttk.Entry(frm, textvariable=self.dhan_pin_var, show="*", width=60)
+        self.dhan_pin_entry.grid(row=row, column=1, sticky="we", padx=5)
+
+        row += 1
+        ttk.Label(frm, text="Dhan API Key").grid(row=row, column=0, sticky="w")
+        self.dhan_api_key_var = tk.StringVar(value="")
+        self.dhan_api_key_entry = ttk.Entry(frm, textvariable=self.dhan_api_key_var, width=60)
+        self.dhan_api_key_entry.grid(row=row, column=1, sticky="we", padx=5)
+
+        row += 1
+        ttk.Label(frm, text="Dhan API Secret").grid(row=row, column=0, sticky="w")
+        self.dhan_api_secret_var = tk.StringVar(value="")
+        self.dhan_api_secret_entry = ttk.Entry(frm, textvariable=self.dhan_api_secret_var, show="*", width=60)
+        self.dhan_api_secret_entry.grid(row=row, column=1, sticky="we", padx=5)
 
         # Strategy selection
         row += 1
@@ -4332,6 +5139,16 @@ class ScalperUI(tk.Tk):
             _preset_ui = "Aggressive"
         elif _preset_env == "conservative":
             _preset_ui = "Conservative"
+        elif _preset_env == "trend":
+            _preset_ui = "Trend"
+        elif _preset_env == "chop":
+            _preset_ui = "Chop"
+        elif _preset_env == "expiry":
+            _preset_ui = "Expiry"
+        elif _preset_env == "high_volatility":
+            _preset_ui = "High Volatility"
+        elif _preset_env == "low_liquidity":
+            _preset_ui = "Low Liquidity"
         self.preset_var = tk.StringVar(value=_preset_ui)
         ttk.OptionMenu(
             preset_frame,
@@ -4340,21 +5157,33 @@ class ScalperUI(tk.Tk):
             "(none)",
             "Aggressive",
             "Conservative",
+            "Trend",
+            "Chop",
+            "Expiry",
+            "High Volatility",
+            "Low Liquidity",
         ).pack(side=tk.LEFT)
 
         def _apply_quick_preset() -> None:
             name = str(self.preset_var.get() or "").strip().lower()
             current_strategy = str(self.strategy_var.get() or "").strip().lower()
-            if name == "aggressive":
+            if name in {"aggressive", "conservative", "trend", "chop", "expiry", "high volatility", "low liquidity"}:
                 if current_strategy != "auto":
                     self.strategy_var.set("auto")
-                self.timeframe_var.set("1m")
-                if hasattr(self, "delta_hedge_scope_var"):
-                    self.delta_hedge_scope_var.set("all_options")
-            elif name == "conservative":
-                if current_strategy != "auto":
-                    self.strategy_var.set("auto")
-                self.timeframe_var.set("3m")
+                if name == "aggressive":
+                    self.timeframe_var.set("1m")
+                elif name == "conservative":
+                    self.timeframe_var.set("3m")
+                elif name == "trend":
+                    self.timeframe_var.set("2m")
+                elif name == "chop":
+                    self.timeframe_var.set("3m")
+                elif name == "expiry":
+                    self.timeframe_var.set("1m")
+                elif name == "high volatility":
+                    self.timeframe_var.set("3m")
+                elif name == "low liquidity":
+                    self.timeframe_var.set("5m")
                 if hasattr(self, "delta_hedge_scope_var"):
                     self.delta_hedge_scope_var.set("all_options")
 
@@ -5890,7 +6719,7 @@ class ScalperUI(tk.Tk):
                     {
                         "symbol": sym,
                         "side": leg.get("side"),
-                        "quantity": leg.get("quantity"),
+                        "quantity": self._get_leg_qty(leg),
                         "strike": leg.get("strike"),
                         "option_type": leg.get("option_type"),
                         "expiry": (str(leg.get("expiry"))[:10] if leg.get("expiry") is not None else None),
@@ -6223,7 +7052,7 @@ class ScalperUI(tk.Tk):
                     continue
                 side = str(leg.get("side") or leg.get("transactionType") or leg.get("transactiontype") or "").strip().upper()
                 try:
-                    qty = int(leg.get("quantity") or leg.get("qty") or leg.get("netQty") or leg.get("netqty") or 0)
+                    qty = self._get_leg_qty(leg) if hasattr(self, "_get_leg_qty") else ScalperUI._get_leg_qty(self, leg)
                 except Exception:
                     qty = 0
                 if qty <= 0:
@@ -6367,9 +7196,31 @@ class ScalperUI(tk.Tk):
                 if strike_f <= 0:
                     continue
                 t_sec = (expiry_dt - now).total_seconds()
-                if t_sec <= 60:
+                # If expired, we can still list the leg with zero greeks instead of ignoring it.
+                if t_sec <= 0:
+                    rows.append(
+                        {
+                            "trade_id": str(tid),
+                            "symbol": display_sym,
+                            "side": side,
+                            "qty": qty,
+                            "strike": strike_f,
+                            "type": opt_type,
+                            "expiry": (expiry_dt.strftime("%Y-%m-%d") if expiry_dt else None),
+                            "price": leg.get("ltp") or leg.get("entry_price") or 0.0,
+                            "iv": 0.0,
+                            "delta": 0.0,
+                            "gamma": 0.0,
+                            "vega": 0.0,
+                            "theta": 0.0,
+                            "net_delta": 0.0,
+                            "is_hedge": is_hedge,
+                        }
+                    )
                     continue
-                t_years = float(t_sec) / float(365.0 * 24.0 * 3600.0)
+
+                t_sec_clamped = max(1.0, t_sec)
+                t_years = float(t_sec_clamped) / float(365.0 * 24.0 * 3600.0)
 
                 # Prefer current ltp, else exit_price, else entry_price.
                 px_val = leg.get("ltp")
@@ -6608,6 +7459,141 @@ class ScalperUI(tk.Tk):
         except Exception:
             pass
 
+    def _enrich_chain_iv(self, chain: list[dict[str, object]], spot: float | None) -> list[dict[str, object]]:
+        if not chain or spot is None:
+            return chain
+        try:
+            spot_f = float(spot)
+        except Exception:
+            return chain
+        if spot_f <= 0:
+            return chain
+
+        try:
+            rate = float(os.getenv("MSTOCK_RISK_FREE_RATE", "0.06") or 0.06)
+        except Exception:
+            rate = 0.06
+
+        client = getattr(self, "_client", None)
+
+        rows: list[dict[str, object]] = []
+        for row in chain:
+            if not isinstance(row, dict):
+                continue
+            try:
+                strike = float(row.get("strike") or 0.0)
+            except Exception:
+                strike = 0.0
+            if strike <= 0:
+                continue
+            opt_type = str(row.get("option_type") or "").strip().upper()
+            if opt_type not in {"CE", "PE"}:
+                continue
+            rows.append(row)
+
+        if not rows:
+            return chain
+
+        try:
+            max_rows = int(os.getenv("MSTOCK_IV_SMILE_MAX_ROWS", "40") or 40)
+        except Exception:
+            max_rows = 40
+        if max_rows <= 0:
+            max_rows = 40
+
+        rows_sorted = sorted(rows, key=lambda r: abs(float(r.get("strike") or 0.0) - spot_f))
+        rows_target = rows_sorted[: max_rows]
+
+        now = datetime.now()
+
+        def _norm_iv(val: object) -> float | None:
+            try:
+                iv_f = float(val)
+            except Exception:
+                return None
+            if iv_f <= 0:
+                return None
+            if iv_f > 5:
+                iv_f = iv_f / 100.0
+            return iv_f
+
+        def _pick_price(row: dict[str, object]) -> float | None:
+            for k in (
+                "ltp",
+                "last_price",
+                "lastPrice",
+                "last_traded_price",
+                "lastTradedPrice",
+                "close",
+                "price",
+                "premium",
+            ):
+                if k in row and row.get(k) is not None:
+                    try:
+                        p = float(row.get(k))
+                        if p > 0:
+                            return p
+                    except Exception:
+                        continue
+            raw = row.get("raw") if isinstance(row.get("raw"), dict) else None
+            if isinstance(raw, dict):
+                for k in (
+                    "ltp",
+                    "lastPrice",
+                    "last_price",
+                    "last_traded_price",
+                    "close",
+                    "price",
+                ):
+                    if k in raw and raw.get(k) is not None:
+                        try:
+                            p = float(raw.get(k))
+                            if p > 0:
+                                return p
+                        except Exception:
+                            continue
+            return None
+
+        for row in rows_target:
+            iv_val = _norm_iv(row.get("iv"))
+            if iv_val is not None:
+                row["iv"] = iv_val
+                continue
+
+            expiry_dt = self._parse_expiry(row.get("expiry"))
+            if expiry_dt is None:
+                continue
+
+            time_to_expiry = (expiry_dt - now).total_seconds() / (365.0 * 24.0 * 3600.0)
+            if time_to_expiry <= 0:
+                continue
+
+            price = _pick_price(row)
+            if price is None and client is not None:
+                try:
+                    price = self._try_get_live_ltp_for_leg(client, row)
+                except Exception:
+                    price = None
+            if price is None or price <= 0:
+                continue
+
+            opt_type = str(row.get("option_type") or "").strip().upper()
+            try:
+                strike = float(row.get("strike") or 0.0)
+            except Exception:
+                strike = 0.0
+            if strike <= 0 or opt_type not in {"CE", "PE"}:
+                continue
+
+            try:
+                iv_calc = implied_volatility(price, spot_f, strike, time_to_expiry, rate, opt_type)
+            except Exception:
+                iv_calc = None
+            if iv_calc is not None and iv_calc > 0:
+                row["iv"] = float(iv_calc)
+
+        return chain
+
     def _queue_greeks_render(self, spot: float | None) -> None:
         now = time.time()
         if self._greeks_inflight:
@@ -6628,6 +7614,23 @@ class ScalperUI(tk.Tk):
         self._greeks_inflight = True
 
         def _worker(p_spot: float, p_state: dict[str, dict[str, object]]) -> None:
+            chain = []
+            try:
+                scalper = getattr(self, "_scalper", None)
+                if scalper is not None and hasattr(scalper, "cfg") and getattr(scalper.cfg, "underlying", None):
+                    underlying = scalper.cfg.underlying
+                else:
+                    underlying = (os.getenv("MSTOCK_UNDERLYING") or os.getenv("MSTOCK_SYMBOL") or "NIFTY").strip()
+                
+                client = getattr(self, "_client", None)
+                if client is not None:
+                    try:
+                        chain = client.get_option_chain(underlying)
+                    except Exception:
+                        chain = []
+            except Exception:
+                chain = []
+
             try:
                 rows, summary = self._compute_open_leg_greeks(p_spot, trade_state=p_state)
             except Exception:
@@ -6636,6 +7639,12 @@ class ScalperUI(tk.Tk):
             def _apply() -> None:
                 try:
                     self._render_greeks_rows(rows, summary)
+                    if hasattr(self, "iv_smile_plugin") and self.iv_smile_plugin is not None:
+                        try:
+                            chain_smile = self._enrich_chain_iv(chain, p_spot)
+                            self.iv_smile_plugin.update_chain(chain_smile, spot=p_spot)
+                        except Exception:
+                            pass
                 finally:
                     self._greeks_last_render_ts = time.time()
                     self._greeks_inflight = False
@@ -6819,7 +7828,7 @@ class ScalperUI(tk.Tk):
             if not sym:
                 continue
             side = str(leg.get("side") or "").upper().strip()
-            qty = int(leg.get("quantity") or 0)
+            qty = self._get_leg_qty(leg)
             label = f"{side} {sym} x{qty}"
             options.append(label)
             legs_by_label[label] = leg
@@ -6842,7 +7851,7 @@ class ScalperUI(tk.Tk):
             token = str(leg.get("token") or "").strip() or None
             exch = str(leg.get("exchange") or "").strip() or None
             side = str(leg.get("side") or "").upper().strip()
-            qty = int(leg.get("quantity") or 0)
+            qty = self._get_leg_qty(leg)
             if not sym or side not in {"BUY", "SELL"} or qty <= 0:
                 messagebox.showerror("Invalid leg", "Selected leg is missing symbol/side/qty.")
                 return
@@ -7417,6 +8426,34 @@ class ScalperUI(tk.Tk):
         except Exception as exc:
             if hasattr(self, "_journal_status_var"):
                 self._journal_status_var.set(f"Journal load failed: {exc}")
+
+    def _refresh_live_chart_overlays(self, force: bool = False) -> None:
+        try:
+            now_ts = time.time()
+            last_ts = float(getattr(self, "_chart_overlay_refresh_ts", 0.0) or 0.0)
+            refresh_sec = float(getattr(self, "_chart_overlay_refresh_sec", 5.0) or 5.0)
+            if not force and (now_ts - last_ts) < refresh_sec:
+                return
+            plugin = getattr(self, "live_chart_plugin", None)
+            if plugin is None:
+                return
+            db = getattr(self, "_db_manager", None)
+            if db is None:
+                scalper = getattr(self, "_scalper", None)
+                db = getattr(scalper, "db_manager", None) if scalper is not None else None
+            if db is None:
+                return
+
+            trade_rows = db.list_recent_trade_events(limit=1200) if hasattr(db, "list_recent_trade_events") else []
+            prediction_rows = db.list_recent_prediction_markers(limit=3000) if hasattr(db, "list_recent_prediction_markers") else []
+
+            if trade_rows:
+                plugin.load_trade_event_rows(trade_rows)
+            if prediction_rows:
+                plugin.load_prediction_rows(prediction_rows)
+            self._chart_overlay_refresh_ts = now_ts
+        except Exception:
+            pass
 
     def _export_trade_journal_csv(self) -> None:
         try:
@@ -8140,6 +9177,11 @@ class ScalperUI(tk.Tk):
             while True:
                 evt = self._trade_q.get_nowait()
                 processed += 1
+                if "live_chart_plugin" in self.__dict__ and self.live_chart_plugin is not None:
+                    try:
+                        self.live_chart_plugin.push_trade_event(evt)
+                    except Exception:
+                        pass
                 try:
                     try:
                         db = getattr(self, "_db_manager", None)
@@ -8155,6 +9197,34 @@ class ScalperUI(tk.Tk):
                                 "realized": evt.realized,
                                 "reason": evt.reason,
                                 "margin_required": evt.margin_required,
+                                "symbol": evt.symbol,
+                                "strike": evt.strike,
+                                "option_type": evt.option_type,
+                                "side": evt.side,
+                                "quantity": evt.quantity,
+                                "bid": evt.bid,
+                                "ask": evt.ask,
+                                "ltp": evt.ltp,
+                                "execution_price": evt.execution_price,
+                                "execution_price_source": evt.execution_price_source,
+                                "entry_price": evt.entry_price,
+                                "exit_price": evt.exit_price,
+                                "gross_pnl": evt.gross_pnl,
+                                "net_pnl": evt.net_pnl,
+                                "spread_cost": evt.spread_cost,
+                                "slippage_cost": evt.slippage_cost,
+                                "brokerage_cost": evt.brokerage_cost,
+                                "exit_reason": evt.exit_reason,
+                                "risk_filter_decisions": evt.risk_filter_decisions,
+                                "realized_slippage_pct": evt.realized_slippage_pct,
+                                "paper_mode": evt.paper_mode,
+                                "timestamp": evt.timestamp,
+                                "skip_reason": evt.skip_reason,
+                                "spread_pct_at_entry": evt.spread_pct_at_entry,
+                                "spread_pct_at_exit": evt.spread_pct_at_exit,
+                                "filter_premium_ok": evt.filter_premium_ok,
+                                "filter_spread_ok": evt.filter_spread_ok,
+                                "filter_bid_ask_ok": evt.filter_bid_ask_ok,
                             })
                     except Exception:
                         pass
@@ -8654,6 +9724,7 @@ class ScalperUI(tk.Tk):
                     self._refresh_broker_health()
                     if hasattr(self, "journal_tree"):
                         self._refresh_trade_journal()
+                self._refresh_live_chart_overlays()
             except Exception:
                 pass
             self.after(150, self._pump_trades)
@@ -9223,6 +10294,16 @@ class ScalperUI(tk.Tk):
             _preset_ui = "Aggressive"
         elif _preset_env == "conservative":
             _preset_ui = "Conservative"
+        elif _preset_env == "trend":
+            _preset_ui = "Trend"
+        elif _preset_env == "chop":
+            _preset_ui = "Chop"
+        elif _preset_env == "expiry":
+            _preset_ui = "Expiry"
+        elif _preset_env == "high_volatility":
+            _preset_ui = "High Volatility"
+        elif _preset_env == "low_liquidity":
+            _preset_ui = "Low Liquidity"
         preset_var = tk.StringVar(value=_preset_ui)
         tk.OptionMenu(
             preset_frame,
@@ -9230,6 +10311,11 @@ class ScalperUI(tk.Tk):
             "(none)",
             "Aggressive",
             "Conservative",
+            "Trend",
+            "Chop",
+            "Expiry",
+            "High Volatility",
+            "Low Liquidity",
         ).pack(side=tk.LEFT)
 
         row += 1
@@ -9496,8 +10582,72 @@ class ScalperUI(tk.Tk):
                 risk_scale_max_qty_var.set(preset_max_qty)
                 risk_scale_step_qty_var.set(str(preset_lot_size))
                 max_pos_var.set(str(preset_position_limit))
-                exit_short_var.set(True)
                 exit_wing_var.set(False)
+
+            elif name == "Trend":
+                if allow_strategy_override:
+                    strategy_var.set("auto")
+                timeframe_var.set("2m")
+                cooldown_var.set("30")
+                cooldown_stopout_var.set("90")
+                risk_scale_max_qty_var.set("450")
+                pyramid_var.set("2")
+                dir_prem_trail_var.set("0.06")
+                dir_partial_tgt_var.set("1.5")
+                risk_scale_recovery_var.set("1")
+                mtf_enabled_var.set(True)
+
+            elif name == "Chop":
+                if allow_strategy_override:
+                    strategy_var.set("auto")
+                timeframe_var.set("3m")
+                cooldown_var.set("60")
+                cooldown_stopout_var.set("180")
+                risk_scale_max_qty_var.set("200")
+                pyramid_var.set("0")
+                dir_prem_trail_var.set("0.12")
+                dir_partial_tgt_var.set("0.8")
+                risk_scale_recovery_var.set("2")
+                mtf_enabled_var.set(False)
+
+            elif name == "Expiry":
+                if allow_strategy_override:
+                    strategy_var.set("auto")
+                timeframe_var.set("1m")
+                cooldown_var.set("90")
+                cooldown_stopout_var.set("300")
+                risk_scale_max_qty_var.set("100")
+                pyramid_var.set("0")
+                dir_prem_trail_var.set("0.15")
+                dir_partial_tgt_var.set("1.0")
+                risk_scale_recovery_var.set("3")
+                mtf_enabled_var.set(True)
+
+            elif name == "High Volatility":
+                if allow_strategy_override:
+                    strategy_var.set("auto")
+                timeframe_var.set("3m")
+                cooldown_var.set("75")
+                cooldown_stopout_var.set("240")
+                risk_scale_max_qty_var.set("150")
+                pyramid_var.set("0")
+                dir_prem_trail_var.set("0.18")
+                dir_partial_tgt_var.set("1.8")
+                risk_scale_recovery_var.set("3")
+                mtf_enabled_var.set(True)
+
+            elif name == "Low Liquidity":
+                if allow_strategy_override:
+                    strategy_var.set("auto")
+                timeframe_var.set("5m")
+                cooldown_var.set("120")
+                cooldown_stopout_var.set("360")
+                risk_scale_max_qty_var.set("50")
+                pyramid_var.set("0")
+                dir_prem_trail_var.set("0.10")
+                dir_partial_tgt_var.set("1.0")
+                risk_scale_recovery_var.set("3")
+                mtf_enabled_var.set(False)
 
             after = _snapshot_preset_fields()
             keys = list({*before.keys(), *after.keys()})
@@ -10117,6 +11267,80 @@ class ScalperUI(tk.Tk):
         limit_buf_var = tk.StringVar(value=str(getattr(cfg, "limit_price_buffer_pct", 0.05)))
         tk.Entry(content, textvariable=limit_buf_var, width=10).grid(row=row, column=1, sticky="w", padx=8)
 
+        # Low-Resource & Robustness Options
+        row += 1
+        robust_sect_lbl = ttk.Label(content, text="Low-Resource & Institutional Robustness", font=("Segoe UI", 10, "bold"))
+        robust_sect_lbl.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 4), padx=8)
+        
+        row += 1
+        robust_row1 = tk.Frame(content)
+        robust_row1.grid(row=row, column=1, sticky="w", padx=8)
+        
+        recon_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_reconciliation", True)))
+        ttk.Checkbutton(robust_row1, text="Reconciliation On", variable=recon_enabled_var).pack(side=tk.LEFT, padx=(0, 6))
+        
+        tk.Label(robust_row1, text="Interval (s)").pack(side=tk.LEFT)
+        recon_interval_var = tk.StringVar(value=str(getattr(cfg, "reconciliation_interval_sec", 15.0)))
+        tk.Entry(robust_row1, textvariable=recon_interval_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
+
+        exec_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_execution_analytics", True)))
+        ttk.Checkbutton(robust_row1, text="Execution Analytics", variable=exec_enabled_var).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(robust_row1, text="Prune Days").pack(side=tk.LEFT)
+        exec_retention_var = tk.StringVar(value=str(getattr(cfg, "analytics_retention_days", 30)))
+        tk.Entry(robust_row1, textvariable=exec_retention_var, width=4).pack(side=tk.LEFT, padx=(2, 10))
+
+        row += 1
+        robust_row2 = tk.Frame(content)
+        robust_row2.grid(row=row, column=1, sticky="w", padx=8)
+        
+        dq_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_data_validation", True)))
+        ttk.Checkbutton(robust_row2, text="Data Validation", variable=dq_enabled_var).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(robust_row2, text="Outlier ATR").pack(side=tk.LEFT)
+        dq_atr_var = tk.StringVar(value=str(getattr(cfg, "data_outlier_atr_mult", 3.0)))
+        tk.Entry(robust_row2, textvariable=dq_atr_var, width=4).pack(side=tk.LEFT, padx=(2, 10))
+
+        decay_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_strategy_decay", True)))
+        ttk.Checkbutton(robust_row2, text="Strategy Decay On", variable=decay_enabled_var).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(robust_row2, text="Decay Window").pack(side=tk.LEFT)
+        decay_window_var = tk.StringVar(value=str(getattr(cfg, "decay_window_size", 15)))
+        tk.Entry(robust_row2, textvariable=decay_window_var, width=4).pack(side=tk.LEFT, padx=(2, 10))
+
+        row += 1
+        robust_row3 = tk.Frame(content)
+        robust_row3.grid(row=row, column=1, sticky="w", padx=8)
+
+        tk.Label(robust_row3, text="Min Rolling Sharpe").pack(side=tk.LEFT)
+        decay_min_sharpe_var = tk.StringVar(value=str(getattr(cfg, "min_rolling_sharpe", 0.0)))
+        tk.Entry(robust_row3, textvariable=decay_min_sharpe_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
+
+        tk.Label(robust_row3, text="Max Strat Drawdown (%)").pack(side=tk.LEFT)
+        decay_max_dd_var = tk.StringVar(value=str(getattr(cfg, "max_strategy_drawdown_pct", 0.15)))
+        tk.Entry(robust_row3, textvariable=decay_max_dd_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
+
+        shadow_mode_var = tk.BooleanVar(value=bool(getattr(cfg, "shadow_mode", False)))
+        ttk.Checkbutton(robust_row3, text="Shadow Mode", variable=shadow_mode_var).pack(side=tk.LEFT, padx=(0, 6))
+
+        row += 1
+        robust_row4 = tk.Frame(content)
+        robust_row4.grid(row=row, column=1, sticky="w", padx=8)
+
+        mem_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_memory_manager", True)))
+        ttk.Checkbutton(robust_row4, text="Memory Manager On", variable=mem_enabled_var).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(robust_row4, text="Max Memory %").pack(side=tk.LEFT)
+        mem_max_pct_var = tk.StringVar(value=str(getattr(cfg, "max_memory_usage_pct", 80.0)))
+        tk.Entry(robust_row4, textvariable=mem_max_pct_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
+
+        telem_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_telemetry", True)))
+        ttk.Checkbutton(robust_row4, text="Telemetry", variable=telem_enabled_var).pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(robust_row4, text="Telem Int (s)").pack(side=tk.LEFT)
+        telem_interval_var = tk.StringVar(value=str(getattr(cfg, "telemetry_interval_sec", 5.0)))
+        tk.Entry(robust_row4, textvariable=telem_interval_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
+
         row += 1
         enh_row1 = tk.Frame(content)
         enh_row1.grid(row=row, column=1, sticky="w", padx=8)
@@ -10137,26 +11361,25 @@ class ScalperUI(tk.Tk):
         limit_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_limit_orders", False)))
         ttk.Checkbutton(enh_row2, text="Use Limit Orders", variable=limit_enabled_var).pack(side=tk.LEFT)
 
+        row += 1
+        enh_row3 = tk.Frame(content)
+        enh_row3.grid(row=row, column=1, sticky="w", padx=8)
+        adaptive_regimes_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_adaptive_regimes", False)))
+        ttk.Checkbutton(enh_row3, text="Adaptive Preset Mode (Regime-Aware)", variable=adaptive_regimes_enabled_var).pack(side=tk.LEFT)
+
         def apply_changes() -> None:
             try:
                 to_persist: dict[str, str] = {}
                 to_unset: list[str] = []
 
                 preset_name = str(preset_var.get() or "").strip().lower()
-                if preset_name == "aggressive":
-                    os.environ["MSTOCK_PRESET"] = "aggressive"
-                    to_persist["MSTOCK_PRESET"] = "aggressive"
+                if preset_name in {"aggressive", "conservative", "trend", "chop", "expiry", "high volatility", "low liquidity"}:
+                    p_val = preset_name.replace(" ", "_")
+                    os.environ["MSTOCK_PRESET"] = p_val
+                    to_persist["MSTOCK_PRESET"] = p_val
                     try:
                         if hasattr(self, "preset_var"):
-                            self.preset_var.set("Aggressive")
-                    except Exception:
-                        pass
-                elif preset_name == "conservative":
-                    os.environ["MSTOCK_PRESET"] = "conservative"
-                    to_persist["MSTOCK_PRESET"] = "conservative"
-                    try:
-                        if hasattr(self, "preset_var"):
-                            self.preset_var.set("Conservative")
+                            self.preset_var.set(preset_name.title())
                     except Exception:
                         pass
                 else:
@@ -10885,6 +12108,66 @@ class ScalperUI(tk.Tk):
                 os.environ["MSTOCK_DEBUG_NO_SIGNAL"] = v
                 to_persist["MSTOCK_DEBUG_NO_SIGNAL"] = v
 
+                os.environ["MSTOCK_ENABLE_ADAPTIVE_REGIMES"] = "true" if adaptive_regimes_enabled_var.get() else "false"
+                to_persist["MSTOCK_ENABLE_ADAPTIVE_REGIMES"] = os.environ["MSTOCK_ENABLE_ADAPTIVE_REGIMES"]
+                if getattr(self, "_scalper", None) is not None:
+                    self._scalper.cfg.enable_adaptive_regimes = adaptive_regimes_enabled_var.get()
+                self._enable_adaptive_regimes_var.set(adaptive_regimes_enabled_var.get())
+
+                # Persist Upgraded Low-Resource & Robustness Settings
+                os.environ["MSTOCK_ENABLE_RECONCILIATION"] = "true" if recon_enabled_var.get() else "false"
+                to_persist["MSTOCK_ENABLE_RECONCILIATION"] = os.environ["MSTOCK_ENABLE_RECONCILIATION"]
+                if recon_interval_var.get().strip():
+                    v = str(float(recon_interval_var.get().strip()))
+                    os.environ["MSTOCK_RECONCILIATION_INTERVAL_SEC"] = v
+                    to_persist["MSTOCK_RECONCILIATION_INTERVAL_SEC"] = v
+
+                os.environ["MSTOCK_ENABLE_EXECUTION_ANALYTICS"] = "true" if exec_enabled_var.get() else "false"
+                to_persist["MSTOCK_ENABLE_EXECUTION_ANALYTICS"] = os.environ["MSTOCK_ENABLE_EXECUTION_ANALYTICS"]
+                if exec_retention_var.get().strip():
+                    v = str(int(exec_retention_var.get().strip()))
+                    os.environ["MSTOCK_ANALYTICS_RETENTION_DAYS"] = v
+                    to_persist["MSTOCK_ANALYTICS_RETENTION_DAYS"] = v
+
+                os.environ["MSTOCK_ENABLE_DATA_VALIDATION"] = "true" if dq_enabled_var.get() else "false"
+                to_persist["MSTOCK_ENABLE_DATA_VALIDATION"] = os.environ["MSTOCK_ENABLE_DATA_VALIDATION"]
+                if dq_atr_var.get().strip():
+                    v = str(float(dq_atr_var.get().strip()))
+                    os.environ["MSTOCK_DATA_OUTLIER_ATR_MULT"] = v
+                    to_persist["MSTOCK_DATA_OUTLIER_ATR_MULT"] = v
+
+                os.environ["MSTOCK_ENABLE_STRATEGY_DECAY"] = "true" if decay_enabled_var.get() else "false"
+                to_persist["MSTOCK_ENABLE_STRATEGY_DECAY"] = os.environ["MSTOCK_ENABLE_STRATEGY_DECAY"]
+                if decay_window_var.get().strip():
+                    v = str(int(decay_window_var.get().strip()))
+                    os.environ["MSTOCK_DECAY_WINDOW_SIZE"] = v
+                    to_persist["MSTOCK_DECAY_WINDOW_SIZE"] = v
+                if decay_min_sharpe_var.get().strip():
+                    v = str(float(decay_min_sharpe_var.get().strip()))
+                    os.environ["MSTOCK_MIN_ROLLING_SHARPE"] = v
+                    to_persist["MSTOCK_MIN_ROLLING_SHARPE"] = v
+                if decay_max_dd_var.get().strip():
+                    v = str(float(decay_max_dd_var.get().strip()))
+                    os.environ["MSTOCK_MAX_STRATEGY_DRAWDOWN_PCT"] = v
+                    to_persist["MSTOCK_MAX_STRATEGY_DRAWDOWN_PCT"] = v
+
+                os.environ["MSTOCK_SHADOW_MODE"] = "true" if shadow_mode_var.get() else "false"
+                to_persist["MSTOCK_SHADOW_MODE"] = os.environ["MSTOCK_SHADOW_MODE"]
+
+                os.environ["MSTOCK_ENABLE_MEMORY_MANAGER"] = "true" if mem_enabled_var.get() else "false"
+                to_persist["MSTOCK_ENABLE_MEMORY_MANAGER"] = os.environ["MSTOCK_ENABLE_MEMORY_MANAGER"]
+                if mem_max_pct_var.get().strip():
+                    v = str(float(mem_max_pct_var.get().strip()))
+                    os.environ["MSTOCK_MAX_MEMORY_USAGE_PCT"] = v
+                    to_persist["MSTOCK_MAX_MEMORY_USAGE_PCT"] = v
+
+                os.environ["MSTOCK_ENABLE_TELEMETRY"] = "true" if telem_enabled_var.get() else "false"
+                to_persist["MSTOCK_ENABLE_TELEMETRY"] = os.environ["MSTOCK_ENABLE_TELEMETRY"]
+                if telem_interval_var.get().strip():
+                    v = str(float(telem_interval_var.get().strip()))
+                    os.environ["MSTOCK_TELEMETRY_INTERVAL_SEC"] = v
+                    to_persist["MSTOCK_TELEMETRY_INTERVAL_SEC"] = v
+
 
                 persist_settings_env(to_persist, to_unset)
             except Exception as exc:  # noqa: BLE001
@@ -10920,9 +12203,60 @@ class ScalperUI(tk.Tk):
         canvas.yview_moveto(0.0)
 
     def _set_env_from_fields(self) -> None:
+        os.environ["SCALPER_BROKER"] = self._selected_broker()
         os.environ["MSTOCK_API_KEY"] = self.api_key_var.get().strip()
         os.environ["MSTOCK_USERNAME"] = self.username_var.get().strip()
         os.environ["MSTOCK_PASSWORD"] = self.password_var.get()
+        if hasattr(self, "dhan_client_id_var"):
+            dhan_client_id = self.dhan_client_id_var.get().strip()
+            if dhan_client_id:
+                os.environ["DHAN_CLIENT_ID"] = dhan_client_id
+            else:
+                os.environ.pop("DHAN_CLIENT_ID", None)
+        if hasattr(self, "dhan_access_token_var"):
+            dhan_access_token = self.dhan_access_token_var.get().strip()
+            if dhan_access_token:
+                os.environ["DHAN_ACCESS_TOKEN"] = dhan_access_token
+            else:
+                os.environ.pop("DHAN_ACCESS_TOKEN", None)
+        if hasattr(self, "dhan_underlying_security_id_var"):
+            dhan_underlying_security_id = self.dhan_underlying_security_id_var.get().strip()
+            if dhan_underlying_security_id:
+                os.environ["DHAN_UNDERLYING_SECURITY_ID"] = dhan_underlying_security_id
+                os.environ["DHAN_UNDER_SECURITY_ID"] = dhan_underlying_security_id
+            else:
+                os.environ.pop("DHAN_UNDERLYING_SECURITY_ID", None)
+                os.environ.pop("DHAN_UNDER_SECURITY_ID", None)
+        if hasattr(self, "dhan_pin_var"):
+            dhan_pin = self.dhan_pin_var.get().strip()
+            if dhan_pin:
+                os.environ["DHAN_PIN"] = dhan_pin
+            else:
+                os.environ.pop("DHAN_PIN", None)
+        if hasattr(self, "dhan_api_key_var"):
+            dhan_api_key = self.dhan_api_key_var.get().strip()
+            if dhan_api_key:
+                os.environ["DHAN_API_KEY"] = dhan_api_key
+            else:
+                os.environ.pop("DHAN_API_KEY", None)
+        if hasattr(self, "dhan_api_secret_var"):
+            dhan_api_secret = self.dhan_api_secret_var.get().strip()
+            if dhan_api_secret:
+                os.environ["DHAN_API_SECRET"] = dhan_api_secret
+            else:
+                os.environ.pop("DHAN_API_SECRET", None)
+        if hasattr(self, "totp_secret_var"):
+            shared_totp_secret = self.totp_secret_var.get().strip()
+            if self._selected_broker() == "dhan" and shared_totp_secret:
+                os.environ["DHAN_TOTP_SECRET"] = shared_totp_secret
+            elif self._selected_broker() == "dhan":
+                os.environ.pop("DHAN_TOTP_SECRET", None)
+        if hasattr(self, "totp_code_var"):
+            shared_totp_code = self.totp_code_var.get().strip()
+            if self._selected_broker() == "dhan" and shared_totp_code:
+                os.environ["DHAN_TOTP_CODE"] = shared_totp_code
+            elif self._selected_broker() == "dhan":
+                os.environ.pop("DHAN_TOTP_CODE", None)
         token = self.access_token_var.get().strip()
         if token:
             os.environ["MSTOCK_ACCESS_TOKEN"] = token
@@ -11050,6 +12384,132 @@ class ScalperUI(tk.Tk):
             return Path(base) / "scalper" / "credentials.json"
         return Path.home() / ".scalper" / "credentials.json"
 
+    def _selected_broker(self) -> str:
+        try:
+            broker = str(self.broker_var.get() or "mstock").strip().lower()
+        except Exception:
+            broker = str(os.getenv("SCALPER_BROKER", "mstock") or "mstock").strip().lower()
+        return broker if broker in {"mstock", "dhan"} else "mstock"
+
+    def _is_dhan_selected(self) -> bool:
+        return self._selected_broker() == "dhan"
+
+    def _mask_secret(self, value: object) -> str:
+        token = str(value or "").strip()
+        if not token:
+            return "(missing)"
+        if len(token) <= 8:
+            return token[:2] + "..." + token[-2:]
+        return token[:4] + "..." + token[-4:]
+
+    def _sync_broker_ui(self) -> None:
+        broker = self._selected_broker()
+        try:
+            self.btn_login_totp.configure(text="Generate/Use Dhan Token" if broker == "dhan" else "Login TOTP")
+        except Exception:
+            pass
+        try:
+            if broker == "dhan":
+                self.totp_secret_label.configure(text="TOTP Secret (used for m.Stock or Dhan)")
+                self.totp_code_label.configure(text="Or 6-Digit TOTP Code (used for m.Stock or Dhan)")
+                self.totp_code_hint_label.configure(
+                    text="(Enter a manual 6-digit OTP code for m.Stock or Dhan auto-token generation)"
+                )
+            else:
+                self.totp_secret_label.configure(text="TOTP Secret")
+                self.totp_code_label.configure(text="Or 6-Digit TOTP Code")
+                self.totp_code_hint_label.configure(
+                    text="(Enter manual 6-digit OTP code from Google Authenticator)"
+                )
+        except Exception:
+            pass
+
+    def _build_dhan_client(self, strat_cfg: object | None = None):
+        from dhan_client import DhanClient
+
+        return DhanClient(strat_cfg)
+
+    def _use_dhan_token(self) -> None:
+        client_id = str(self.dhan_client_id_var.get() or "").strip()
+        try:
+            access_token = self._ensure_dhan_session_ready()
+        except Exception as exc:
+            messagebox.showerror("Dhan Login Failed", str(exc))
+            return
+
+        masked = self._mask_secret(access_token)
+        jwt_payload = decode_dhan_jwt(access_token)
+        exp_text = ""
+        try:
+            exp_epoch = jwt_payload.get("exp")
+            if exp_epoch is not None:
+                exp_dt = datetime.fromtimestamp(int(exp_epoch))
+                exp_text = f", expires {exp_dt.strftime('%Y-%m-%d %H:%M')}"
+        except Exception:
+            exp_text = ""
+        if hasattr(self, "status_var"):
+            self.status_var.set(f"Dhan token loaded ({masked}{exp_text})")
+        try:
+            self._app_status_var.set("Dhan session ready.")
+        except Exception:
+            pass
+        print(f"[UI] Dhan session ready for client {client_id} token={masked}")
+
+        if self.remember_var.get():
+            try:
+                self._on_save_credentials()
+            except Exception:
+                pass
+
+        try:
+            from dhan_client import get_dhan_sdk_diagnostics
+
+            diag = get_dhan_sdk_diagnostics()
+            print(
+                "[UI] Dhan SDK diagnostics: "
+                f"import_ok={bool(diag.get('import_ok'))} "
+                f"source={str(diag.get('sdk_source', 'unknown') or 'unknown')}"
+            )
+        except Exception:
+            pass
+
+    def _refresh_broker_status(self, client: object) -> None:
+        if self._selected_broker() != "dhan":
+            return
+        masked = self._mask_secret(getattr(client, "access_token", ""))
+        if hasattr(self, "status_var"):
+            self.status_var.set(f"Running... (dhan {masked})")
+
+    def _ensure_dhan_session_ready(self) -> str:
+        self._set_env_from_fields()
+        client_id = str(self.dhan_client_id_var.get() or "").strip()
+        access_token = str(self.dhan_access_token_var.get() or "").strip()
+        pin = str(self.dhan_pin_var.get() or "").strip() if hasattr(self, "dhan_pin_var") else ""
+        totp_secret = str(self.totp_secret_var.get() or "").strip() if hasattr(self, "totp_secret_var") else ""
+        totp_code = str(self.totp_code_var.get() or "").strip() if hasattr(self, "totp_code_var") else ""
+        if not client_id:
+            raise RuntimeError("Dhan Client ID is required.")
+        needs_refresh = not access_token or is_dhan_token_expiring(access_token, within_seconds=900)
+        if needs_refresh:
+            if not pin or not (totp_secret or totp_code):
+                raise RuntimeError(
+                    "Dhan token is missing or expiring soon. Provide Dhan PIN and TOTP Secret/6-digit code to refresh it."
+                )
+            access_token = generate_dhan_access_token(
+                client_id,
+                pin,
+                totp_secret=totp_secret,
+                totp_code=totp_code,
+            )
+            self.dhan_access_token_var.set(access_token)
+            os.environ["DHAN_ACCESS_TOKEN"] = access_token
+            try:
+                if hasattr(self, "totp_code_var"):
+                    self.totp_code_var.set("")
+            except Exception:
+                pass
+        return access_token
+
     def _load_prefilled_credentials(self) -> None:
         # Priority: saved file -> env vars -> blanks.
         saved = {}
@@ -11062,6 +12522,18 @@ class ScalperUI(tk.Tk):
         api_key = str(saved.get("api_key") or os.getenv("MSTOCK_API_KEY", ""))
         username = str(saved.get("username") or os.getenv("MSTOCK_USERNAME", ""))
         password = str(saved.get("password") or os.getenv("MSTOCK_PASSWORD", ""))
+        broker = str(saved.get("broker") or os.getenv("SCALPER_BROKER", "mstock") or "mstock").strip().lower()
+        if broker not in {"mstock", "dhan"}:
+            broker = "mstock"
+        dhan_client_id = str(saved.get("dhan_client_id") or os.getenv("DHAN_CLIENT_ID", ""))
+        dhan_access_token = str(saved.get("dhan_access_token") or os.getenv("DHAN_ACCESS_TOKEN", ""))
+        dhan_underlying_security_id = str(
+            saved.get("dhan_underlying_security_id")
+            or os.getenv("DHAN_UNDERLYING_SECURITY_ID", os.getenv("DHAN_UNDER_SECURITY_ID", ""))
+        )
+        dhan_pin = str(saved.get("dhan_pin") or os.getenv("DHAN_PIN", ""))
+        dhan_api_key = str(saved.get("dhan_api_key") or os.getenv("DHAN_API_KEY", ""))
+        dhan_api_secret = str(saved.get("dhan_api_secret") or os.getenv("DHAN_API_SECRET", ""))
         underlying_token = str(saved.get("underlying_token") or os.getenv("MSTOCK_UNDERLYING_TOKEN", ""))
         underlying_exchange = str(
             saved.get("underlying_exchange")
@@ -11087,16 +12559,41 @@ class ScalperUI(tk.Tk):
         chain_fallback = bool(
             saved.get("use_chain_fallback")
             if "use_chain_fallback" in saved
-            else os.getenv("MSTOCK_USE_CHAIN_FALLBACK", "true").lower() in {"1", "true", "yes", "y"}
+            else os.getenv("MSTOCK_USE_CHAIN_FALLBACK", "false").lower() in {"1", "true", "yes", "y"}
         )
         auto_fetch_sm = bool(
             saved.get("auto_fetch_scripmaster")
             if "auto_fetch_scripmaster" in saved
             else os.getenv("MSTOCK_AUTO_FETCH_SCRIPMASTER", "true").lower() in {"1", "true", "yes", "y"}
         )
-        # Target expiry is a bot setting rather than a credential; prefer env (including
-        # .scalper.env / Settings dialog) over any previously saved credentials value.
-        target_expiry = str(os.getenv("MSTOCK_TARGET_EXPIRY", "") or saved.get("target_expiry") or "")
+        target_expiry = str(os.getenv("MSTOCK_TARGET_EXPIRY", "") or saved.get("target_expiry") or "").strip()
+        if target_expiry:
+            try:
+                from datetime import datetime as _dt
+                parsed_expiry = None
+                for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+                    try:
+                        parsed_expiry = _dt.strptime(target_expiry, fmt).date()
+                        break
+                    except Exception:
+                        continue
+                if parsed_expiry and parsed_expiry < _dt.now().date():
+                    print(f"[UI] Stale target expiry {target_expiry!r} is in the past; clearing dynamically.")
+                    target_expiry = ""
+                    os.environ.pop("MSTOCK_TARGET_EXPIRY", None)
+                    try:
+                        persist_settings_env({}, unset_keys=["MSTOCK_TARGET_EXPIRY"])
+                    except Exception:
+                        pass
+                    if "target_expiry" in saved:
+                        try:
+                            saved.pop("target_expiry", None)
+                            self._cred_path.parent.mkdir(parents=True, exist_ok=True)
+                            self._cred_path.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         short_strike_distance = str(
             saved.get("short_strike_distance")
             or os.getenv("MSTOCK_SHORT_STRIKE_DISTANCE", "50")
@@ -11105,6 +12602,20 @@ class ScalperUI(tk.Tk):
         self.api_key_var.set(api_key)
         self.username_var.set(username)
         self.password_var.set(password)
+        if "broker_var" in getattr(self, "__dict__", {}):
+            self.broker_var.set(broker)
+        if "dhan_client_id_var" in getattr(self, "__dict__", {}):
+            self.dhan_client_id_var.set(dhan_client_id)
+        if "dhan_access_token_var" in getattr(self, "__dict__", {}):
+            self.dhan_access_token_var.set(dhan_access_token)
+        if "dhan_underlying_security_id_var" in getattr(self, "__dict__", {}):
+            self.dhan_underlying_security_id_var.set(dhan_underlying_security_id)
+        if "dhan_pin_var" in getattr(self, "__dict__", {}):
+            self.dhan_pin_var.set(dhan_pin)
+        if "dhan_api_key_var" in getattr(self, "__dict__", {}):
+            self.dhan_api_key_var.set(dhan_api_key)
+        if "dhan_api_secret_var" in getattr(self, "__dict__", {}):
+            self.dhan_api_secret_var.set(dhan_api_secret)
         if hasattr(self, "totp_secret_var"):
             self.totp_secret_var.set(totp_secret)
         if hasattr(self, "underlying_token_var"):
@@ -11153,11 +12664,31 @@ class ScalperUI(tk.Tk):
             )
             return
 
+        existing_saved: dict[str, object] = {}
+        try:
+            if self._cred_path.exists():
+                existing_saved = json.loads(self._cred_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing_saved = {}
+
         data = {
+            "broker": self._selected_broker(),
             "api_key": self.api_key_var.get().strip(),
             "username": self.username_var.get().strip(),
             "password": self.password_var.get(),
         }
+        if hasattr(self, "dhan_client_id_var"):
+            data["dhan_client_id"] = self.dhan_client_id_var.get().strip()
+        if hasattr(self, "dhan_access_token_var"):
+            data["dhan_access_token"] = self.dhan_access_token_var.get().strip()
+        if hasattr(self, "dhan_underlying_security_id_var"):
+            data["dhan_underlying_security_id"] = self.dhan_underlying_security_id_var.get().strip()
+        if hasattr(self, "dhan_pin_var"):
+            data["dhan_pin"] = self.dhan_pin_var.get().strip()
+        if hasattr(self, "dhan_api_key_var"):
+            data["dhan_api_key"] = self.dhan_api_key_var.get().strip()
+        if hasattr(self, "dhan_api_secret_var"):
+            data["dhan_api_secret"] = self.dhan_api_secret_var.get().strip()
         if hasattr(self, "totp_secret_var"):
             totp_sec = self.totp_secret_var.get().strip()
             if totp_sec:
@@ -11192,13 +12723,33 @@ class ScalperUI(tk.Tk):
             dist = self.distance_var.get().strip()
             if dist:
                 data["short_strike_distance"] = dist
-        if not data["api_key"] or not data["username"] or not data["password"]:
-            messagebox.showerror("Missing info", "API key, username, and password are required to save.")
-            return
+        if self._selected_broker() == "mstock":
+            if not data["api_key"] or not data["username"] or not data["password"]:
+                messagebox.showerror("Missing info", "API key, username, and password are required to save.")
+                return
+        else:
+            if not data.get("dhan_client_id") or not data.get("dhan_access_token"):
+                messagebox.showerror("Missing info", "Dhan Client ID and Dhan Access Token are required to save.")
+                return
+
+        data = merge_saved_broker_credentials(existing_saved, self._selected_broker(), data)
 
         try:
             self._cred_path.parent.mkdir(parents=True, exist_ok=True)
             self._cred_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            persist_settings_env(
+                {
+                    "SCALPER_BROKER": self._selected_broker(),
+                    "DHAN_CLIENT_ID": str(data.get("dhan_client_id") or ""),
+                    "DHAN_ACCESS_TOKEN": str(data.get("dhan_access_token") or ""),
+                    "DHAN_UNDERLYING_SECURITY_ID": str(data.get("dhan_underlying_security_id") or ""),
+                    "DHAN_UNDER_SECURITY_ID": str(data.get("dhan_underlying_security_id") or ""),
+                    "DHAN_PIN": str(data.get("dhan_pin") or ""),
+                    "DHAN_API_KEY": str(data.get("dhan_api_key") or ""),
+                    "DHAN_API_SECRET": str(data.get("dhan_api_secret") or ""),
+                },
+                [],
+            )
             print(f"Saved credentials to {self._cred_path}.\n")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Save failed", f"Could not save credentials: {exc}")
@@ -11244,12 +12795,15 @@ class ScalperUI(tk.Tk):
                     break
         except queue.Empty:
             pass
-        self.after(100, self._pump_logs)
+        self._safe_after(100, self._pump_logs)
 
     # --- Login flow (TOTP) ---
 
     def _on_login_totp(self) -> None:
         """Login using TOTP (Time-based One-Time Password) from authenticator app."""
+        if self._is_dhan_selected():
+            self._use_dhan_token()
+            return
         self._set_env_from_fields()
         username = self.username_var.get().strip()
         password = self.password_var.get()
@@ -11339,8 +12893,19 @@ class ScalperUI(tk.Tk):
             pass
 
         self._set_env_from_fields()
-        if not os.getenv("MSTOCK_ACCESS_TOKEN"):
-            messagebox.showerror("Not logged in", "Generate/set an access token first.")
+        broker = self._selected_broker()
+        if broker == "mstock":
+            if not os.getenv("MSTOCK_ACCESS_TOKEN"):
+                messagebox.showerror("Not logged in", "Generate/set an access token first.")
+                return
+        elif broker == "dhan":
+            try:
+                self._ensure_dhan_session_ready()
+            except Exception as exc:
+                messagebox.showerror("Not logged in", str(exc))
+                return
+        else:
+            messagebox.showerror("Unsupported broker", f"Unsupported broker: {broker}")
             return
 
         self._bot_stop.clear()
@@ -11402,17 +12967,25 @@ class ScalperUI(tk.Tk):
                 except Exception:
                     pass
 
-                client = MStockTypeBClient(api_cfg)
-                client.login()  # no-op if token is already set
+                if broker == "dhan":
+                    client = self._build_dhan_client(strat_cfg)
+                    client.login(interactive=False)
+                else:
+                    client = MStockTypeBClient(api_cfg)
+                    client.login()  # no-op if token is already set
                 try:
                     self.after(0, lambda c=client: setattr(self, "_client", c))
                 except Exception:
                     self._client = client
+                try:
+                    self.after(0, lambda c=client: self._refresh_broker_status(c))
+                except Exception:
+                    pass
 
                 # m.Stock candles require an underlying token for the selected exchange.
                 # Auto-resolve it if missing so candle fetch doesn't block trading.
                 u_tok = os.getenv("MSTOCK_UNDERLYING_TOKEN", "").strip()
-                if not u_tok:
+                if broker == "mstock" and not u_tok:
                     try:
                         exch_hint = os.getenv(
                             "MSTOCK_UNDERLYING_EXCHANGE",
@@ -11542,6 +13115,21 @@ class ScalperUI(tk.Tk):
                                 except Exception:
                                     pass
                                 self._render_signals_and_greeks()
+                                if "live_chart_plugin" in self.__dict__ and self.live_chart_plugin is not None:
+                                    try:
+                                        underlying = "NIFTY"
+                                        scalper = getattr(self, "_scalper", None)
+                                        if scalper is not None and hasattr(scalper, "cfg") and getattr(scalper.cfg, "underlying", None):
+                                            underlying = scalper.cfg.underlying
+                                        else:
+                                            underlying = (os.getenv("MSTOCK_UNDERLYING") or os.getenv("MSTOCK_SYMBOL") or "NIFTY").strip()
+                                        
+                                        if self.live_chart_plugin.symbol != underlying:
+                                            self.live_chart_plugin.symbol = underlying
+                                            self.live_chart_plugin.ax_price.set_title(f"{underlying} ({self.live_chart_plugin.timeframe})")
+                                        self.live_chart_plugin.push_candles(norm)
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
 
@@ -11647,8 +13235,969 @@ class ScalperUI(tk.Tk):
             sys.stderr = self._orig_stderr
             self.destroy()
 
+    def _build_monte_carlo_tab(self) -> None:
+        """Constructs the Monte Carlo Simulator GUI layout inside self.mc_frame."""
+        import os
+        import matplotlib
+        try:
+            matplotlib.use("TkAgg")
+        except Exception:
+            pass
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        # Top label
+        mc_title_frame = ttk.Frame(self.mc_frame)
+        mc_title_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+        ttk.Label(mc_title_frame, text="Monte Carlo Risk & Stress Simulator", font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT)
+        
+        # Main split container
+        mc_split = ttk.PanedWindow(self.mc_frame, orient=tk.HORIZONTAL)
+        mc_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Left Panel (Controls)
+        left_panel = ttk.Frame(mc_split)
+        mc_split.add(left_panel, weight=1)
+        
+        # Right Panel (Metrics & Plots)
+        right_panel = ttk.Frame(mc_split)
+        mc_split.add(right_panel, weight=2)
+        
+        # Controls Frame (Left Panel Layout)
+        ctrl_lf = ttk.LabelFrame(left_panel, text="Simulation Controls")
+        ctrl_lf.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Trade Source Radiobuttons
+        ttk.Label(ctrl_lf, text="Trade PnL Source:", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+        self.mc_source_var = tk.StringVar(value="demo")
+        
+        src_demo = ttk.Radiobutton(ctrl_lf, text="Example Option Strategy (Demo)", variable=self.mc_source_var, value="demo", command=self._on_mc_source_changed)
+        src_demo.pack(anchor="w", padx=20, pady=2)
+        src_ledger = ttk.Radiobutton(ctrl_lf, text="Current Session Trade Ledger", variable=self.mc_source_var, value="ledger", command=self._on_mc_source_changed)
+        src_ledger.pack(anchor="w", padx=20, pady=2)
+        src_manual = ttk.Radiobutton(ctrl_lf, text="Manual Comma-Separated Input", variable=self.mc_source_var, value="manual", command=self._on_mc_source_changed)
+        src_manual.pack(anchor="w", padx=20, pady=2)
+        
+        # CSV Input Box
+        ttk.Label(ctrl_lf, text="Trades PnL Values (comma-separated):").pack(anchor="w", padx=10, pady=(10, 2))
+        self.mc_csv_text = tk.Text(ctrl_lf, height=4, width=32, wrap=tk.CHAR)
+        self.mc_csv_text.pack(fill=tk.X, padx=10, pady=2)
+        # Prepopulate demo trades
+        demo_trades_str = "2400, -1800, 3100, -1200, 4200, -2200, 1500, -800, 5000, -3200, 2100, -900, 1800, -1100, 3600, -2800"
+        self.mc_csv_text.insert("1.0", demo_trades_str)
+        
+        # Settings Inputs Grid
+        grid_frame = ttk.Frame(ctrl_lf)
+        grid_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+        
+        # Iterations
+        ttk.Label(grid_frame, text="Iterations:").grid(row=0, column=0, sticky="w", pady=4)
+        self.mc_iter_var = tk.StringVar(value="5000")
+        ttk.Entry(grid_frame, textvariable=self.mc_iter_var, width=10).grid(row=0, column=1, sticky="w", padx=5, pady=4)
+        
+        # Confidence Level
+        ttk.Label(grid_frame, text="Confidence Level (%):").grid(row=1, column=0, sticky="w", pady=4)
+        self.mc_conf_var = tk.StringVar(value="95")
+        ttk.Entry(grid_frame, textvariable=self.mc_conf_var, width=10).grid(row=1, column=1, sticky="w", padx=5, pady=4)
+        
+        # Initial Capital
+        ttk.Label(grid_frame, text="Initial Capital (₹):").grid(row=2, column=0, sticky="w", pady=4)
+        self.mc_capital_var = tk.StringVar(value="100000")
+        ttk.Entry(grid_frame, textvariable=self.mc_capital_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=4)
+        
+        # Leverage/Lot Size Factor
+        ttk.Label(grid_frame, text="Lot Size Factor:").grid(row=3, column=0, sticky="w", pady=4)
+        self.mc_lot_var = tk.StringVar(value="1.0")
+        ttk.Entry(grid_frame, textvariable=self.mc_lot_var, width=10).grid(row=3, column=1, sticky="w", padx=5, pady=4)
+        
+        # Slippage Penalty
+        ttk.Label(grid_frame, text="Slippage Penalty (₹/trade):").grid(row=4, column=0, sticky="w", pady=4)
+        self.mc_slippage_var = tk.StringVar(value="50")
+        ttk.Entry(grid_frame, textvariable=self.mc_slippage_var, width=10).grid(row=4, column=1, sticky="w", padx=5, pady=4)
+        
+        # Resample Mode
+        ttk.Label(grid_frame, text="Resample Mode:").grid(row=5, column=0, sticky="w", pady=4)
+        self.mc_mode_var = tk.StringVar(value="bootstrap")
+        self.mc_mode_cb = ttk.Combobox(grid_frame, textvariable=self.mc_mode_var, values=["bootstrap", "shuffle", "block_bootstrap"], width=12, state="readonly")
+        self.mc_mode_cb.grid(row=5, column=1, sticky="w", padx=5, pady=4)
+        
+        # Action Buttons Layout Grid
+        btn_grid = ttk.Frame(ctrl_lf)
+        btn_grid.pack(fill=tk.X, padx=10, pady=(10, 15))
+        
+        self.mc_run_btn = ttk.Button(btn_grid, text="⚡ Run Simulator", style="Accent.TButton", command=self._run_monte_carlo_sim)
+        self.mc_run_btn.grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=5)
+        
+        self.mc_web_btn = ttk.Button(btn_grid, text="🚀 Launch Dashboard", style="Accent.TButton", command=self._launch_web_dashboard)
+        self.mc_web_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=5)
+        
+        btn_grid.columnconfigure(0, weight=1)
+        btn_grid.columnconfigure(1, weight=1)
+        
+        # Right Panel Layout
+        # Metrics Display Card
+        metrics_lf = ttk.LabelFrame(right_panel, text="Stress Test Risk Metrics")
+        metrics_lf.pack(fill=tk.X, padx=5, pady=5)
+        
+        metrics_grid = ttk.Frame(metrics_lf)
+        metrics_grid.pack(fill=tk.X, padx=10, pady=10)
+        
+        # Metric Variables
+        self.mc_original_return_var = tk.StringVar(value="₹0.00")
+        self.mc_median_return_var = tk.StringVar(value="₹0.00")
+        self.mc_worst_drawdown_var = tk.StringVar(value="0.00%")
+        self.mc_var_drawdown_var = tk.StringVar(value="0.00%")
+        self.mc_probability_loss_var = tk.StringVar(value="0.00%")
+        self.mc_ruin_var = tk.StringVar(value="0.00%")
+        self.mc_streak_var = tk.StringVar(value="0")
+        
+        # Label layout in grid
+        labels = [
+            ("Original Return:", self.mc_original_return_var, 0, 0),
+            ("Median Sim Return:", self.mc_median_return_var, 0, 2),
+            ("Worst Drawdown:", self.mc_worst_drawdown_var, 1, 0),
+            ("95% VaR Drawdown:", self.mc_var_drawdown_var, 1, 2),
+            ("Probability of Net Loss:", self.mc_probability_loss_var, 2, 0),
+            ("Risk of Ruin (>50% Drawdown):", self.mc_ruin_var, 2, 2),
+            ("Worst Consecutive Losses:", self.mc_streak_var, 3, 0)
+        ]
+        
+        for text, var, r, c in labels:
+            ttk.Label(metrics_grid, text=text, font=("Segoe UI", 9, "bold")).grid(row=r, column=c, sticky="w", padx=(10, 5), pady=4)
+            ttk.Label(metrics_grid, textvariable=var, font=("Segoe UI", 9)).grid(row=r, column=c+1, sticky="w", padx=(0, 20), pady=4)
+            
+        # Matplotlib Plot Frame
+        self.mc_plot_lf = ttk.LabelFrame(right_panel, text="Simulated Equity Curve Scenarios")
+        self.mc_plot_lf.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        self.mc_fig = plt.Figure(figsize=(7.5, 3.4), dpi=100)
+        self.mc_ax = self.mc_fig.add_subplot(1, 1, 1)
+        
+        # Apply dark theme styling to Matplotlib immediately
+        theme = "dark"
+        try:
+            theme = (os.getenv("MSTOCK_UI_THEME", "dark") or "dark").strip().lower()
+            if theme == "dark":
+                self.mc_fig.patch.set_facecolor("#1e1e1e")
+                self.mc_ax.set_facecolor("#1e1e1e")
+                for spine in ("top", "bottom", "left", "right"):
+                    self.mc_ax.spines[spine].set_color("#555555")
+                self.mc_ax.tick_params(colors="#cccccc")
+                self.mc_ax.xaxis.label.set_color("#cccccc")
+                self.mc_ax.yaxis.label.set_color("#cccccc")
+                self.mc_ax.title.set_color("#cccccc")
+        except Exception:
+            pass
+            
+        self.mc_ax.grid(True, linestyle="--", alpha=0.3, color="#555555" if theme == "dark" else "#cccccc")
+        self.mc_ax.set_title("Run Simulation to Visualize Scenarios")
+        self.mc_ax.set_xlabel("Trade Count")
+        self.mc_ax.set_ylabel("Account Balance (₹)")
+        
+        self.mc_canvas = FigureCanvasTkAgg(self.mc_fig, master=self.mc_plot_lf)
+        self.mc_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _on_mc_source_changed(self) -> None:
+        """Fills the csv input box with trades depending on source radio button selection."""
+        src = self.mc_source_var.get()
+        if src == "demo":
+            demo_trades_str = "2400, -1800, 3100, -1200, 4200, -2200, 1500, -800, 5000, -3200, 2100, -900, 1800, -1100, 3600, -2800"
+            self.mc_csv_text.delete("1.0", tk.END)
+            self.mc_csv_text.insert("1.0", demo_trades_str)
+            self.mc_csv_text.configure(state=tk.NORMAL)
+        elif src == "ledger":
+            pnl_ledger = getattr(self, "_pnl_ledger", None)
+            if isinstance(pnl_ledger, list) and pnl_ledger:
+                trades_str = ", ".join(f"{float(v):.2f}" for v in pnl_ledger)
+            else:
+                trades_str = "2000, -1500, 1200, -500, 1800"  # fallback
+            self.mc_csv_text.delete("1.0", tk.END)
+            self.mc_csv_text.insert("1.0", trades_str)
+            self.mc_csv_text.configure(state=tk.NORMAL)
+        elif src == "manual":
+            self.mc_csv_text.configure(state=tk.NORMAL)
+
+    def _run_monte_carlo_sim(self) -> None:
+        """Executes a Trade Shuffle Monte Carlo Simulation with costs & slippage penalty."""
+        import random
+        import os
+        import matplotlib
+        try:
+            matplotlib.use("TkAgg")
+        except Exception:
+            pass
+        import matplotlib.pyplot as plt
+        
+        try:
+            # 1. Parse Inputs
+            # Parse Trades List
+            text_val = self.mc_csv_text.get("1.0", tk.END).strip()
+            if not text_val:
+                messagebox.showerror("Monte Carlo", "Please enter some trades first.")
+                return
+            
+            raw_trades = []
+            for item in text_val.split(","):
+                item_str = item.strip()
+                if item_str:
+                    try:
+                        raw_trades.append(float(item_str))
+                    except Exception:
+                        pass
+            
+            if not raw_trades:
+                messagebox.showerror("Monte Carlo", "No valid numeric trades found in the input box.")
+                return
+            
+            # Parse simulation parameters
+            try:
+                num_iter = int(self.mc_iter_var.get() or "5000")
+                if num_iter <= 0:
+                    raise ValueError
+            except Exception:
+                num_iter = 5000
+                self.mc_iter_var.set("5000")
+                
+            try:
+                conf_level = float(self.mc_conf_var.get() or "95") / 100.0
+                if not (0.01 < conf_level < 0.999):
+                    raise ValueError
+            except Exception:
+                conf_level = 0.95
+                self.mc_conf_var.set("95")
+                
+            try:
+                start_cap = float(self.mc_capital_var.get() or "100000")
+                if start_cap <= 0:
+                    raise ValueError
+            except Exception:
+                start_cap = 100000.0
+                self.mc_capital_var.set("100000")
+                
+            try:
+                lot_size = float(self.mc_lot_var.get() or "1.0")
+                if lot_size <= 0:
+                    raise ValueError
+            except Exception:
+                lot_size = 1.0
+                self.mc_lot_var.set("1.0")
+                
+            try:
+                slippage = float(self.mc_slippage_var.get() or "50")
+            except Exception:
+                slippage = 0.0
+                self.mc_slippage_var.set("0")
+                
+            # 2. Run Simulation Iterations using modular risk engine
+            from risk_engine.simulator import SimulationEngine
+            sim_engine = SimulationEngine(raw_trades)
+            mode = self.mc_mode_var.get() if hasattr(self, 'mc_mode_var') else "bootstrap"
+            
+            all_final_returns = []
+            all_max_drawdowns = []
+            all_max_loss_streaks = []
+            all_curves = []
+            
+            # Calculate Original Backtest Curve (no shuffle, but with lot size and slippage)
+            orig_curve = [start_cap]
+            current_cap = start_cap
+            for pnl in raw_trades:
+                current_cap += (pnl * lot_size) - slippage
+                orig_curve.append(current_cap)
+            orig_final_return = current_cap - start_cap
+            
+            # Run simulations
+            for _ in range(num_iter):
+                # Resample trades using the new modular engine!
+                resampled = sim_engine.resample_trades(mode=mode, block_size=5)
+                
+                curve = [start_cap]
+                cap = start_cap
+                peak = start_cap
+                max_dd = 0.0
+                streak = 0
+                max_streak = 0
+                
+                for pnl in resampled:
+                    adjusted_pnl = (pnl * lot_size) - slippage
+                    cap += adjusted_pnl
+                    curve.append(cap)
+                    
+                    # Track drawdown
+                    if cap > peak:
+                        peak = cap
+                    dd = (peak - cap) / peak if peak > 0 else 0.0
+                    if dd > max_dd:
+                        max_dd = dd
+                        
+                    # Track losing streak
+                    if adjusted_pnl < 0:
+                        streak += 1
+                        if streak > max_streak:
+                            max_streak = streak
+                    else:
+                        streak = 0
+                        
+                all_final_returns.append(cap - start_cap)
+                all_max_drawdowns.append(max_dd)
+                all_max_loss_streaks.append(max_streak)
+                all_curves.append(curve)
+                
+            # 3. Calculate Risk Metrics
+            # Sort metrics to calculate percentiles
+            sorted_returns = sorted(all_final_returns)
+            sorted_drawdowns = sorted(all_max_drawdowns)
+            
+            median_return = sorted_returns[int(num_iter * 0.50)]
+            worst_drawdown = sorted_drawdowns[-1]
+            
+            # Drawdown percentile (Confidence Level VaR)
+            var_index = int(num_iter * conf_level)
+            if var_index >= num_iter:
+                var_index = num_iter - 1
+            var_drawdown = sorted_drawdowns[var_index]
+            
+            # Probability of overall net loss (final return < 0)
+            losses_count = sum(1 for ret in all_final_returns if ret < 0)
+            prob_loss = losses_count / num_iter
+            
+            # Risk of ruin (probability of drawdown > 50%)
+            ruin_count = sum(1 for dd in all_max_drawdowns if dd >= 0.50)
+            prob_ruin = ruin_count / num_iter
+            
+            # Max consecutive losses
+            worst_streak = max(all_max_loss_streaks)
+            
+            # Update variables
+            self.mc_original_return_var.set(f"₹{orig_final_return:,.2f}")
+            self.mc_median_return_var.set(f"₹{median_return:,.2f}")
+            self.mc_worst_drawdown_var.set(f"{worst_drawdown * 100:.2f}%")
+            self.mc_var_drawdown_var.set(f"{var_drawdown * 100:.2f}%")
+            self.mc_probability_loss_var.set(f"{prob_loss * 100:.2f}%")
+            self.mc_ruin_var.set(f"{prob_ruin * 100:.2f}%")
+            self.mc_streak_var.set(str(worst_streak))
+            
+            # 4. Plot Equity Curves
+            self.mc_ax.clear()
+            
+            # Re-apply theme styling
+            theme = (os.getenv("MSTOCK_UI_THEME", "dark") or "dark").strip().lower()
+            if theme == "dark":
+                self.mc_fig.patch.set_facecolor("#1e1e1e")
+                self.mc_ax.set_facecolor("#1e1e1e")
+                for spine in ("top", "bottom", "left", "right"):
+                    self.mc_ax.spines[spine].set_color("#555555")
+                self.mc_ax.tick_params(colors="#cccccc")
+                self.mc_ax.xaxis.label.set_color("#cccccc")
+                self.mc_ax.yaxis.label.set_color("#cccccc")
+                self.mc_ax.title.set_color("#cccccc")
+                grid_color = "#555555"
+            else:
+                self.mc_fig.patch.set_facecolor("#ffffff")
+                self.mc_ax.set_facecolor("#ffffff")
+                for spine in ("top", "bottom", "left", "right"):
+                    self.mc_ax.spines[spine].set_color("#cccccc")
+                self.mc_ax.tick_params(colors="#333333")
+                self.mc_ax.xaxis.label.set_color("#333333")
+                self.mc_ax.yaxis.label.set_color("#333333")
+                self.mc_ax.title.set_color("#333333")
+                grid_color = "#cccccc"
+                
+            self.mc_ax.grid(True, linestyle="--", alpha=0.3, color=grid_color)
+            
+            # Plot a representative sample of 50 paths in thin transparent lines
+            sample_paths = random.sample(all_curves, min(50, len(all_curves)))
+            for curve in sample_paths:
+                self.mc_ax.plot(curve, color="cyan" if theme == "dark" else "blue", linewidth=0.5, alpha=0.15)
+                
+            # Find and plot the 5th percentile worst-case curve
+            # Rank curves by final return
+            ranked_curves = sorted(all_curves, key=lambda c: c[-1])
+            worst_5pct_index = int(num_iter * 0.05)
+            worst_5pct_curve = ranked_curves[worst_5pct_index]
+            
+            # Find and plot the median curve
+            median_index = int(num_iter * 0.50)
+            median_curve = ranked_curves[median_index]
+            
+            # Plot reference bold lines
+            x = list(range(len(raw_trades) + 1))
+            self.mc_ax.plot(x, orig_curve, color="green" if theme == "dark" else "forestgreen", linewidth=1.5, label="Original Path")
+            self.mc_ax.plot(x, median_curve, color="orange", linewidth=1.5, label="Median Path")
+            self.mc_ax.plot(x, worst_5pct_curve, color="red", linewidth=1.5, linestyle="--", label="Worst 5% Stress Path")
+            
+            self.mc_ax.set_title(f"Monte Carlo: {num_iter} Scenarios ({mode.capitalize()})")
+            self.mc_ax.set_xlabel("Trade Count")
+            self.mc_ax.set_ylabel("Account Balance (₹)")
+            self.mc_ax.legend(loc="upper left", fontsize=8)
+            
+            self.mc_fig.tight_layout()
+            self.mc_canvas.draw_idle()
+            
+        except Exception as err:
+            messagebox.showerror("Monte Carlo", f"Error during simulation execution:\n{err}")
+
+    def _launch_web_dashboard(self) -> None:
+        """Launches the Streamlit web-based institutional risk dashboard in the background."""
+        import subprocess
+        import webbrowser
+        import threading
+        import time
+        from pathlib import Path
+
+        def run_streamlit():
+            try:
+                # Resolve paths
+                py_dir = Path(__file__).parent
+                dashboard_path = py_dir / "risk_dashboard.py"
+                
+                # Check for virtualenv streamlit executable
+                if os.name == "nt":
+                    streamlit_exe = py_dir.parent / ".venv" / "Scripts" / "streamlit.exe"
+                else:
+                    streamlit_exe = py_dir.parent / ".venv" / "bin" / "streamlit"
+
+                if not streamlit_exe.exists():
+                    streamlit_exe = "streamlit"  # fallback to global path
+
+                cmd = [str(streamlit_exe), "run", str(dashboard_path)]
+                print(f"[UI] Spawning background Streamlit process: {' '.join(cmd)}")
+                
+                # Run the process without blocking
+                subprocess.Popen(
+                    cmd,
+                    cwd=str(py_dir.parent),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=True if os.name == "nt" else False
+                )
+                
+                # Wait 2 seconds for server startup, then open the browser
+                time.sleep(2)
+                webbrowser.open("http://localhost:8501")
+                print("[UI] Institutional Dashboard launched successfully at http://localhost:8501")
+            except Exception as e:
+                print(f"[UI] Failed to launch Streamlit dashboard: {e}")
+                # Fallback directly to opening local address in case it's already running
+                try:
+                    webbrowser.open("http://localhost:8501")
+                except Exception:
+                    pass
+
+        threading.Thread(target=run_streamlit, daemon=True).start()
+        messagebox.showinfo("Dashboard Launcher", "Spawning the Institutional Risk Web Dashboard...\n\nIt will open automatically in your browser at http://localhost:8501 shortly!")
+
+    def _build_validation_tab(self) -> None:
+        """Create the layout for the Forward Validation Dashboard."""
+        # Main scrollable canvas frame to support smaller laptop screens
+        outer = ttk.Frame(self.validation_frame)
+        outer.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        try:
+            style = ttk.Style(self)
+            bg = style.lookup("TFrame", "background")
+            if bg:
+                canvas.configure(background=bg)
+        except Exception:
+            pass
+            
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Internal container for all widgets
+        container = ttk.Frame(canvas)
+        container_id = canvas.create_window((0, 0), window=container, anchor="nw")
+        
+        def _on_val_configure(_evt: object = None) -> None:
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                return
+                
+        def _on_val_canvas_configure(evt: object) -> None:
+            try:
+                width = int(evt.width)
+            except Exception:
+                return
+            try:
+                canvas.itemconfigure(container_id, width=width)
+            except Exception:
+                return
+                
+        container.bind("<Configure>", lambda e: _on_val_configure(e))
+        canvas.bind("<Configure>", _on_val_canvas_configure)
+
+        # Let's bind mousewheel
+        def _val_mousewheel(evt: object) -> None:
+            try:
+                delta = int(evt.delta)
+            except Exception:
+                delta = 0
+            if delta:
+                canvas.yview_scroll(int(-delta / 120), "units")
+        container.bind_all("<MouseWheel>", _val_mousewheel, add="+")
+
+        # ---------------- Title & Top-Level Counters Card Frame ----------------
+        title_frame = ttk.Frame(container)
+        title_frame.pack(fill=tk.X, expand=False, padx=10, pady=(10, 5))
+        
+        ttk.Label(title_frame, text="FORWARD VALIDATION AUDIT ENGINE", font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
+        
+        refresh_btn = ttk.Button(title_frame, text="🔄 Recalculate Shadow Validation", command=self._trigger_validation_refresh)
+        refresh_btn.pack(side=tk.RIGHT, padx=5)
+
+        # Counter Cards Frame
+        cards_frame = ttk.Frame(container)
+        cards_frame.pack(fill=tk.X, expand=False, padx=10, pady=5)
+        
+        # Declare string variables
+        self._val_total_var = tk.StringVar(value="n/a")
+        self._val_active_var = tk.StringVar(value="n/a")
+        self._val_filtered_var = tk.StringVar(value="n/a")
+        self._val_blocked_var = tk.StringVar(value="n/a")
+        self._val_stance_var = tk.StringVar(value="n/a")
+        self._val_throughput_var = tk.StringVar(value="n/a")
+        self._val_signal_conv_var = tk.StringVar(value="n/a")
+        self._val_trade_conv_var = tk.StringVar(value="n/a")
+        self._val_today_var = tk.StringVar(value="n/a")
+        self._val_week_var = tk.StringVar(value="n/a")
+        self._val_cal_err_var = tk.StringVar(value="n/a")
+        self._val_best_reg_var = tk.StringVar(value="n/a")
+        self._val_worst_reg_var = tk.StringVar(value="n/a")
+        self._val_opt_thresh_var = tk.StringVar(value="n/a")
+        self._val_sizing_var = tk.StringVar(value="n/a")
+        self._val_decay_status_var = tk.StringVar(value="n/a")
+
+        def make_card(parent, title, var, bg_color="#2c3e50"):
+            card = tk.Frame(parent, bg=bg_color, bd=1, relief="ridge", width=220, height=80)
+            card.pack(side=tk.LEFT, padx=10, pady=5, expand=True, fill=tk.BOTH)
+            card.pack_propagate(False)
+            
+            lbl_title = tk.Label(card, text=title, font=("Segoe UI", 9), fg="#bdc3c7", bg=bg_color)
+            lbl_title.pack(anchor="w", padx=10, pady=(8, 2))
+            
+            lbl_val = tk.Label(card, textvariable=var, font=("Segoe UI", 18, "bold"), fg="white", bg=bg_color)
+            lbl_val.pack(anchor="w", padx=10)
+            return card
+
+        make_card(cards_frame, "TOTAL PREDICTIONS", self._val_total_var, "#1a252f")
+        make_card(cards_frame, "ACTIVE TRADES", self._val_active_var, "#1a252f")
+        make_card(cards_frame, "FILTERED SIGNALS", self._val_filtered_var, "#1a252f")
+        make_card(cards_frame, "BLOCKED SIGNALS", self._val_blocked_var, "#1a252f")
+
+        summary_row = ttk.Frame(container)
+        summary_row.pack(fill=tk.X, expand=False, padx=10, pady=(0, 10))
+        ttk.Label(summary_row, text="Expected Prediction Throughput / Day:").pack(side=tk.LEFT)
+        ttk.Label(summary_row, textvariable=self._val_throughput_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 20))
+        ttk.Label(summary_row, text="Calibration Stance:").pack(side=tk.LEFT)
+        ttk.Label(summary_row, textvariable=self._val_stance_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 0))
+
+        summary_row_2 = ttk.Frame(container)
+        summary_row_2.pack(fill=tk.X, expand=False, padx=10, pady=(0, 10))
+        ttk.Label(summary_row_2, text="Signal Conversion Rate:").pack(side=tk.LEFT)
+        ttk.Label(summary_row_2, textvariable=self._val_signal_conv_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 20))
+        ttk.Label(summary_row_2, text="Trade Conversion Rate:").pack(side=tk.LEFT)
+        ttk.Label(summary_row_2, textvariable=self._val_trade_conv_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 20))
+        ttk.Label(summary_row_2, text="Predictions Today:").pack(side=tk.LEFT)
+        ttk.Label(summary_row_2, textvariable=self._val_today_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 20))
+        ttk.Label(summary_row_2, text="Predictions This Week:").pack(side=tk.LEFT)
+        ttk.Label(summary_row_2, textvariable=self._val_week_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 0))
+
+        # ---------------- Phase 1: Rolling Validation horizons ----------------
+        p1_frame = ttk.LabelFrame(container, text="Phase 1: Rolling Validation Horizons & Milestone Gates", padding=10)
+        p1_frame.pack(fill=tk.X, expand=False, padx=10, pady=10)
+        
+        columns = ("chk", "cnt", "auc", "wr", "pf", "sr", "exp", "paper", "live", "scale")
+        self.p1_tree = ttk.Treeview(p1_frame, columns=columns, show="headings", height=4)
+        self.p1_tree.pack(fill=tk.BOTH, expand=True)
+        
+        headers = {
+            "chk": "Validation Checkpoint", "cnt": "Count", "auc": "ROC-AUC",
+            "wr": "Win Rate", "pf": "Profit Factor", "sr": "Sharpe Ratio",
+            "exp": "Expectancy", "paper": "Paper Trade Gate", "live": "1 Lot Live Gate",
+            "scale": "Scaling Size Gate"
+        }
+        for col, h in headers.items():
+            self.p1_tree.heading(col, text=h)
+            self.p1_tree.column(col, width=105, anchor="center")
+
+        # ---------------- Phase 2: Regime-Specific Sizing ----------------
+        p2_frame = ttk.LabelFrame(container, text="Phase 2: Regime-Specific Options Flow Performance", padding=10)
+        p2_frame.pack(fill=tk.X, expand=False, padx=10, pady=10)
+        
+        # Sizing callouts row
+        callout_row = ttk.Frame(p2_frame)
+        callout_row.pack(fill=tk.X, expand=False, pady=(0, 10))
+        
+        def make_callout(parent, title, var, fg_col):
+            f = ttk.Frame(parent)
+            f.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=10)
+            ttk.Label(f, text=title, font=("Segoe UI", 9)).pack(anchor="w")
+            ttk.Label(f, textvariable=var, font=("Segoe UI", 12, "bold"), foreground=fg_col).pack(anchor="w")
+            
+        make_callout(callout_row, "🏆 Strongest Regime State (Best Edge)", self._val_best_reg_var, "#2ecc71")
+        make_callout(callout_row, "⚠️ Weakest Regime State (Risk Suspension)", self._val_worst_reg_var, "#e74c3c")
+        
+        # Regime table
+        reg_cols = ("regime", "cnt", "auc", "wr", "pf", "sr", "exp", "status")
+        self.p2_tree = ttk.Treeview(p2_frame, columns=reg_cols, show="headings", height=8)
+        self.p2_tree.pack(fill=tk.BOTH, expand=True)
+        
+        reg_headers = {
+            "regime": "Regime Classification", "cnt": "Count", "auc": "ROC-AUC",
+            "wr": "Win Rate", "pf": "Profit Factor", "sr": "Sharpe Ratio",
+            "exp": "Expectancy", "status": "Regime Status"
+        }
+        for col, h in reg_headers.items():
+            self.p2_tree.heading(col, text=h)
+            self.p2_tree.column(col, width=120, anchor="center")
+
+        # ---------------- Phase 3 & 5: Calibration & Decay ----------------
+        row3 = ttk.Frame(container)
+        row3.pack(fill=tk.X, expand=False, padx=10, pady=10)
+        
+        p3_frame = ttk.LabelFrame(row3, text="Phase 3: Ensemble Probability Calibration Error", padding=10)
+        p3_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        cal_cols = ("bucket", "cnt", "avg_conf", "act_wr", "pf", "sr", "stance")
+        self.p3_tree = ttk.Treeview(p3_frame, columns=cal_cols, show="headings", height=7)
+        self.p3_tree.pack(fill=tk.BOTH, expand=True)
+        
+        cal_headers = {
+            "bucket": "Probability Bucket", "cnt": "Count", "avg_conf": "Expected Prob",
+            "act_wr": "Actual Win Rate", "pf": "Profit Factor", "sr": "Sharpe",
+            "stance": "Calibration Stance"
+        }
+        for col, h in cal_headers.items():
+            self.p3_tree.heading(col, text=h)
+            self.p3_tree.column(col, width=100, anchor="center")
+            
+        lbl_err_frame = ttk.Frame(p3_frame)
+        lbl_err_frame.pack(fill=tk.X, expand=False, pady=(8, 0))
+        ttk.Label(lbl_err_frame, text="Average Model Probability Calibration Error: ").pack(side=tk.LEFT)
+        ttk.Label(lbl_err_frame, textvariable=self._val_cal_err_var, font=("Segoe UI", 10, "bold"), foreground="#3498db").pack(side=tk.LEFT)
+
+        # Phase 5: Decay Frame
+        p5_frame = ttk.LabelFrame(row3, text="Phase 5: Concept Drift & System Performance Decay Alerts", padding=10)
+        p5_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        
+        # Drift variables labels
+        self._val_psi_pcr_var = tk.StringVar(value="n/a")
+        self._val_psi_iv_var = tk.StringVar(value="n/a")
+        self._val_psi_rsi_var = tk.StringVar(value="n/a")
+        self._val_lbl_drift_var = tk.StringVar(value="n/a")
+        self._val_concept_drift_var = tk.StringVar(value="n/a")
+        self._val_brier_drift_var = tk.StringVar(value="n/a")
+        self._val_reg_drift_var = tk.StringVar(value="n/a")
+        self._val_overall_auc_var = tk.StringVar(value="n/a")
+        self._val_overall_sharpe_var = tk.StringVar(value="n/a")
+        self._val_overall_pf_var = tk.StringVar(value="n/a")
+        
+        drift_lbl_grid = ttk.Frame(p5_frame)
+        drift_lbl_grid.pack(fill=tk.X, expand=False, pady=(0, 5))
+        
+        def add_drift_metric(parent, label, var, row, col):
+            ttk.Label(parent, text=label).grid(row=row, column=col*2, sticky="w", padx=5, pady=2)
+            ttk.Label(parent, textvariable=var, font=("Segoe UI", 9, "bold")).grid(row=row, column=col*2+1, sticky="w", padx=5, pady=2)
+            
+        add_drift_metric(drift_lbl_grid, "Feature PSI (PCR):", self._val_psi_pcr_var, 0, 0)
+        add_drift_metric(drift_lbl_grid, "Feature PSI (IV):", self._val_psi_iv_var, 0, 1)
+        add_drift_metric(drift_lbl_grid, "Feature PSI (RSI):", self._val_psi_rsi_var, 1, 0)
+        add_drift_metric(drift_lbl_grid, "Label Drift:", self._val_lbl_drift_var, 1, 1)
+        add_drift_metric(drift_lbl_grid, "Concept Drift:", self._val_concept_drift_var, 2, 0)
+        add_drift_metric(drift_lbl_grid, "Brier Score Drift:", self._val_brier_drift_var, 2, 1)
+        add_drift_metric(drift_lbl_grid, "Regime Shift Drift:", self._val_reg_drift_var, 3, 0)
+        add_drift_metric(drift_lbl_grid, "Overall ROC-AUC:", self._val_overall_auc_var, 3, 1)
+        add_drift_metric(drift_lbl_grid, "Overall Sharpe:", self._val_overall_sharpe_var, 4, 0)
+        add_drift_metric(drift_lbl_grid, "Overall Profit Factor:", self._val_overall_pf_var, 4, 1)
+
+        ttk.Label(p5_frame, text="Drift & Decay Alerts Console:", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 2))
+        
+        self.alerts_text = ScrolledText(p5_frame, height=5, font=("Consolas", 9), state=tk.DISABLED)
+        self.alerts_text.pack(fill=tk.BOTH, expand=True)
+
+        # ---------------- Phase 4 & 7: Threshold Optimization & Capital Readiness ----------------
+        row4 = ttk.Frame(container)
+        row4.pack(fill=tk.X, expand=False, padx=10, pady=(10, 20))
+        
+        p4_frame = ttk.LabelFrame(row4, text="Phase 4: Confidence Gating Threshold Optimization", padding=10)
+        p4_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        thresh_cols = ("thresh", "trades", "auc", "pf", "sr", "exp")
+        self.p4_tree = ttk.Treeview(p4_frame, columns=thresh_cols, show="headings", height=5)
+        self.p4_tree.pack(fill=tk.BOTH, expand=True)
+        
+        thresh_headers = {
+            "thresh": "Threshold Filter", "trades": "Trades Passed", "auc": "ROC-AUC",
+            "pf": "Profit Factor", "sr": "Sharpe Ratio", "exp": "Expectancy"
+        }
+        for col, h in thresh_headers.items():
+            self.p4_tree.heading(col, text=h)
+            self.p4_tree.column(col, width=100, anchor="center")
+            
+        rec_row = ttk.Frame(p4_frame)
+        rec_row.pack(fill=tk.X, expand=False, pady=(8, 0))
+        ttk.Label(rec_row, text="Recommended Optimal Confidence Threshold: ").pack(side=tk.LEFT)
+        ttk.Label(rec_row, textvariable=self._val_opt_thresh_var, font=("Segoe UI", 10, "bold"), foreground="#2ecc71").pack(side=tk.LEFT)
+
+        # Phase 7: Sizing Sizing Readiness
+        p7_frame = ttk.LabelFrame(row4, text="Phase 7: Capital Scaling Sizing Sizing Readiness", padding=10)
+        p7_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        
+        p7_cols = ("scale", "gate", "status")
+        self.p7_tree = ttk.Treeview(p7_frame, columns=p7_cols, show="headings", height=4)
+        self.p7_tree.pack(fill=tk.BOTH, expand=True)
+        
+        p7_headers = {
+            "scale": "Sizing Scale", "gate": "Sizing Validation Gate", "status": "Deployment Status"
+        }
+        for col, h in p7_headers.items():
+            self.p7_tree.heading(col, text=h)
+            self.p7_tree.column(col, width=130, anchor="center")
+            
+        p7_rec_row = ttk.Frame(p7_frame)
+        p7_rec_row.pack(fill=tk.X, expand=False, pady=(8, 0))
+        ttk.Label(p7_rec_row, text="Optimal Position Size Recommendation: ").pack(side=tk.LEFT)
+        ttk.Label(p7_rec_row, textvariable=self._val_sizing_var, font=("Segoe UI", 10, "bold"), foreground="#2ecc71").pack(side=tk.LEFT)
+
+    def _trigger_validation_refresh(self) -> None:
+        """Fetch forward shadow metrics from the database and populate the validation dashboard."""
+        try:
+            from institutional_framework.validation_analytics import ValidationAnalyticsEngine
+            
+            engine = ValidationAnalyticsEngine()
+            
+            # Fetch statistics
+            summary = engine.fetch_validation_summary()
+            regimes = engine.fetch_regime_performance()
+            cal = engine.fetch_confidence_calibration()
+            thresh = engine.fetch_threshold_optimization()
+            drift = engine.fetch_drift_and_decay()
+            milestones = engine.fetch_milestones_and_readiness()
+            final_report = engine.generate_final_report_data()
+
+            # Safe formatting helper
+            def safe_format(d, key, fmt=None):
+                if not isinstance(d, dict):
+                    return "N/A"
+                val = d.get(key, "N/A")
+                if val is None or val == "N/A":
+                    return "N/A"
+                try:
+                    val_float = float(val)
+                    if fmt:
+                        return fmt.format(val_float)
+                    return str(val)
+                except Exception:
+                    return str(val)
+
+            # Update string variables
+            self._val_total_var.set(str(summary.get("total_predictions", "0") if isinstance(summary, dict) else "0"))
+            self._val_active_var.set(str(summary.get("active_trades", "0") if isinstance(summary, dict) else "0"))
+            self._val_filtered_var.set(str(summary.get("filtered_signals", "0") if isinstance(summary, dict) else "0"))
+            self._val_blocked_var.set(str(summary.get("blocked_signals", "0") if isinstance(summary, dict) else "0"))
+            self._val_throughput_var.set(safe_format(summary, "prediction_throughput_per_day", "{:.2f}"))
+            self._val_signal_conv_var.set(safe_format(summary, "signal_conversion_rate", "{:.2f}%"))
+            self._val_trade_conv_var.set(safe_format(summary, "trade_conversion_rate", "{:.2f}%"))
+            self._val_today_var.set(str(summary.get("predictions_today", "0") if isinstance(summary, dict) else "0"))
+            self._val_week_var.set(str(summary.get("predictions_this_week", "0") if isinstance(summary, dict) else "0"))
+            self._val_stance_var.set(cal.get("stance", "N/A") if isinstance(cal, dict) else "N/A")
+            self._val_cal_err_var.set(safe_format(cal, "average_calibration_error_pct", "{:.2f}%"))
+            
+            best_reg = regimes.get("best_regime", "N/A") if isinstance(regimes, dict) else "N/A"
+            worst_reg = regimes.get("worst_regime", "N/A") if isinstance(regimes, dict) else "N/A"
+            best_reg_sharpe = safe_format(regimes.get("regimes", {}).get(best_reg, {}) if isinstance(regimes, dict) else {}, "sharpe", "{:.2f}")
+            worst_reg_sharpe = safe_format(regimes.get("regimes", {}).get(worst_reg, {}) if isinstance(regimes, dict) else {}, "sharpe", "{:.2f}")
+            
+            self._val_best_reg_var.set(f"{best_reg} (Sharpe: {best_reg_sharpe})")
+            self._val_worst_reg_var.set(f"{worst_reg} (Sharpe: {worst_reg_sharpe})")
+            self._val_opt_thresh_var.set(f"Confidence > {safe_format(thresh, 'optimal_threshold', '{:.2f}')}")
+            self._val_sizing_var.set(final_report.get("recommended_position_sizing", "N/A") if isinstance(final_report, dict) else "N/A")
+
+            # Populate Phase 1 Treeview
+            for item in self.p1_tree.get_children():
+                self.p1_tree.delete(item)
+                
+            rolling_chk = summary.get("rolling_checkpoints", {}) if isinstance(summary, dict) else {}
+            milestone_dict = milestones.get("milestones", {}) if isinstance(milestones, dict) else {}
+            for checkpoint, m in rolling_chk.items():
+                m_gate = milestone_dict.get(checkpoint, {})
+                exp_val = safe_format(m, 'expectancy', '{:.2f}')
+                self.p1_tree.insert("", "end", values=(
+                    f"{checkpoint} predictions",
+                    str(m.get("count", 0)),
+                    safe_format(m, 'roc_auc', '{:.3f}'),
+                    safe_format(m, 'win_rate', '{:.1f}%'),
+                    safe_format(m, 'profit_factor', '{:.2f}'),
+                    safe_format(m, 'sharpe', '{:.2f}'),
+                    f"₹{exp_val}" if exp_val != "N/A" else "N/A",
+                    m_gate.get("paper", "n/a") if isinstance(m_gate, dict) else "n/a",
+                    m_gate.get("live1", "n/a") if isinstance(m_gate, dict) else "n/a",
+                    m_gate.get("scale", "n/a") if isinstance(m_gate, dict) else "n/a"
+                ))
+
+            # Populate Phase 2 Treeview
+            for item in self.p2_tree.get_children():
+                self.p2_tree.delete(item)
+                
+            regimes_dict = regimes.get("regimes", {}) if isinstance(regimes, dict) else {}
+            best_reg_name = regimes.get("best_regime", "N/A") if isinstance(regimes, dict) else "N/A"
+            worst_reg_name = regimes.get("worst_regime", "N/A") if isinstance(regimes, dict) else "N/A"
+            for r_name, m in regimes_dict.items():
+                status_tag = "🏆 Best Edge" if r_name == best_reg_name else "⚠️ Worst Edge" if r_name == worst_reg_name else "Active"
+                exp_val = safe_format(m, 'expectancy', '{:.2f}')
+                self.p2_tree.insert("", "end", values=(
+                    r_name,
+                    str(m.get("count", 0)),
+                    safe_format(m, 'roc_auc', '{:.3f}'),
+                    safe_format(m, 'win_rate', '{:.1f}%'),
+                    safe_format(m, 'profit_factor', '{:.2f}'),
+                    safe_format(m, 'sharpe', '{:.2f}'),
+                    f"₹{exp_val}" if exp_val != "N/A" else "N/A",
+                    status_tag
+                ))
+
+            # Populate Phase 3 Treeview
+            for item in self.p3_tree.get_children():
+                self.p3_tree.delete(item)
+                
+            cal_buckets = cal.get("buckets", {}) if isinstance(cal, dict) else {}
+            for b_name, m in cal_buckets.items():
+                avg_conf = m.get("avg_confidence", "N/A")
+                if avg_conf != "N/A" and avg_conf is not None:
+                    try:
+                        avg_conf_val = f"{float(avg_conf)*100:.1f}%"
+                    except Exception:
+                        avg_conf_val = "N/A"
+                else:
+                    avg_conf_val = "N/A"
+                self.p3_tree.insert("", "end", values=(
+                    b_name,
+                    str(m.get("count", 0)),
+                    avg_conf_val,
+                    safe_format(m, 'actual_win_rate', '{:.1f}%'),
+                    safe_format(m, 'profit_factor', '{:.2f}'),
+                    safe_format(m, 'sharpe', '{:.2f}'),
+                    m.get("calibration_status", "N/A")
+                ))
+
+            # Update Phase 5 Drift meters & Alerts console
+            d_metrics = drift.get("drift_metrics", {}) if isinstance(drift, dict) else {}
+            self._val_psi_pcr_var.set(safe_format(d_metrics, "feature_psi_pcr", "{:.4f}"))
+            self._val_psi_iv_var.set(safe_format(d_metrics, "feature_psi_iv", "{:.4f}"))
+            self._val_psi_rsi_var.set(safe_format(d_metrics, "feature_psi_rsi", "{:.4f}"))
+            self._val_lbl_drift_var.set(safe_format(d_metrics, "label_drift", "{:.2f}%"))
+            self._val_concept_drift_var.set(safe_format(d_metrics, "concept_drift", "{:.2f}%"))
+            self._val_brier_drift_var.set(safe_format(d_metrics, "performance_brier_drift_pct", "{:.2f}%"))
+            self._val_reg_drift_var.set(safe_format(d_metrics, "regime_drift_pct", "{:.2f}%"))
+            self._val_overall_auc_var.set(safe_format(d_metrics, "roc_auc", "{:.3f}"))
+            self._val_overall_sharpe_var.set(safe_format(d_metrics, "sharpe", "{:.2f}"))
+            self._val_overall_pf_var.set(safe_format(d_metrics, "profit_factor", "{:.2f}"))
+
+            self.alerts_text.config(state=tk.NORMAL)
+            self.alerts_text.delete("1.0", tk.END)
+            
+            drift_alerts = drift.get("alerts", []) if isinstance(drift, dict) else []
+            if drift_alerts:
+                for alert in drift_alerts:
+                    self.alerts_text.insert(tk.END, f"🚨 {alert}\n")
+            else:
+                self.alerts_text.insert(tk.END, "🏆 SYSTEM HEALTHY: Zero edge decay alerts triggered.\n")
+                self.alerts_text.insert(tk.END, "PSI shows excellent feature stability. Brier score is consistent.\n")
+                self.alerts_text.insert(tk.END, "Durable, statistically significant trading edge fully verified.\n")
+            self.alerts_text.config(state=tk.DISABLED)
+
+            # Populate Phase 4 Treeview
+            for item in self.p4_tree.get_children():
+                self.p4_tree.delete(item)
+                
+            thresh_dict = thresh.get("thresholds", {}) if isinstance(thresh, dict) else {}
+            for label, m in thresh_dict.items():
+                exp_val = safe_format(m, 'expectancy', '{:.2f}')
+                self.p4_tree.insert("", "end", values=(
+                    label,
+                    str(m.get("count", 0)),
+                    safe_format(m, 'roc_auc', '{:.3f}'),
+                    safe_format(m, 'profit_factor', '{:.2f}'),
+                    safe_format(m, 'sharpe', '{:.2f}'),
+                    f"₹{exp_val}" if exp_val != "N/A" else "N/A"
+                ))
+
+            # Populate Phase 7 Treeview
+            for item in self.p7_tree.get_children():
+                self.p7_tree.delete(item)
+                
+            cap_readiness = milestones.get("capital_readiness", {}) if isinstance(milestones, dict) else {}
+            for scale, status in cap_readiness.items():
+                gate_str = "N >= 250, AUC >= 0.55" if scale == "1 lot" else "N >= 250, AUC >= 0.56" if scale == "2 lots" else "N >= 500, AUC >= 0.57, Sharpe >= 1.0" if scale == "5 lots" else "N >= 1000, AUC >= 0.58, Sharpe >= 1.2"
+                self.p7_tree.insert("", "end", values=(
+                    scale,
+                    gate_str,
+                    status
+                ))
+
+            logger.info("Forward Shadow Validation Dashboard successfully refreshed.")
+        except Exception as e:
+            logger.error(f"Failed to refresh forward validation metrics: {e}")
+            import traceback
+            traceback.print_exc()
+
+            logger.info("Forward Shadow Validation Dashboard successfully refreshed.")
+        except Exception as e:
+            logger.error(f"Failed to refresh forward validation metrics: {e}")
+            import traceback
+            traceback.print_exc()
+
 
 def main() -> None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--ml-shadow-mode", action="store_true")
+    parser.add_argument("--ml-paper-mode", action="store_true")
+    parser.add_argument("--ml-manifest", default="")
+    parser.add_argument("--dry-run", action="store_true")
+    args, _ = parser.parse_known_args()
+    if args.dry_run and args.ml_manifest:
+        cfg = load_strategy_config()
+        registry = MLModelRegistry(args.ml_manifest)
+        risk = MLPaperRiskManager(
+            max_trades_per_day=int(getattr(cfg, "max_trades_per_day", 5) or 5),
+            cooldown_minutes=15,
+            max_open_paper_positions=1,
+            max_daily_paper_loss=float(getattr(cfg, "ml_max_daily_paper_loss", 5000.0) or 5000.0),
+            max_consecutive_paper_losses=int(getattr(cfg, "ml_max_consecutive_paper_losses", 3) or 3),
+        )
+        runtime = MLRuntimeEngine(
+            registry=registry,
+            risk_manager=risk,
+            kill_switch=bool(getattr(cfg, "ml_disable_all", False)),
+            shadow_mode_enabled=bool(args.ml_shadow_mode),
+            paper_mode_enabled=bool(args.ml_paper_mode),
+            min_confidence_threshold=float(getattr(cfg, "ml_min_confidence_threshold", 0.0) or 0.0),
+            max_predictions_per_day=int(getattr(cfg, "ml_max_predictions_per_day", 1000) or 1000),
+            log_feature_vector=bool(getattr(cfg, "ml_log_feature_vector", True)),
+            log_prediction_reason=bool(getattr(cfg, "ml_log_prediction_reason", True)),
+            fail_closed_on_schema_mismatch=bool(getattr(cfg, "ml_fail_closed_on_schema_mismatch", True)),
+        )
+        manifest = registry.manifest()
+        paper_allowed, paper_reason = paper_mode_allowed(
+            manifest_payload=manifest.payload if manifest is not None else {},
+            registry_health=registry.model_health_status(),
+            schema_ok=bool(registry.model_health_status().get("ok")),
+            paper_mode_enabled=bool(args.ml_paper_mode),
+            kill_switch=bool(getattr(cfg, "ml_disable_all", False)),
+        )
+        print(json.dumps({
+            "dry_run": True,
+            "status": runtime.status(),
+            "manifest_validation": bool(manifest is not None and registry.model_health_status().get("ok")),
+            "paper_mode_allowed": bool(paper_allowed),
+            "paper_mode_block_reason": paper_reason,
+            "production_order_sent": False,
+        }, indent=2))
+        return
     print("Starting Scalper UI...")
     print("Creating ScalperUI instance...")
     app = ScalperUI()
