@@ -25,26 +25,59 @@ except Exception:  # noqa: BLE001
     ZoneInfo = None  # type: ignore[assignment]
 
 
-if ZoneInfo is not None:
-    try:
+IST: Optional[object] = None
+_TZ_AVAILABLE: bool = False
+
+# Set _TZ_AVAILABLE at module load time — BEFORE any other imports that might
+# fail. This ensures the flag reflects timezone-availability state accurately
+# regardless of whether later imports (candlestick_patterns, etc.) succeed.
+try:
+    if ZoneInfo is not None:
         IST = ZoneInfo("Asia/Kolkata")
-    except Exception:
-        IST = None
-elif pytz is not None:
-    try:
+        _TZ_AVAILABLE = True
+    elif pytz is not None:
         IST = pytz.timezone("Asia/Kolkata")
-    except Exception:
-        IST = None
-else:
+        _TZ_AVAILABLE = True
+    else:
+        _TZ_AVAILABLE = False
+except Exception as exc:
+    # If timezone loading fails, log explicitly and leave IST = None.
+    # _TZ_AVAILABLE stays False so is_market_open() returns False (fail-closed).
+    import sys
+    print(f"[TIMEZONE ERROR] Failed to load Asia/Kolkata timezone: {exc}", file=sys.stderr)
+    _TZ_AVAILABLE = False
+
+# Guard: if we set IST successfully but the flag is somehow still False, correct it.
+if IST is not None:
+    _TZ_AVAILABLE = True
+
+# Guard: if neither zoneinfo nor pytz is available at all, log and ensure fail-closed.
+if ZoneInfo is None and pytz is None:
+    _TZ_AVAILABLE = False
     IST = None
 
 
 def is_market_open() -> bool:
-    if IST is None:
-        # Fallback: assume open to avoid hard-blocking if tz support is missing.
-        now = dt_datetime.now().time()
-    else:
-        now = dt_datetime.now(IST).time()
+    """Return True only during IST 09:15–15:30; fail-closed if timezone unavailable.
+
+    Safety rules:
+    - Never use local (wall-clock) time as a proxy for IST.
+    - If neither ZoneInfo nor pytz can resolve Asia/Kolkata, return False
+      so the system does not trade outside intended hours.
+    """
+    if not _TZ_AVAILABLE or IST is None:
+        # Fail-closed: block trading when we cannot determine IST correctly.
+        # Do NOT fall back to local wall-clock time — that would incorrectly
+        # treat e.g. midnight IST-equivalent hours as "market open".
+        import sys
+        print(
+            "[TIMEZONE SAFETY] Cannot determine IST; is_market_open() returning False "
+            "(fail-closed). _TZ_AVAILABLE=False. Restore timezone support to enable "
+            "market-hours gating.",
+            file=sys.stderr,
+        )
+        return False
+    now = dt_datetime.now(IST).time()
     return dt_time(9, 15) <= now <= dt_time(15, 30)
 
 from candlestick_patterns import (
@@ -170,7 +203,7 @@ class TradeState:
 @dataclass(frozen=True)
 class TradeLogEvent:
     ts: float
-    event: str  # "OPEN" | "UPDATE" | "CLOSE" | "PARTIAL_CLOSE"
+    event: str  # "OPEN" | "UPDATE" | "CLOSE" | "PARTIAL_CLOSE" | "SKIP"
     trade_id: str
     position_type: str  # "multi" | "directional"
     name: str
@@ -180,6 +213,7 @@ class TradeLogEvent:
     reason: Optional[str] = None
     margin_required: Optional[float] = None
     # ---- paper-journal validation fields ----
+    timestamp: Optional[str] = None  # ISO timestamp of event
     symbol: Optional[str] = None  # e.g. "NIFTY" (root, derived from legs)
     strike: Optional[float] = None  # ATM strike at entry
     option_type: Optional[str] = None  # "CE" | "PE"
@@ -189,7 +223,7 @@ class TradeLogEvent:
     ask: Optional[float] = None  # best ask at entry/exit
     ltp: Optional[float] = None  # last traded price at entry/exit
     execution_price: Optional[float] = None  # actual price used
-    execution_price_source: Optional[str] = None  # "ask" | "bid" | "ltp_fallback"
+    execution_price_source: Optional[str] = None  # "ask" | "bid" | "ltp_fallback" | "missing_bid_ask"
     entry_price: Optional[float] = None
     exit_price: Optional[float] = None
     gross_pnl: Optional[float] = None  # before costs
@@ -199,8 +233,15 @@ class TradeLogEvent:
     brokerage_cost: Optional[float] = None  # brokerage + taxes + fees in rupees
     exit_reason: Optional[str] = None  # stop_loss | target_hit | time_exit | eod_squareoff | gpt_override
     risk_filter_decisions: Optional[Dict[str, Any]] = None  # dict of what filters passed/failed
-    realized_slippage_pct: Optional[float] = None
+    realized_slippage_pct: Optional[float] = None  # slippage / notional_value
     paper_mode: bool = True  # True for simulated fills; False for live
+    # ---- additional required journal fields ----
+    skip_reason: Optional[str] = None  # why trade was skipped (for SKIP events)
+    spread_pct_at_entry: Optional[float] = None  # spread / mid at entry
+    spread_pct_at_exit: Optional[float] = None  # spread / mid at exit
+    filter_premium_ok: Optional[bool] = None
+    filter_spread_ok: Optional[bool] = None
+    filter_bid_ask_ok: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -664,8 +705,12 @@ class NiftyScalper:
                 )
 
                 # If GPT is enabled, optionally ask GPT to approve/deny the proposed trade.
+                # GPT_MARKET_COMMENTARY_ENABLED (default False) gates all GPT commentary calls.
+                # When False, GPT 402 errors cannot block ML trading since no GPT calls are made.
                 try:
-                    if bool(getattr(self.cfg, "gpt_enable", False)) and bool(getattr(self.cfg, "gpt_auto_select", True)):
+                    if (bool(getattr(self.cfg, "gpt_enable", False))
+                        and bool(getattr(self.cfg, "gpt_auto_select", True))
+                        and bool(getattr(self.cfg, "gpt_market_commentary_enabled", False))):
                         # AUTO mode should still give GPT a chance to originate a trade.
                         # Otherwise GPT can only veto trades that a local gate already accepted.
                         consult_gpt = bool(take) or bool(getattr(self.cfg, "gpt_require_recommendation", False))
@@ -783,8 +828,18 @@ class NiftyScalper:
                                     take = True
                                     reason = f"gpt_take:{getattr(parsed, 'reason', '') or ''}"
                                 else:
-                                    # UNKNOWN: if GPT recommendation is required, block; else keep prior decision
-                                    if bool(getattr(self.cfg, "gpt_require_recommendation", False)):
+                                    # UNKNOWN: if GPT recommendation is required, block; else keep prior decision.
+                                    # HTTP 402 from GPT provider MUST NOT block ML trading. Treat as non-blocking
+                                    # (log warning, preserve prior take/reason decision).
+                                    gpt_reason = str(getattr(parsed, "reason", "") or "").strip().lower()
+                                    if gpt_reason.startswith("http 402:"):
+                                        try:
+                                            print(f"[GPT ADVISOR] HTTP 402 received — GPT commentary unavailable, continuing without it")
+                                        except Exception:
+                                            pass
+                                        # HTTP 402 must not set prediction probability to 0 or block shadow/paper.
+                                        # Keep the prior `take` and `reason` (ml_gate / technical_fallback) intact.
+                                    elif bool(getattr(self.cfg, "gpt_require_recommendation", False)):
                                         take = False
                                         reason = f"gpt_unknown:{getattr(parsed, 'reason', '') or ''}"
                             else:
@@ -1110,6 +1165,31 @@ class NiftyScalper:
                 )
                 if ask_raw is None:
                     print(f"[PAPER][BLOCKED] {name}: ask price unavailable for {resolved_symbol} — bid/ask required for paper realism")
+                    if self._has_event_sink():
+                        try:
+                            self._emit(TradeLogEvent(
+                                ts=time.time(),
+                                event="SKIP",
+                                trade_id=self._new_trade_id("D"),
+                                position_type="directional",
+                                name=str(name),
+                                legs=[],
+                                skip_reason="ask_price_unavailable",
+                                symbol=self.cfg.underlying,
+                                strike=float(atm_strike),
+                                option_type=option_type,
+                                side="BUY",
+                                quantity=int(size),
+                                bid=float(bid_raw) if bid_raw is not None else None,
+                                ask=None,
+                                ltp=float(price),
+                                execution_price=None,
+                                execution_price_source="missing_bid_ask",
+                                filter_bid_ask_ok=False,
+                                paper_mode=True,
+                            ))
+                        except Exception:
+                            pass
                     return None
                 paper_entry_price = float(ask_raw)
                 paper_spread_cost = 0.0
@@ -1155,9 +1235,43 @@ class NiftyScalper:
                         "entry_price": paper_entry_price,
                     }
                 ]
+                # Compute spread_pct_at_entry from bid/ask mid
+                _spread_pct_entry = 0.0
+                try:
+                    _mid = (float(bid_raw) + paper_entry_price) / 2.0 if bid_raw is not None and float(bid_raw) > 0 else paper_entry_price
+                    if _mid > 0:
+                        _spread_pct_entry = abs(paper_entry_price - float(bid_raw)) / _mid * 100.0
+                except Exception:
+                    pass
+
                 ok, filter_reason = self._check_entry_leg_premiums(paper_legs)
                 if not ok:
                     print(f"[PAPER][BLOCKED] {name}: premium filter rejected — {filter_reason}")
+                    if self._has_event_sink():
+                        try:
+                            self._emit(TradeLogEvent(
+                                ts=time.time(),
+                                event="SKIP",
+                                trade_id=self._new_trade_id("D"),
+                                position_type="directional",
+                                name=str(name),
+                                legs=[],
+                                skip_reason=str(filter_reason or "premium_filter_rejected"),
+                                symbol=self.cfg.underlying,
+                                strike=float(atm_strike),
+                                option_type=option_type,
+                                side="BUY",
+                                quantity=int(size),
+                                bid=float(bid_raw) if bid_raw is not None else None,
+                                ask=float(ask_raw) if ask_raw is not None else None,
+                                ltp=float(price),
+                                execution_price=float(paper_entry_price),
+                                execution_price_source="ask",
+                                filter_premium_ok=False,
+                                paper_mode=True,
+                            ))
+                        except Exception:
+                            pass
                     return None
 
                 print(f"[PAPER][AUTO] {name}: side=BUY size={size} price={paper_entry_price} (ask) reason={reason}")
@@ -1179,6 +1293,7 @@ class NiftyScalper:
                     "total_entry_cost": float(_entry_total_cost),
                     "realized_slippage_pct": float(_entry_slippage_pct),
                     "execution_price_source": "ask",
+                    "spread_pct_at_entry": float(_spread_pct_entry),
                     "execution_friction_status": str(friction_preview.get("status") or ""),
                 }
                 if prediction_id:
@@ -1476,6 +1591,20 @@ class NiftyScalper:
         if v is None:
             return bool(default)
         return str(v).strip().lower() in {"1", "true", "yes", "y"}
+
+    def _kill_switch_active(self) -> bool:
+        """Check external kill-switch env vars at runtime.
+
+        Returns True if either MSTOCK_KILL_SWITCH or SCALPER_KILL_SWITCH
+        is set to a truthy value, which blocks all new entries and live orders.
+        """
+        if self._bool_env("MSTOCK_KILL_SWITCH", False):
+            LOGGER.warning("[KILL_SWITCH] MSTOCK_KILL_SWITCH is active — blocking all entries and live orders")
+            return True
+        if self._bool_env("SCALPER_KILL_SWITCH", False):
+            LOGGER.warning("[KILL_SWITCH] SCALPER_KILL_SWITCH is active — blocking all entries and live orders")
+            return True
+        return False
 
     def _debug_delta_hedge(self) -> bool:
         return self._bool_env("MSTOCK_DEBUG_DELTA_HEDGE", False)
@@ -2293,6 +2422,9 @@ class NiftyScalper:
         return side_exit, qty_exit
 
     def _equity_place_order(self, symbol: str, side: str, qty: int, *, horizon: Optional[str] = None) -> None:
+        if self._kill_switch_active():
+            LOGGER.warning("[KILL_SWITCH] Equity order blocked: %s %s x%d", side, symbol, qty)
+            return
         if qty <= 0:
             return
         sym_norm = self._normalize_equity_symbol(symbol)
@@ -3917,6 +4049,9 @@ class NiftyScalper:
             return
 
     def _place_order_with_retry(self, **kwargs: object) -> Order:
+        if self._kill_switch_active():
+            raise RuntimeError("[KILL_SWITCH] Active — live orders blocked")
+
         attempts = 1
         delay = 0.0
         try:
@@ -5418,6 +5553,15 @@ class NiftyScalper:
                 return False, reason
             return True, ""
 
+        # Fall back to min_option_premium when entry_min_option_premium is disabled.
+        # This ensures the global min_option_premium safeguard is not bypassed.
+        try:
+            min_option_fallback = float(getattr(self.cfg, "min_option_premium", 0.0) or 0.0)
+        except Exception:
+            min_option_fallback = 0.0
+        if min_p <= 0 and min_option_fallback > 0:
+            min_p = min_option_fallback
+
         total_abs = 0.0
         for leg in legs:
             if not isinstance(leg, dict):
@@ -5563,10 +5707,61 @@ class NiftyScalper:
             if max_pct > 0:
                 mid = (float(ask) + float(bid)) / 2.0
                 if mid > 0:
-                    pct = (spread / mid) * 100.0
-                    if pct > max_pct * 100.0:
-                        return False, f"Spread too wide for {symbol} ({pct:.2f}% > {max_pct * 100.0:.2f}%)"
+                    pct = spread / mid  # fraction, e.g. 0.005 for 0.5%
+                    if pct > max_pct:
+                        return False, f"Spread too wide for {symbol} ({pct*100:.2f}% > {max_pct*100:.2f}%)"
 
+        return True, ""
+
+    def _check_exit_liquidity(self, legs: List[Dict[str, object]]) -> tuple[bool, str]:
+        """Check exit-time liquidity filters (bid/ask spread guard for closing trades).
+
+        Wider spreads are tolerated at exit vs. entry because you must close the
+        position.  Defaults: require_bid_ask=True, max_spread_pct=3.0%, max_abs=₹8.
+        """
+        try:
+            require_ba = bool(getattr(self.cfg, "exit_require_bid_ask", True))
+        except Exception:
+            require_ba = True
+        try:
+            max_pct = float(getattr(self.cfg, "exit_max_bid_ask_spread_pct", 3.0) or 3.0)
+        except Exception:
+            max_pct = 3.0
+        try:
+            max_abs = float(getattr(self.cfg, "exit_max_bid_ask_spread_abs", 8.0) or 8.0)
+        except Exception:
+            max_abs = 8.0
+
+        # If all guards are disabled, skip broker calls
+        if max_pct <= 0 and max_abs <= 0 and not require_ba:
+            return True, ""
+
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            symbol = str(leg.get("symbol") or "")
+            if not symbol:
+                continue
+            exchange = str(leg.get("exchange") or "") or None
+            tok = str(leg.get("token") or "").strip()
+            quote_key = tok if (tok.isdigit() and int(tok) > 0) else symbol
+            bid, ask, _ = self.client.get_bid_ask(quote_key, exchange_hint=exchange)
+            if require_ba and (bid is None or ask is None):
+                return False, f"Bid/ask unavailable for {symbol}"
+            if bid is None or ask is None:
+                continue
+            try:
+                spread = abs(float(ask) - float(bid))
+            except Exception:
+                continue
+            if max_abs > 0 and spread > max_abs:
+                return False, f"Exit spread too wide for {symbol} ({spread:.2f} > {max_abs:.2f})"
+            if max_pct > 0:
+                mid = (float(ask) + float(bid)) / 2.0
+                if mid > 0:
+                    pct = (spread / mid) * 100.0
+                    if pct > max_pct:
+                        return False, f"Exit spread too wide for {symbol} ({pct:.2f}% > {max_pct:.2f}%)"
         return True, ""
 
     def _session_bucket(self, now_t: dt_time) -> str:
@@ -5838,7 +6033,11 @@ class NiftyScalper:
         return pv / vol
 
     def _gpt_should_apply_now(self, *, is_paper: bool) -> bool:
+        # gpt_market_commentary_enabled (default False) must gate all GPT commentary calls.
+        # When False, no GPT calls are made and therefore HTTP 402 cannot block ML trading.
         try:
+            if not bool(getattr(self.cfg, "gpt_market_commentary_enabled", False)):
+                return False
             if not bool(getattr(self.cfg, "gpt_enabled", getattr(self.cfg, "gpt_enable", False))):
                 return False
         except Exception:
@@ -6303,6 +6502,58 @@ class NiftyScalper:
                 return "leg_target"
         return None
 
+    def _get_paper_exit_price(
+        self,
+        symbol: str,
+        exchange: Optional[str],
+        leg_side: str,
+        qty: int,
+        *,
+        is_entry_side_buy: bool,
+    ) -> Tuple[Optional[float], float]:
+        """Return (paper_exit_price, spread_deduct) for a paper-mode leg exit.
+
+        Realistic paper pricing:
+        - Closing a BUY (long) leg → we SELL → use bid (buyer's price)
+        - Closing a SELL (short) leg → we BUY → use ask (seller's price)
+
+        Uses cfg.paper_allow_ltp_fallback when bid/ask is unavailable.
+
+        Returns (None, 0.0) when bid/ask is missing and LTP fallback is disabled.
+        """
+        spread_deduct: float = 0.0
+        use_bid_ask = bool(getattr(self.cfg, "paper_use_bid_ask_execution", True))
+        allow_ltp_fallback = bool(getattr(self.cfg, "paper_allow_ltp_fallback", False))
+        ltp_fallback_penalty = float(getattr(self.cfg, "paper_ltp_fallback_spread_pct", 0.05) or 0.05)
+
+        if not use_bid_ask:
+            # Fall back to LTP
+            ltp_val = self._try_get_ltp_for_leg({"symbol": symbol, "exchange": exchange})
+            return (ltp_val, 0.0) if ltp_val else (None, 0.0)
+
+        bid_raw, ask_raw, ltp_raw = self.client.get_bid_ask(symbol, exchange_hint=exchange)
+
+        if is_entry_side_buy:
+            # Closing BUY position = we SELL → receive bid
+            if bid_raw is None:
+                if allow_ltp_fallback and ltp_raw is not None:
+                    return (float(ltp_raw) * (1.0 - ltp_fallback_penalty), 0.0)
+                return (None, 0.0)
+            exit_price = float(bid_raw)
+            if ask_raw is not None:
+                spread_deduct = float((float(ask_raw) - float(bid_raw)) * float(qty))
+        else:
+            # Closing SELL position = we BUY → pay ask
+            if ask_raw is None:
+                if allow_ltp_fallback and ltp_raw is not None:
+                    return (float(ltp_raw) * (1.0 + ltp_fallback_penalty), 0.0)
+                return (None, 0.0)
+            exit_price = float(ask_raw)
+            if bid_raw is not None:
+                spread_deduct = float((float(ask_raw) - float(bid_raw)) * float(qty))
+
+        return (exit_price, spread_deduct)
+
     def _close_single_leg(self, *, trade: Dict[str, object], leg: Dict[str, object], position_type: str, reason: str) -> float:
         """Close exactly one leg (best-effort). Returns realized P&L for that leg."""
         symbol = str(leg.get("symbol") or "")
@@ -6424,7 +6675,7 @@ class NiftyScalper:
                     reason=str(reason or ""),
                     gross_pnl=float(gross_pnl),
                     net_pnl=float(realized),
-                    exit_price_source=price_source if not self.cfg.enable_live_trading else "ltp",
+                    execution_price_source=price_source if not self.cfg.enable_live_trading else "ltp",
                     spread_cost=paper_spread_deduct,  # logged for audit (embedded, not double-deducted)
                     slippage_cost=total_slippage,
                     brokerage_cost=total_brokerage,
@@ -7225,7 +7476,15 @@ class NiftyScalper:
                 reason.startswith("http 504:")
                 or "timed out" in reason
                 or "connection timed out" in reason
+                or reason.startswith("http 402:")
             ):
+                # HTTP 402 (Payment Required) from GPT provider must not block
+                # ML trading. Treated identically to timeout: return None so the
+                # calling gate allows the trade to proceed.
+                try:
+                    print(f"[GPT CONTROL] HTTP 402 / timeout in advise_trade reason={reason[:120]}")
+                except Exception:
+                    pass
                 return None
             return adv
         except Exception:
@@ -7593,6 +7852,9 @@ class NiftyScalper:
         self._auto_gpt_directional_steps = None
 
         try:
+            # gpt_market_commentary_enabled (default False) gates GPT market commentary.
+            if not bool(getattr(self.cfg, "gpt_market_commentary_enabled", False)):
+                return None
             if not bool(getattr(self.cfg, "gpt_enabled", getattr(self.cfg, "gpt_enable", False))):
                 return None
             if not bool(getattr(self.cfg, "use_gpt_market_analysis", False)):
@@ -7992,7 +8254,16 @@ class NiftyScalper:
         entry_price = None
         price_source = "ltp"
         if use_bid_ask and not self.cfg.enable_live_trading:
-            bid_raw, ask_raw, _ = self.client.get_bid_ask(symbol, exchange_hint=exchange)
+            # First attempt: fetch FULL quote directly with token to get depth/bid-ask.
+            # This avoids symbol->token resolution failures that LTP-mode has.
+            quote_data = self.client.fetch_option_quote_for_paper(exchange, token, symbol)
+            bid_raw = quote_data.get("bid_price")
+            ask_raw = quote_data.get("ask_price")
+
+            # Fallback to get_bid_ask if FULL quote returned no depth
+            if bid_raw is None and ask_raw is None:
+                bid_raw, ask_raw, _ = self.client.get_bid_ask(symbol, exchange_hint=exchange)
+
             if entry_side == "BUY":
                 # Long entry: pay ask (you are the buyer paying seller's ask)
                 if ask_raw is None:
@@ -8209,7 +8480,7 @@ class NiftyScalper:
         try:
             if not self.cfg.enable_live_trading:
                 meta["live_bid_ask_spread_pct"] = float(friction_preview.get("relative_spread_pct") or 0.0)
-                meta["realized_slippage_pct"] = 0.0
+                meta["realized_slippage_pct"] = float(getattr(self.cfg, "paper_slippage_pct", 0.001) or 0.001)
                 meta["execution_friction_status"] = str(friction_preview.get("status") or "")
                 meta["execution_price_source"] = str(price_source)
             else:
@@ -8275,6 +8546,26 @@ class NiftyScalper:
                     name=name,
                     legs=legs,
                     mtm=self._compute_legs_mtm(legs),
+                    timestamp=dt_datetime.now(IST).isoformat() if IST else dt_datetime.now().isoformat(),
+                    symbol=self.cfg.underlying,
+                    strike=float(atm_strike),
+                    option_type=option_type,
+                    side="BUY",
+                    quantity=int(size),
+                    bid=float(bid_raw) if bid_raw is not None else None,
+                    ask=float(ask_raw) if ask_raw is not None else None,
+                    ltp=float(price),
+                    execution_price=float(paper_entry_price),
+                    execution_price_source="ask",
+                    entry_price=float(paper_entry_price),
+                    spread_cost=float(paper_spread_cost),
+                    slippage_cost=float(_entry_slippage_cost),
+                    brokerage_cost=float(_entry_brokerage_cost),
+                    realized_slippage_pct=float(_entry_slippage_pct),
+                    spread_pct_at_entry=float(_spread_pct_entry),
+                    filter_premium_ok=True,
+                    filter_bid_ask_ok=True,
+                    paper_mode=True,
                 )
             )
 
@@ -10923,6 +11214,13 @@ class NiftyScalper:
         if not isinstance(legs, list):
             return 0.0
 
+        # Apply exit liquidity filter before closing any leg.
+        # Block the entire exit if any leg fails the spread/bid-ask guard.
+        ok, filter_reason = self._check_exit_liquidity(legs)
+        if not ok:
+            print(f"[PAPER][BLOCKED] Exit {trade.get('name', '?')}: liquidity filter rejected — {filter_reason}")
+            return 0.0
+
         realized = 0.0
 
         def opposite(side: str) -> str:
@@ -10940,19 +11238,55 @@ class NiftyScalper:
                 continue
 
             if not self.cfg.enable_live_trading:
-                print(f"[PAPER] Close leg: {opposite(side)} {symbol} x{qty}")
-
+                # Paper mode: use bid/ask for realistic exit pricing.
+                # - Closing BUY leg (we SELL) → use bid (what buyer pays)
+                # - Closing SELL leg (we BUY)  → use ask (what seller asks)
+                paper_exit_price: Optional[float] = None
+                paper_spread_deduct: float = 0.0
+                leg_side = side.upper()
+                close_action = opposite(side)  # our closing action
+                if close_action == "SELL":
+                    # Closing a BUY (long) position → we sell → receive bid
+                    paper_exit_price, paper_spread_deduct = self._get_paper_exit_price(
+                        symbol, exchange, leg_side, qty, is_entry_side_buy=True
+                    )
+                else:
+                    # Closing a SELL (short) position → we buy → pay ask
+                    paper_exit_price, paper_spread_deduct = self._get_paper_exit_price(
+                        symbol, exchange, leg_side, qty, is_entry_side_buy=False
+                    )
+                if paper_exit_price is None or paper_exit_price <= 0.0:
+                    print(f"[PAPER][BLOCKED] Close leg {symbol}: exit price unavailable — bid/ask required")
+                    continue
+                print(f"[PAPER] Close leg: {close_action} {symbol} x{qty} @ {paper_exit_price:.2f} ({'bid' if close_action == 'SELL' else 'ask'})")
                 entry = leg.get("entry_price")
                 try:
                     entry_f = float(entry) if entry is not None else None
                 except Exception:
                     entry_f = None
-                cur = self._try_get_ltp_for_leg(leg)
+                cur = paper_exit_price
                 # Store exit price for UI display.
                 leg["exit_price"] = cur
+                leg["execution_price_source"] = "bid" if close_action == "SELL" else "ask"
                 if entry_f is not None and cur is not None and side.upper() in {"BUY", "SELL"}:
                     sign = 1.0 if side.upper() == "BUY" else -1.0
-                    realized += (float(cur) - float(entry_f)) * sign * float(qty)
+                    gross_pnl = (float(cur) - float(entry_f)) * sign * float(qty)
+                    # Spread cost already embedded in bid/ask execution price.
+                    # Deduct only slippage + brokerage via paper cost model.
+                    try:
+                        from cost_model import estimate_paper_execution_costs
+                        _exit_costs = estimate_paper_execution_costs(
+                            execution_price=float(cur),
+                            quantity=int(qty),
+                            slippage_pct=float(getattr(self.cfg, "paper_slippage_pct", 0.001) or 0.001),
+                            extra_market_impact_pct=float(getattr(self.cfg, "paper_extra_market_impact_pct", 0.0) or 0.0),
+                            apply_brokerage=bool(getattr(self.cfg, "paper_apply_brokerage_costs", True)),
+                            cost_model_source=str(getattr(self.cfg, "paper_cost_model_source", "cost_model_assumptions") or "cost_model_assumptions"),
+                            side=close_action,
+                        )
+                        realized += gross_pnl - float(_exit_costs.get("slippage_cost", 0.0)) - float(_exit_costs.get("total_brokerage_charges", 0.0))
+                    except Exception:
+                        realized += gross_pnl
                 continue
 
             try:
@@ -12691,13 +13025,18 @@ class NiftyScalper:
         - Candlestick patterns on the underlying
         - Delta of ATM options from the option chain
         """
+        def block(reason: str) -> None:
+            self._note_entry_blocked(reason)
+
         # P4: Check if entries are paused by regime monitor
         if getattr(self, "_entries_paused", False):
             block("entries_paused_by_gpt_regime")
             return
 
-        def block(reason: str) -> None:
-            self._note_entry_blocked(reason)
+        # External kill-switch: block all new entries when active.
+        if self._kill_switch_active():
+            block("kill_switch_active")
+            return
 
         attempted_auto_strategies_set = {
             self._resolve_auto_strategy_candidate(name)
@@ -16421,23 +16760,35 @@ class NiftyScalper:
                 print("Stop requested. Exiting scalper loop.")
                 break
 
-            # External env-var kill switch: SCALPER_KILL_SWITCH=true instantly halts
-            # all new entries and safely exits all open positions. No code change
-            # required — purely env-driven and works even mid-loop.
+            # External env-var kill switch: MSTOCK_KILL_SWITCH or SCALPER_KILL_SWITCH
+            # instantly halts all new entries and safely exits all open positions.
             try:
-                kill_raw = os.getenv("SCALPER_KILL_SWITCH", "").strip().lower()
-                if kill_raw in {"1", "true", "yes"}:
+                if self._kill_switch_active():
+                    ks_reason = "MSTOCK_KILL_SWITCH" if self._bool_env("MSTOCK_KILL_SWITCH", False) else "SCALPER_KILL_SWITCH"
                     print(
-                        "[KILL_SWITCH] SCALPER_KILL_SWITCH=true detected — "
+                        f"[KILL_SWITCH] {ks_reason} active — "
                         "blocking all entries and exiting open positions."
                     )
                     try:
-                        self._safe_exit_all_positions(
-                            reason="SCALPER_KILL_SWITCH"
-                        )
+                        self._safe_exit_all_positions(reason=ks_reason)
                     except Exception as exc_kill:
                         print(f"[KILL_SWITCH] Error during safe exit: {exc_kill}")
                     break
+            except Exception:
+                pass
+
+            # External env-var paper-force: SCALPER_FORCE_PAPER=true forces paper mode
+            # regardless of cfg.enable_live_trading. Checked every iteration so that
+            # even a mid-session toggle takes effect without a restart.
+            try:
+                force_paper_raw = os.getenv("SCALPER_FORCE_PAPER", "").strip().lower()
+                if force_paper_raw in {"1", "true", "yes"}:
+                    if self.cfg.enable_live_trading:
+                        print(
+                            "[SCALPER_FORCE_PAPER] SCALPER_FORCE_PAPER=true detected — "
+                            "overriding enable_live_trading=True and forcing paper mode."
+                        )
+                    self.cfg.enable_live_trading = False
             except Exception:
                 pass
 

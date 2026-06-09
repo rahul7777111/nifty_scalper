@@ -3206,6 +3206,132 @@ class MStockTypeBClient:
         )
         return (None, None, None)
 
+    def fetch_option_quote_for_paper(
+        self,
+        exchange: str,
+        token: str,
+        tradingsymbol: str,
+    ) -> dict:
+        """Fetch FULL quote for an option contract and extract bid/ask.
+
+        Returns a dict with keys:
+          bid_price, ask_price, bid_qty, ask_qty, ltp, quote_timestamp,
+          _raw_payload (for debug logging).
+
+        When bid/ask are None, logs ALL available keys from the broker
+        response at DEBUG level so operators can see exactly what the
+        broker returned for this token.
+
+        Returns empty dict on any error (never raises). Paper engine
+        will remain blocked if bid/ask are absent.
+        """
+        import logging
+        import time
+        _log = logging.getLogger(__name__)
+
+        def _as_float(v: object) -> Optional[float]:
+            try:
+                if v is None:
+                    return None
+                return float(v)
+            except Exception:
+                return None
+
+        result = {
+            "bid_price": None,
+            "ask_price": None,
+            "bid_qty": None,
+            "ask_qty": None,
+            "ltp": None,
+            "quote_timestamp": time.time(),
+            "_raw_payload": None,   # only populated when bid/ask missing (debug)
+        }
+
+        try:
+            quote_payloads = [{exchange.upper(): [str(token)]}]
+            response = self._raw.get_market_quote("FULL", quote_payloads)
+            data = self._safe_json(response, context="fetch_option_quote_for_paper")
+        except Exception as exc:
+            _log.debug(
+                "[PAPER][QUOTE] fetch_option_quote_for_paper(%s, %s, %s) failed: %s",
+                exchange, token, tradingsymbol, exc,
+            )
+            return result
+
+        # Walk response to find the row matching this token
+        found_row = {}
+
+        def _walk(obj):
+            if isinstance(obj, dict):
+                tok = (
+                    obj.get("token") or obj.get("instrumentToken")
+                    or obj.get("symbolToken") or obj.get("instrument_token")
+                )
+                if tok and str(tok).strip() == str(token).strip():
+                    nonlocal found_row
+                    found_row = obj
+                    return
+                for child in obj.values():
+                    if isinstance(child, (dict, list)):
+                        _walk(child)
+            elif isinstance(obj, list):
+                for item in obj:
+                    if isinstance(item, (dict, list)):
+                        _walk(item)
+
+        _walk(data)
+
+        if not found_row:
+            _log.debug(
+                "[PAPER][QUOTE] Token %s not found in FULL quote response for %s",
+                token, tradingsymbol,
+            )
+            return result
+
+        bid, ask, bid_qty, ask_qty = self.extract_bid_ask(found_row)
+        ltp = (
+            _as_float(found_row.get("ltp") or found_row.get("lastPrice")
+                      or found_row.get("lastTradedPrice"))
+        )
+
+        result["bid_price"] = bid
+        result["ask_price"] = ask
+        result["bid_qty"] = bid_qty
+        result["ask_qty"] = ask_qty
+        result["ltp"] = ltp
+
+        if bid is None or ask is None:
+            # Log full payload keys for operator debugging
+            available_keys = [k for k in found_row.keys() if k not in ("raw", "_raw")]
+            depth = found_row.get("depth") or found_row.get("marketDepth")
+            if isinstance(depth, dict):
+                for k in depth.keys():
+                    if k not in available_keys:
+                        available_keys.append(f"depth.{k}")
+                for side in ("buy", "sell", "bids", "asks"):
+                    arr = depth.get(side)
+                    if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                        for k in arr[0].keys():
+                            ns = f"depth.{side}[0].{k}"
+                            if ns not in available_keys:
+                                available_keys.append(ns)
+            _log.debug(
+                "[PAPER][QUOTE] bid/ask missing for %s token=%s exchange=%s. "
+                "Available keys: %s. depth type=%s. This is a BROKER DATA limitation. "
+                "PAPER WILL REMAIN BLOCKED until broker provides depth for this contract.",
+                tradingsymbol, token, exchange,
+                sorted(available_keys),
+                type(depth).__name__ if depth is not None else "None",
+            )
+            result["_raw_payload"] = available_keys  # store for caller logging
+        else:
+            _log.debug(
+                "[PAPER][QUOTE] bid=%s ask=%s for %s token=%s exchange=%s",
+                bid, ask, tradingsymbol, token, exchange,
+            )
+
+        return result
+
     def get_option_chain(self, underlying: str) -> List[Dict[str, Any]]:
         """Return option chain for the given underlying using SDK endpoints.
 

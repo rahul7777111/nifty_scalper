@@ -235,3 +235,141 @@ def test_malformed_depth():
     bid, ask, _, _ = ea(payload)
     assert bid == 10.0
     assert ask == 11.0
+
+
+# =====================================================================
+# fetch_option_quote_for_paper tests
+# =====================================================================
+
+def _make_mock_client(full_quote_response: dict):
+    """Build a minimal mock MStockTypeBClient with a pre-set FULL quote response."""
+    class MockRaw:
+        def get_market_quote(self, mode, payloads):
+            return MagicMock()
+
+    class MockClient(MStockTypeBClient):
+        def __init__(self):
+            # Skip parent __init__ which needs API credentials
+            self._raw = MockRaw()
+            self._full_quote_resp = full_quote_response
+
+        def _safe_json(self, response, context=""):
+            return self._full_quote_resp
+
+    return MockClient()
+
+
+from unittest.mock import MagicMock
+
+
+def test_fetch_option_quote_with_bid_ask():
+    """When FULL quote contains bid/ask, those values are returned."""
+    resp = {
+        "data": {
+            "fetched": [{
+                "token": "42300",
+                "symbol": "NIFTY2660923500CE",
+                "bid_price": 145.50,
+                "ask_price": 147.25,
+                "bid_qty": 150,
+                "ask_qty": 150,
+                "ltp": 146.50,
+            }]
+        }
+    }
+    client = _make_mock_client(resp)
+    result = client.fetch_option_quote_for_paper("NFO", "42300", "NIFTY2660923500CE")
+    assert result["bid_price"] == 145.50
+    assert result["ask_price"] == 147.25
+    assert result["bid_qty"] == 150
+    assert result["ask_qty"] == 150
+    assert result["ltp"] == 146.50
+    assert result["_raw_payload"] is None  # populated only on failure
+
+
+def test_fetch_option_quote_with_best_bid_ask():
+    """best_bid_price / best_ask_price variants are extracted correctly."""
+    resp = {"data": {"fetched": [{
+            "token": "42300",
+            "best_bid_price": 88.0,
+            "best_ask_price": 89.5,
+            "ltp": 88.75,
+        }]}}
+    client = _make_mock_client(resp)
+    result = client.fetch_option_quote_for_paper("NFO", "42300", "NIFTY26600CE")
+    assert result["bid_price"] == 88.0
+    assert result["ask_price"] == 89.5
+
+
+def test_fetch_option_quote_with_depth():
+    """depth.buy[0].price / depth.sell[0].price are extracted correctly."""
+    resp = {"data": {"fetched": [{
+            "token": "42300",
+            "depth": {
+                "buy": [{"price": 145.0, "quantity": 600}],
+                "sell": [{"price": 147.0, "quantity": 600}],
+            },
+            "ltp": 146.0,
+        }]}}
+    client = _make_mock_client(resp)
+    result = client.fetch_option_quote_for_paper("NFO", "42300", "NIFTY26600CE")
+    assert result["bid_price"] == 145.0
+    assert result["ask_price"] == 147.0
+    assert result["bid_qty"] == 600
+
+
+def test_fetch_option_quote_with_market_depth():
+    """marketDepth.buy[0].price variant is extracted correctly."""
+    resp = {"data": {"fetched": [{
+            "token": "42300",
+            "marketDepth": {
+                "buy": [{"price": 145.25, "quantity": 750}],
+                "sell": [{"price": 147.05, "quantity": 750}],
+            },
+        }]}}
+    client = _make_mock_client(resp)
+    result = client.fetch_option_quote_for_paper("NFO", "42300", "NIFTY26600CE")
+    assert result["bid_price"] == 145.25
+    assert result["ask_price"] == 147.05
+
+
+def test_fetch_option_quote_ltp_only_blocks():
+    """When FULL quote has only LTP (no bid/ask), result has None bid/ask."""
+    resp = {"data": {"fetched": [{
+            "token": "42300",
+            "ltp": 146.50,
+            "depth": {},
+        }]}}
+    client = _make_mock_client(resp)
+    result = client.fetch_option_quote_for_paper("NFO", "42300", "NIFTY26600CE")
+    assert result["bid_price"] is None
+    assert result["ask_price"] is None
+    assert result["ltp"] == 146.50
+
+
+def test_fetch_option_quote_fetch_failure_returns_empty():
+    """If get_market_quote throws, result has None bid/ask (no crash)."""
+    class MockRaw:
+        def get_market_quote(self, mode, payloads):
+            raise RuntimeError("Network error")
+
+    class MockClient(MStockTypeBClient):
+        def __init__(self):
+            self._raw = MockRaw()
+
+        def _safe_json(self, response, context=""):
+            raise RuntimeError("JSON parse error")
+
+    client = MockClient()
+    result = client.fetch_option_quote_for_paper("NFO", "42300", "NIFTY26600CE")
+    assert result["bid_price"] is None
+    assert result["ask_price"] is None
+
+
+def test_fetch_option_quote_token_not_in_response():
+    """If token not found in response, returns None bid/ask."""
+    resp = {"data": {"fetched": [{"token": "99999", "ltp": 100.0}]}}
+    client = _make_mock_client(resp)
+    result = client.fetch_option_quote_for_paper("NFO", "42300", "NIFTY26600CE")
+    assert result["bid_price"] is None
+    assert result["ask_price"] is None
