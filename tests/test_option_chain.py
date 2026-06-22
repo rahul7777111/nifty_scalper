@@ -1,6 +1,7 @@
 import os
 import sys
 from datetime import date
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.getcwd(), "src"))
 
@@ -99,3 +100,23 @@ def test_parse_strike_bucket_ce_pe_objects():
     assert tokens == {"111", "222"}
     strikes = {float(r.get("strike") or 0) for r in chain}
     assert strikes == {26200.0}
+
+
+def test_get_scripmaster_falls_back_to_local_instrument_csv(monkeypatch, tmp_path):
+    csv_path = tmp_path / "instrument (2).csv"
+    csv_path.write_text(
+        "Exch,Token,Underlying,Expiry,Strike,OptionType,TradingSymbol,LotSize\n"
+        "NFO,12345,NIFTY,16-06-2026,23500,CE,NIFTY16JUN2623500CE,65\n",
+        encoding="utf-8",
+    )
+
+    client = MStockTypeBClient(SimpleNamespace(api_key="test"))
+    client._load_instruments = lambda: []
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MSTOCK_SCRIPMASTER_PATH", str(tmp_path / "missing.csv"))
+
+    sm = client._get_scripmaster()
+
+    assert sm is not None
+    assert Path(sm.csv_path) == csv_path

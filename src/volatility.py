@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Iterable, List, Optional
 
+import logging
 import math
 
 try:
@@ -18,10 +19,24 @@ try:
 except Exception:  # pragma: no cover - best-effort imports
     np = None
 
-try:
-    from arch import arch_model  # type: ignore[import-not-found]
-except Exception:
-    arch_model = None
+LOGGER = logging.getLogger(__name__)
+_ARCH_MODEL = None
+_ARCH_IMPORT_ATTEMPTED = False
+
+
+def _get_arch_model():
+    """Import arch lazily so UI startup does not block on scipy initialization."""
+    global _ARCH_MODEL, _ARCH_IMPORT_ATTEMPTED
+    if _ARCH_IMPORT_ATTEMPTED:
+        return _ARCH_MODEL
+    _ARCH_IMPORT_ATTEMPTED = True
+    try:
+        from arch import arch_model as _arch_model  # type: ignore[import-not-found]
+        _ARCH_MODEL = _arch_model
+    except Exception as exc:
+        LOGGER.debug("arch import unavailable, using EWMA fallback: %s", exc)
+        _ARCH_MODEL = None
+    return _ARCH_MODEL
 
 
 def _ewma_vol(series: Iterable[float], span: int = 20) -> float:
@@ -49,6 +64,7 @@ def fit_garch(returns: List[float], p: int = 1, q: int = 1, disp: bool = False) 
 
     Returns the fitted model object when `arch` is available, otherwise None.
     """
+    arch_model = _get_arch_model()
     if arch_model is None:
         return None
     try:
@@ -68,7 +84,8 @@ def forecast_volatility(returns: List[float], horizon: int = 1, span: int = 20) 
     Strategy code should call this to get a volatility estimate (same units
     as input returns). When GARCH is available we use it; otherwise EWMA.
     """
-    if arch_model is not None and len(returns) >= 50:
+    arch_model = _get_arch_model() if len(returns) >= 50 else None
+    if arch_model is not None:
         try:
             res = fit_garch(returns)
             if res is not None:
@@ -213,8 +230,7 @@ def svi_fit(log_moneyness: list, total_variance: list, initial_guess: dict = Non
     except ImportError:
         return _svi_fit_fallback(log_moneyness, total_variance)
     except Exception as e:
-        logger = logging.getLogger(__name__)
-        logger.warning(f"SVI fit failed: {e}")
+        LOGGER.warning("SVI fit failed: %s", e)
         return _svi_fit_fallback(log_moneyness, total_variance)
 
 

@@ -1,0 +1,74 @@
+{
+  "version": "1.0",
+  "description": "Fixed approved dynamic preset policy for shadow and paper-forward modes",
+  "hard_caps": {
+    "real_trading_enabled_mutable_by_ml": false,
+    "broker_place_order_allowed_mutable_by_ml": false,
+    "kill_switch_mutable_by_ml": false,
+    "max_daily_loss_mutable_by_ml": false,
+    "production_model_mutable_by_ml": false,
+    "live_mode_dynamic_presets_allowed": false
+  },
+  "preset_order": ["BLOCK", "OBSERVE_ONLY", "CONSERVATIVE", "NORMAL", "AGGRESSIVE_SHADOW_ONLY"],
+  "presets": {
+    "BLOCK": {
+      "trade_allowed": false,
+      "paper_trade_allowed": false,
+      "shadow_log_allowed": true,
+      "reason_required": true,
+      "effective_threshold_adjustment": null,
+      "max_trades_per_day": 0,
+      "max_open_positions": 0,
+      "spread_limit_tier": null,
+      "description": "Full block — no trades, log only, reason required"
+    },
+    "OBSERVE_ONLY": {
+      "trade_allowed": false,
+      "paper_trade_allowed": false,
+      "shadow_log_allowed": true,
+      "reason_required": true,
+      "effective_threshold_adjustment": null,
+      "max_trades_per_day": 0,
+      "max_open_positions": 0,
+      "spread_limit_tier": null,
+      "description": "Signal interesting but not tradable — log only"
+    },
+    "CONSERVATIVE": {
+      "trade_allowed": false,
+      "paper_trade_allowed": true,
+      "shadow_log_allowed": true,
+      "reason_required": false,
+      "effective_threshold_adjustment": 0.05,
+      "max_trades_per_day": 1,
+      "max_open_positions": 1,
+      "spread_limit_tier": "tight",
+      "feature_coverage_minimum": 0.97,
+      "description": "Paper only, +0.05 threshold bump, max 1 trade/day, tighter spread limit"
+    },
+    "NORMAL": {
+      "trade_allowed": false,
+      "paper_trade_allowed": true,
+      "shadow_log_allowed": true,
+      "reason_required": false,
+      "effective_threshold_adjustment": 0.0,
+      "max_trades_per_day": 3,
+      "max_open_positions": 1,
+      "spread_limit_tier": "normal",
+      "feature_coverage_minimum": 0.95,
+      "description": "Paper only, base threshold, max 3 trades/day"
+    },
+    "AGGRESSIVE_SHADOW_ONLY": {
+      "trade_allowed": false,
+      "paper_trade_allowed": false,
+      "shadow_log_allowed": true,
+      "reason_required": false,
+      "effective_threshold_adjustment": -0.03,
+      "max_trades_per_day": 5,
+      "max_open_positions": 2,
+      "spread_limit_tier": "wide",
+      "feature_coverage_minimum": 0.93,
+      "allowed_modes": ["shadow"],
+      "description": "Shadow-logged only, -0.03 threshold max, NEVER paper or live"
+    }
+  }
+}

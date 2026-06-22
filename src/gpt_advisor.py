@@ -14,6 +14,7 @@ from decimal import Decimal
 from dataclasses import dataclass
 from dataclasses import field, asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import threading
 
 
 def _decode_env_value(raw: str) -> str:
@@ -527,7 +528,7 @@ def _is_reasoning_model(model: str) -> bool:
     return any(p in m for p in reasoning_patterns)
 
 
-def analyze_market(
+def _analyze_market_raw(
     *,
     snapshot: Dict[str, Any],
     model: str,
@@ -694,7 +695,7 @@ def _urllib_post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any]
         return 0, str(e)
 
 
-def advise_trade(
+def _advise_trade_raw(
     *,
     proposal: Dict[str, Any],
     model: str,
@@ -775,3 +776,216 @@ def advise_trade(
     except Exception:
         pass
     return parsed
+
+
+class GPTCircuitBreaker:
+    def __init__(self, max_failures: int = 3, cooldown_seconds: float = 600.0):
+        self.max_failures = max_failures
+        self.cooldown_seconds = cooldown_seconds
+        self.failure_count = 0
+        self.disabled_until = 0.0
+        self._lock = threading.Lock()
+
+    def record_success(self):
+        with self._lock:
+            self.failure_count = 0
+
+    def record_failure(self):
+        with self._lock:
+            self.failure_count += 1
+            if self.failure_count >= self.max_failures:
+                self.disabled_until = time.time() + self.cooldown_seconds
+                print(f"[GPTCircuitBreaker] Circuit open! Disabling GPT for 10 minutes.")
+
+    def is_available(self) -> bool:
+        with self._lock:
+            now = time.time()
+            if now < self.disabled_until:
+                return False
+            if self.disabled_until > 0.0:
+                self.disabled_until = 0.0
+                self.failure_count = 0
+            return True
+
+
+circuit_breaker = GPTCircuitBreaker()
+
+_cached_market_analysis: Optional[GPTMarketAnalysis] = None
+_cached_trade_advice: Optional[GPTAdvice] = None
+_gpt_session_disabled = False
+_gpt_session_disable_reason = ""
+_gpt_session_lock = threading.Lock()
+
+
+def disable_gpt_for_session(reason: str) -> None:
+    global _gpt_session_disabled, _gpt_session_disable_reason
+    with _gpt_session_lock:
+        _gpt_session_disabled = True
+        _gpt_session_disable_reason = str(reason or "GPT disabled for session")
+    try:
+        print(f"[GPT] Disabled for session: {_gpt_session_disable_reason}")
+    except Exception:
+        pass
+    try:
+        _notify_ui("gpt_disabled", {"reason": _gpt_session_disable_reason})
+    except Exception:
+        pass
+
+
+def is_gpt_disabled_for_session() -> bool:
+    with _gpt_session_lock:
+        return bool(_gpt_session_disabled)
+
+
+def gpt_disabled_reason() -> str:
+    with _gpt_session_lock:
+        return str(_gpt_session_disable_reason or "GPT disabled for session")
+
+
+def _update_gpt_latency_metric(latency_sec: float) -> None:
+    try:
+        import performance_monitor
+
+        performance_monitor.update_gpt_latency(float(latency_sec))
+    except Exception:
+        pass
+
+
+def _execute_with_retries(
+    *,
+    call_fn: Callable[[], Any],
+    is_success_fn: Callable[[Any], bool],
+    fallback_fn: Callable[[str], Any],
+    cached_result: Optional[Any],
+    timeout_sec: float,
+    max_retries: int = 2,
+) -> Any:
+    effective_timeout = max(0.5, min(float(timeout_sec or 5.0), 5.0))
+    if is_gpt_disabled_for_session():
+        return cached_result or fallback_fn(gpt_disabled_reason())
+    if not circuit_breaker.is_available():
+        print("[GPTCircuitBreaker] Circuit is open. Returning cached fallback.")
+        return cached_result or fallback_fn("GPT disabled due to circuit breaker")
+
+    result_box: Dict[str, Any] = {"result": None, "reason": "Request timed out"}
+
+    def worker() -> None:
+        last_reason = "Request timed out"
+        for attempt in range(max(0, int(max_retries)) + 1):
+            try:
+                result = call_fn()
+                if is_success_fn(result):
+                    result_box["result"] = result
+                    result_box["reason"] = ""
+                    return
+                last_reason = str(getattr(result, "reason", "") or "Unknown GPT response")
+                if last_reason.lower().startswith("http 402:"):
+                    result_box["result"] = result
+                    result_box["reason"] = last_reason
+                    return
+            except Exception as exc:
+                last_reason = str(exc)
+            if attempt < max_retries:
+                time.sleep(0.5)
+        result_box["reason"] = last_reason or "Request timed out"
+
+    started = time.perf_counter()
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout=effective_timeout + 0.5)
+    _update_gpt_latency_metric(time.perf_counter() - started)
+
+    result = result_box.get("result")
+    if result is not None and is_success_fn(result):
+        circuit_breaker.record_success()
+        return result
+
+    failure_reason = str(result_box.get("reason") or "Request timed out")
+    if failure_reason.lower().startswith("http 402:"):
+        disable_gpt_for_session("HTTP 402 from GPT provider")
+        return cached_result or fallback_fn(gpt_disabled_reason())
+
+    circuit_breaker.record_failure()
+    return cached_result or fallback_fn(failure_reason)
+
+
+def analyze_market(
+    *,
+    snapshot: Dict[str, Any],
+    model: str,
+    api_key: str,
+    base_url: Optional[str] = None,
+    timeout_sec: float = 5.0,
+    temperature: float = 0.0,
+    max_tokens: int = 1000,
+    http_post: Optional["HttpPost"] = None,
+) -> GPTMarketAnalysis:
+    global _cached_market_analysis
+
+    result = _execute_with_retries(
+        call_fn=lambda: _analyze_market_raw(
+            snapshot=snapshot,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            timeout_sec=min(float(timeout_sec or 5.0), 5.0),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            http_post=http_post,
+        ),
+        is_success_fn=lambda res: bool(res) and getattr(res, "ce_pe_bias", "UNKNOWN") != "UNKNOWN" and "HTTP 504" not in str(getattr(res, "reason", "") or "") and "timed out" not in str(getattr(res, "reason", "") or "").lower(),
+        fallback_fn=lambda reason: GPTMarketAnalysis(
+            ce_pe_bias="NEUTRAL",
+            reason=reason,
+            confidence=0.0,
+            raw_text='{"ce_pe_bias":"NEUTRAL","reason":"fallback"}',
+        ),
+        cached_result=_cached_market_analysis,
+        timeout_sec=timeout_sec,
+        max_retries=2,
+    )
+    if getattr(result, "ce_pe_bias", "UNKNOWN") != "UNKNOWN" and "disabled due to circuit breaker" not in str(getattr(result, "reason", "") or "").lower():
+        _cached_market_analysis = result
+    return result
+
+
+def advise_trade(
+    *,
+    proposal: Dict[str, Any],
+    model: str,
+    api_key: str,
+    base_url: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    timeout_sec: float = 5.0,
+    temperature: float = 0.0,
+    max_tokens: int = 500,
+    http_post: Optional[HttpPost] = None,
+) -> GPTAdvice:
+    global _cached_trade_advice
+
+    result = _execute_with_retries(
+        call_fn=lambda: _advise_trade_raw(
+            proposal=proposal,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            system_prompt=system_prompt,
+            timeout_sec=min(float(timeout_sec or 5.0), 5.0),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            http_post=http_post,
+        ),
+        is_success_fn=lambda res: bool(res) and getattr(res, "decision", "UNKNOWN") != "UNKNOWN" and "HTTP 504" not in str(getattr(res, "reason", "") or "") and "timed out" not in str(getattr(res, "reason", "") or "").lower(),
+        fallback_fn=lambda reason: GPTAdvice(
+            decision="SKIP",
+            reason=reason,
+            confidence=0.0,
+            raw_text='{"decision":"SKIP","reason":"fallback"}',
+        ),
+        cached_result=_cached_trade_advice,
+        timeout_sec=timeout_sec,
+        max_retries=2,
+    )
+    if getattr(result, "decision", "UNKNOWN") != "UNKNOWN" and "disabled due to circuit breaker" not in str(getattr(result, "reason", "") or "").lower():
+        _cached_trade_advice = result
+    return result

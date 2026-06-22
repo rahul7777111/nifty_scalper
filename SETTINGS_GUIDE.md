@@ -255,3 +255,13 @@ These settings directly control **how selective** the directional entry logic is
 | **ATR spike x** | `MSTOCK_ATR_SPIKE_MULT` | Kill-switch: Close all trades if volatility suddenly spikes (flash crash protection). |
 | **Bypass weekly filter**| `MSTOCK_BYPASS_WEEKLY_FILTER`| Allows trading monthly or far-dated expiries for debugging. |
 | **No signal log** | `MSTOCK_DEBUG_NO_SIGNAL` | If enabled, logs why a signal was *not* generated every polling interval. |
+
+---
+
+## 9. Testing Commands
+
+| Command | Description |
+| :--- | :--- |
+| `pytest -q -m real_dataset tests/test_real_dataset_retrain_integration.py` | Run real-dataset integration test (requires ~719MB dataset, 405k rows). NON-default test - skipped in normal runs. |
+| `python -m pytest -q` | Run full test suite |
+| `pytest -q -m real_dataset tests/test_real_dataset_retrain_integration.py::test_real_dataset_core_retrain_summary_written` | Run specific real-dataset test |

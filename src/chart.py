@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import os
+import time
 
 import tkinter as tk
 from matplotlib.collections import LineCollection, PolyCollection, PathCollection
@@ -28,6 +29,304 @@ if not hasattr(PolyCollection, "get_verts"):
     def _get_verts_compat(self):
         return [path.vertices for path in self.get_paths()]
     PolyCollection.get_verts = _get_verts_compat
+
+
+_EPOCH_MIN = 946684800.0   # 2000-01-01 UTC
+_EPOCH_MAX = 4102444800.0  # 2100-01-01 UTC
+_MPL_DATE_MIN = float(mdates.date2num(datetime(2000, 1, 1)))
+_MPL_DATE_MAX = float(mdates.date2num(datetime(2100, 1, 1)))
+_NIFTY_Y_MIN = 0.01
+_NIFTY_Y_MAX = 100_000.0
+_CHART_SKIP_LOG_TS: dict[str, float] = {}
+_CHART_SKIP_LOG_INTERVAL_SEC = 10.0
+
+
+def _is_finite_number(x: Any) -> bool:
+    try:
+        f = float(x)
+        return bool(np.isfinite(f))
+    except Exception:
+        return False
+
+
+def _safe_float(x: Any, default: float | None = None) -> float | None:
+    try:
+        f = float(x)
+        if not np.isfinite(f):
+            return default
+        return f
+    except Exception:
+        return default
+
+
+def _safe_mpl_date(x: Any, default: float | None = None) -> float | None:
+    """Return a matplotlib date number or None when invalid."""
+    f = _safe_float(x)
+    if f is None:
+        return default
+    # Unix seconds/ms/ns accidentally passed as x.
+    if abs(f) >= 1e8:
+        epoch = _normalize_epoch_seconds(f)
+        if epoch is None:
+            _log_chart_data_skip("safe_mpl_date", "x", x, None, "unix_epoch_not_mpl_date")
+            return default
+        try:
+            f = float(mdates.date2num(datetime.fromtimestamp(epoch)))
+        except Exception:
+            _log_chart_data_skip("safe_mpl_date", "x", x, None, "epoch_to_mpl_failed")
+            return default
+    if not (_MPL_DATE_MIN <= f <= _MPL_DATE_MAX):
+        _log_chart_data_skip("safe_mpl_date", "x", x, None, "out_of_mpl_date_range")
+        return default
+    return f
+
+
+def _valid_chart_y(
+    y: Any,
+    *,
+    near: float | None = None,
+    rsi: bool = False,
+    allow_negative: bool = False,
+) -> bool:
+    f = _safe_float(y)
+    if f is None or not np.isfinite(f) or abs(f) > 1e9:
+        return False
+    if rsi:
+        return 0.0 <= f <= 100.0
+    if allow_negative:
+        if abs(f) > _NIFTY_Y_MAX:
+            return False
+    elif f <= 0 or f < _NIFTY_Y_MIN or f > _NIFTY_Y_MAX:
+        return False
+    if near is not None:
+        ref = _safe_float(near)
+        if ref is not None and ((allow_negative and abs(ref) > 0) or (not allow_negative and ref > 0)):
+            lhs = abs(f) if allow_negative else f
+            rhs = abs(ref) if allow_negative else ref
+            ratio = max(lhs, rhs) / max(min(lhs, rhs), 1e-9)
+            if ratio > 50.0:
+                return False
+    return True
+
+
+def _valid_chart_xy(x: Any, y: Any, *, near_y: float | None = None, allow_negative: bool = False) -> bool:
+    xf = _safe_mpl_date(x)
+    if xf is None:
+        return False
+    return _valid_chart_y(y, near=near_y, allow_negative=allow_negative)
+
+
+def _log_chart_data_skip(source: str, field: str, x: Any, y: Any, reason: str) -> None:
+    key = f"{source}:{field}:{reason}"
+    now = time.time()
+    last = float(_CHART_SKIP_LOG_TS.get(key, 0.0) or 0.0)
+    if (now - last) < _CHART_SKIP_LOG_INTERVAL_SEC:
+        return
+    _CHART_SKIP_LOG_TS[key] = now
+    print(
+        f"[CHART-DATA-SKIP] source={source} field={field} x={x} y={y} reason={reason}",
+        flush=True,
+    )
+
+
+def _finite_plot_coord(value: Any) -> bool:
+    f = _safe_float(value)
+    return f is not None and abs(f) < 1e12
+
+
+def _normalize_epoch_seconds(value: Any) -> float | None:
+    """Normalize unix seconds/ms/ns to seconds; reject absurd epochs."""
+    try:
+        f = float(value)
+        if not np.isfinite(f):
+            return None
+        if f > 1e18:
+            f = f / 1e9
+        elif f > 1e14:
+            f = f / 1e6
+        elif f > 1e11:
+            f = f / 1000.0
+        if f < _EPOCH_MIN or f > _EPOCH_MAX:
+            return None
+        return f
+    except Exception:
+        return None
+
+
+def _valid_price(value: Any) -> float | None:
+    f = _safe_float(value)
+    if f is None or f <= 0 or f > 1e9:
+        return None
+    return f
+
+
+def _valid_level_price(value: Any, *, near: float | None = None) -> float | None:
+    f = _valid_price(value)
+    if f is None:
+        return None
+    if not _valid_chart_y(f, near=near):
+        _log_chart_data_skip("level_price", "y", None, value, "out_of_sane_range")
+        return None
+    return f
+
+
+def _valid_mpl_date_x(value: Any) -> bool:
+    return _safe_mpl_date(value) is not None
+
+
+def _filter_xy_pairs(
+    xs: list[Any],
+    ys: list[Any],
+    *,
+    source: str,
+    near_y: float | None = None,
+    allow_negative: bool = False,
+) -> tuple[list[float], list[float]]:
+    out_x: list[float] = []
+    out_y: list[float] = []
+    for x, y in zip(xs, ys):
+        xf = _safe_mpl_date(x)
+        yf = _safe_float(y)
+        if xf is None:
+            _log_chart_data_skip(source, "x", x, y, "invalid_x")
+            continue
+        if yf is None or not _valid_chart_y(yf, near=near_y, allow_negative=allow_negative):
+            _log_chart_data_skip(source, "y", x, y, "invalid_y")
+            continue
+        out_x.append(xf)
+        out_y.append(yf)
+    return out_x, out_y
+
+
+def _safe_plot(
+    ax: Any,
+    x: Any,
+    y: Any,
+    *args: Any,
+    source: str = "plot",
+    allow_negative: bool = False,
+    **kwargs: Any,
+) -> Any:
+    xs_in = list(x) if hasattr(x, "__iter__") and not isinstance(x, (str, bytes)) else [x]
+    ys_in = list(y) if hasattr(y, "__iter__") and not isinstance(y, (str, bytes)) else [y]
+    near = _safe_float(ys_in[-1]) if ys_in else None
+    xs, ys = _filter_xy_pairs(xs_in, ys_in, source=source, near_y=near, allow_negative=allow_negative)
+    if not xs or not ys:
+        return None
+    try:
+        return ax.plot(xs, ys, *args, **kwargs)
+    except Exception as exc:
+        _log_chart_data_skip(source, "plot", xs[:1], ys[:1], f"plot_failed:{type(exc).__name__}")
+        return None
+
+
+def _safe_scatter(
+    ax: Any,
+    x: Any,
+    y: Any,
+    *args: Any,
+    source: str = "scatter",
+    allow_negative: bool = False,
+    **kwargs: Any,
+) -> Any:
+    xs_in = list(x) if hasattr(x, "__iter__") and not isinstance(x, (str, bytes)) else [x]
+    ys_in = list(y) if hasattr(y, "__iter__") and not isinstance(y, (str, bytes)) else [y]
+    near = _safe_float(ys_in[-1]) if ys_in else None
+    xs, ys = _filter_xy_pairs(xs_in, ys_in, source=source, near_y=near, allow_negative=allow_negative)
+    if not xs or not ys:
+        return None
+    try:
+        return ax.scatter(xs, ys, *args, **kwargs)
+    except Exception as exc:
+        _log_chart_data_skip(source, "scatter", xs[:1], ys[:1], f"scatter_failed:{type(exc).__name__}")
+        return None
+
+
+def _safe_axvline(ax: Any, x: Any, *args: Any, source: str = "axvline", **kwargs: Any) -> Any:
+    xf = _safe_mpl_date(x)
+    if xf is None:
+        _log_chart_data_skip(source, "x", x, None, "invalid_x")
+        return None
+    try:
+        return ax.axvline(xf, *args, **kwargs)
+    except Exception as exc:
+        _log_chart_data_skip(source, "x", x, None, f"axvline_failed:{type(exc).__name__}")
+        return None
+
+
+def _safe_axhline(ax: Any, y: Any, *args: Any, source: str = "axhline", **kwargs: Any) -> Any:
+    yf = _safe_float(y)
+    allow_negative = bool(kwargs.pop("_allow_negative", False))
+    if yf is None or not _valid_chart_y(yf, allow_negative=allow_negative):
+        _log_chart_data_skip(source, "y", None, y, "invalid_y")
+        return None
+    try:
+        return ax.axhline(yf, *args, **kwargs)
+    except Exception as exc:
+        _log_chart_data_skip(source, "y", None, y, f"axhline_failed:{type(exc).__name__}")
+        return None
+
+
+def _safe_annotate(ax: Any, text: str, xy: Any, *args: Any, source: str = "annotate", **kwargs: Any) -> Any:
+    try:
+        x_raw, y_raw = xy[0], xy[1]
+    except Exception:
+        _log_chart_data_skip(source, "xy", xy, None, "bad_xy_tuple")
+        return None
+    near = _safe_float(y_raw)
+    allow_negative = bool(kwargs.pop("_allow_negative", False))
+    if not _valid_chart_xy(x_raw, y_raw, near_y=near, allow_negative=allow_negative):
+        _log_chart_data_skip(source, "xy", x_raw, y_raw, "invalid_xy")
+        return None
+    xytext = kwargs.get("xytext")
+    if xytext is not None:
+        try:
+            xt_raw, yt_raw = xytext[0], xytext[1]
+            if str(kwargs.get("textcoords", "data")).lower() in {"data", "offset points", "offset pixels"}:
+                if not _valid_chart_xy(xt_raw, yt_raw, near_y=near, allow_negative=allow_negative):
+                    _log_chart_data_skip(source, "xytext", xt_raw, yt_raw, "invalid_xytext")
+                    return None
+        except Exception:
+            _log_chart_data_skip(source, "xytext", xytext, None, "bad_xytext_tuple")
+            return None
+    try:
+        xf = _safe_mpl_date(x_raw)
+        yf = _safe_float(y_raw)
+        return ax.annotate(text, (xf, yf), *args, **kwargs)
+    except Exception as exc:
+        _log_chart_data_skip(source, "annotate", x_raw, y_raw, f"annotate_failed:{type(exc).__name__}")
+        return None
+
+
+_tight_layout_done: dict[int, bool] = {}
+
+
+def _axis_tick_labels(ax: Any) -> list[Any]:
+    labels: list[Any] = []
+    for getter_name in ("get_xticklabels", "get_yticklabels"):
+        getter = getattr(ax, getter_name, None)
+        if callable(getter):
+            try:
+                labels.extend(list(getter() or []))
+            except Exception:
+                continue
+    return labels
+
+
+def _safe_tight_layout(fig, *, force: bool = False) -> None:
+    """Apply tight_layout at most once per figure unless forced."""
+    fid = id(fig)
+    if not force and _tight_layout_done.get(fid):
+        return
+    try:
+        fig.tight_layout()
+        _tight_layout_done[fid] = True
+    except Exception:
+        try:
+            fig.subplots_adjust(left=0.08, right=0.95, top=0.92, bottom=0.12)
+            _tight_layout_done[fid] = True
+        except Exception:
+            pass
 
 
 @dataclass
@@ -94,6 +393,10 @@ class LiveChartPlugin:
 
         self._candles: list[Any] = []
         self._raw_candles: list[Any] = []
+        self._last_candle_batch_key: tuple[int, str] | None = None
+        self._last_candle_ts_key: str | None = None
+        self._overlay_last_render_ts: float = 0.0
+        self._overlay_refresh_sec: float = 3.0
         self._marks: list[_TradeMark] = []
         self._focus_trade_id: Optional[str] = None
         self._active_trade: Optional[dict[str, Any]] = None
@@ -113,6 +416,19 @@ class LiveChartPlugin:
         # [CHART] Batch-update flag — suppresses intermediate _render() calls
         # so callers can make multiple state changes with a single final render.
         self._batch_updates: bool = False
+        # [STOP-BOT] Paused flag to stop renders while preserving visible candles
+        self._paused: bool = False
+        # [CHART] Throttle + UI-thread render scheduling
+        self._render_pending: bool = False
+        self._render_after_id = None
+        self._last_render_ts: float = 0.0
+        self._render_throttle_sec: float = 0.25
+        self._last_render_xs: list[float] = []
+        self._last_render_closes: list[float] = []
+        self._last_render_opens: list[float] = []
+        self._last_render_highs: list[float] = []
+        self._last_render_lows: list[float] = []
+        self._advanced_overlays_disabled: bool = False
 
         # Overlay visibility (name -> bool)
         self._overlays: dict[str, bool] = {
@@ -194,8 +510,14 @@ class LiveChartPlugin:
     def _connect_crosshair(self) -> None:
         """Set up vertical/horizontal crosshairs and floating OHLC HUD."""
         # Crosshair lines
-        self._cross_hair_vert = self.ax_price.axvline(0, color="#64748b", linestyle=":", linewidth=0.8, visible=False, zorder=10)
-        self._cross_hair_horiz = self.ax_price.axhline(0, color="#64748b", linestyle=":", linewidth=0.8, visible=False, zorder=10)
+        self._cross_hair_vert = _safe_axvline(
+            self.ax_price, _MPL_DATE_MIN, color="#64748b", linestyle=":", linewidth=0.8, visible=False, zorder=10,
+            source="crosshair_vert",
+        ) or self.ax_price.axvline(_MPL_DATE_MIN, color="#64748b", linestyle=":", linewidth=0.8, visible=False, zorder=10)
+        self._cross_hair_horiz = _safe_axhline(
+            self.ax_price, 24000.0, color="#64748b", linestyle=":", linewidth=0.8, visible=False, zorder=10,
+            source="crosshair_horiz",
+        ) or self.ax_price.axhline(24000.0, color="#64748b", linestyle=":", linewidth=0.8, visible=False, zorder=10)
         
         # HUD text box near top-left
         self._hud_text = self.ax_price.text(
@@ -218,6 +540,8 @@ class LiveChartPlugin:
 
             x, y = event.xdata, event.ydata
             if x is None or y is None or not self._candles:
+                return
+            if not _valid_mpl_date_x(x) or not _valid_chart_y(y, near=_safe_float(self._candles[-1].close if hasattr(self._candles[-1], "close") else None)):
                 return
 
             # Update crosshair positions
@@ -367,7 +691,8 @@ class LiveChartPlugin:
         self._watermark_text = self.fig.text(
             0.5, 0.55, f"{self.symbol} · {self.timeframe.upper()} · SHADOW MODE",
             fontsize=22, color=grid_color, alpha=0.08,
-            ha="center", va="center", zorder=0, weight="bold"
+            ha="center", va="center", zorder=0, weight="bold",
+            transform=self.fig.transFigure,
         )
 
         for ax in (self.ax_price, self.ax_rsi):
@@ -512,21 +837,192 @@ class LiveChartPlugin:
             self._dirty = True
             self._render()
 
-    def push_candles(self, candles_list: list[Any]) -> None:
-        """Called periodically by the Strategy to feed history into the chart."""
+    def _normalize_incoming_candles(self, candles_list: Any) -> list[Any]:
+        """Normalize DataFrame, dict rows, or Candle objects into a sorted list."""
         if candles_list is None:
+            return []
+        rows: list[Any]
+        try:
+            if hasattr(candles_list, "empty") and hasattr(candles_list, "iterrows"):
+                if bool(getattr(candles_list, "empty", True)):
+                    return []
+                rows = []
+                cols = {str(c).lower(): c for c in list(getattr(candles_list, "columns", []))}
+                time_col = next((cols[k] for k in ("time", "timestamp", "datetime", "date") if k in cols), None)
+                for _, row in candles_list.iterrows():
+                    try:
+                        t = row[time_col] if time_col is not None else None
+                        o = row.get(cols.get("open", "open")) if hasattr(row, "get") else row[cols.get("open", "open")]
+                        h = row.get(cols.get("high", "high")) if hasattr(row, "get") else row[cols.get("high", "high")]
+                        l = row.get(cols.get("low", "low")) if hasattr(row, "get") else row[cols.get("low", "low")]
+                        c = row.get(cols.get("close", "close")) if hasattr(row, "get") else row[cols.get("close", "close")]
+                        v = row.get(cols.get("volume", "volume")) if hasattr(row, "get") else row.get(cols.get("volume", "volume"), 0.0)
+                        rows.append({"time": t, "open": o, "high": h, "low": l, "close": c, "volume": v})
+                    except Exception:
+                        continue
+            else:
+                rows = list(candles_list)
+        except Exception as exc:
+            print(f"[CANDLES-NORMALIZE][ERROR] {type(exc).__name__}: {exc}", flush=True)
+            return []
+
+        def _get_time(c: Any):
+            if hasattr(c, "time"):
+                return getattr(c, "time")
+            if hasattr(c, "timestamp"):
+                return getattr(c, "timestamp")
+            if isinstance(c, dict):
+                return c.get("time") or c.get("timestamp") or c.get("datetime") or c.get("date")
+            return None
+
+        valid: list[Any] = []
+        for c in rows:
+            try:
+                dt = self._candle_dt(c) if hasattr(self, "_candle_dt") else None
+                if dt is None:
+                    # Allow pre-init normalization during construction.
+                    t = _get_time(c)
+                    if t is None:
+                        continue
+                    epoch = _normalize_epoch_seconds(t)
+                    if epoch is None and not isinstance(t, datetime):
+                        _log_chart_data_skip("normalize_incoming", "time", t, None, "invalid_timestamp")
+                        continue
+                if isinstance(c, dict):
+                    o, h, l, cl = c.get("open"), c.get("high"), c.get("low"), c.get("close")
+                    if o is None or h is None or l is None or cl is None:
+                        continue
+                    if _valid_price(cl) is None:
+                        _log_chart_data_skip("normalize_incoming", "close", None, cl, "invalid_price")
+                        continue
+                    valid.append(c)
+                else:
+                    if _valid_price(getattr(c, "close", None)) is None:
+                        _log_chart_data_skip("normalize_incoming", "close", None, getattr(c, "close", None), "invalid_price")
+                        continue
+                    valid.append(c)
+            except Exception:
+                continue
+
+        try:
+            valid = sorted(valid, key=_get_time)
+        except Exception as sort_err:
+            print(f"[CHART-DATA] Warning: Could not sort candles: {sort_err}", flush=True)
+
+        print(
+            f"[CANDLES-NORMALIZE] rows={len(valid)} last={_get_time(valid[-1]) if valid else 'N/A'}",
+            flush=True,
+        )
+        return valid
+
+    def _request_render(self) -> None:
+        """Schedule a render on the Tk main thread (throttled)."""
+        if getattr(self, "_paused", False):
             return
         try:
-            candles = list(candles_list)
+            if self.parent is None or not self.parent.winfo_exists():
+                return
         except Exception:
             return
+        now = time.time()
+        if (now - float(getattr(self, "_last_render_ts", 0.0) or 0.0)) < float(
+            getattr(self, "_render_throttle_sec", 0.25) or 0.25
+        ):
+            if not getattr(self, "_render_pending", False):
+                self._render_pending = True
+                try:
+                    delay_ms = int(float(getattr(self, "_render_throttle_sec", 0.25) or 0.25) * 1000)
+                    if self._render_after_id is not None:
+                        try:
+                            self.parent.after_cancel(self._render_after_id)
+                        except Exception:
+                            pass
+                    self._render_after_id = self.parent.after(max(delay_ms, 50), self._render_on_ui_thread)
+                except Exception:
+                    self._render_pending = False
+                    self._render()
+            return
+        if getattr(self, "_render_pending", False):
+            return
+        self._render_pending = True
+        try:
+            if self._render_after_id is not None:
+                try:
+                    self.parent.after_cancel(self._render_after_id)
+                except Exception:
+                    pass
+            self._render_after_id = self.parent.after(0, self._render_on_ui_thread)
+        except Exception:
+            self._render_pending = False
+            self._render()
+
+    def _render_on_ui_thread(self) -> None:
+        self._render_after_id = None
+        self._render_pending = False
+        try:
+            self._render()
+        except Exception as exc:
+            import traceback
+            print(f"[CHART-RENDER][ERROR] {type(exc).__name__}: {exc}", flush=True)
+            traceback.print_exc()
+
+    def push_candles(self, candles_list: list[Any]) -> None:
+        """Called periodically by the Strategy to feed history into the chart."""
+        # [STOP-BOT] Skip updates when paused (preserves visible candles)
+        if getattr(self, "_paused", False):
+            return
+
+        print(f"[CHART-DATA] push_candles called rows={len(candles_list) if candles_list is not None else 0}", flush=True)
+        candles = self._normalize_incoming_candles(candles_list)
+        if not candles:
+            print("[CHART-DATA][EMPTY] no candle rows received", flush=True)
+            self._raw_candles = []
+            self._candles = []
+            self._dirty = True
+            self._request_render()
+            # Unit tests / headless callers may not pump the Tk loop.
+            if self._dirty:
+                self._render_on_ui_thread()
+            return
+        try:
+            last = candles[-1]
+            last_time = str(getattr(last, "time", getattr(last, "timestamp", "")) or "")
+            batch_key = (len(candles), last_time)
+            has_rendered_candles = bool(getattr(self, "_last_render_xs", None)) and bool(
+                getattr(self, "_last_render_closes", None)
+            )
+            if has_rendered_candles and batch_key == getattr(self, "_last_candle_batch_key", None):
+                return
+            if has_rendered_candles and last_time and last_time == getattr(self, "_last_candle_ts_key", None):
+                return
+            self._last_candle_batch_key = batch_key
+            self._last_candle_ts_key = last_time
+        except Exception:
+            pass
+
+        try:
+            first = candles[0]
+            last = candles[-1]
+            first_time = getattr(first, "time", getattr(first, "timestamp", "N/A"))
+            last_time = getattr(last, "time", getattr(last, "timestamp", "N/A"))
+            if not hasattr(self, "_chart_data_log_ts") or (time.time() - float(getattr(self, "_chart_data_log_ts", 0.0) or 0.0)) > 10.0:
+                print(
+                    f"[CHART-DATA] first={first_time} last={last_time} count={len(candles)}",
+                    flush=True,
+                )
+                self._chart_data_log_ts = time.time()
+        except Exception as e:
+            print(f"[CHART-DATA] Error logging candle data: {e}", flush=True)
+
         self._raw_candles = candles
-        # [CHART] Apply max candle limit so memory does not grow forever.
         limit = self._max_candles if self._max_candles is not None else 500
         if len(self._raw_candles) > limit:
             self._raw_candles = self._raw_candles[-limit:]
         self._dirty = True
-        self._render()
+        self._request_render()
+        # Unit tests / headless callers may not pump the Tk loop.
+        if self._dirty:
+            self._render_on_ui_thread()
 
     # ------------------------------------------------------------------ #
     #  New public API for enhanced features                              #
@@ -559,15 +1055,16 @@ class LiveChartPlugin:
         self._market_info["regime_label"] = kwargs.get("regime_label", self._market_info.get("regime_label", ""))
         self._market_info["market_status"] = kwargs.get("market_status", self._market_info.get("market_status", ""))
         if atm_strike is not None:
-            self._atm_strike = float(atm_strike)
+            self._atm_strike = _valid_level_price(atm_strike, near=_safe_float(spot))
         self._dirty = True
         # [CHART] Removed duplicate _render() call that wasted CPU cycles.
         self._render()
 
     def set_session_levels(self, high: Optional[float], low: Optional[float], open_price: Optional[float] = None) -> None:
         """Set session high/low horizontal lines."""
-        self._session_high = float(high) if high is not None else None
-        self._session_low = float(low) if low is not None else None
+        ref = _safe_float(high) or _safe_float(low)
+        self._session_high = _valid_level_price(high, near=ref) if high is not None else None
+        self._session_low = _valid_level_price(low, near=ref) if low is not None else None
         if open_price is not None:
             self._session_open = float(open_price)
         self._dirty = True
@@ -575,8 +1072,9 @@ class LiveChartPlugin:
 
     def set_prevday_levels(self, high: Optional[float], low: Optional[float], open_price: Optional[float] = None) -> None:
         """Set previous day high/low horizontal lines."""
-        self._prevday_high = float(high) if high is not None else None
-        self._prevday_low = float(low) if low is not None else None
+        ref = _safe_float(high) or _safe_float(low)
+        self._prevday_high = _valid_level_price(high, near=ref) if high is not None else None
+        self._prevday_low = _valid_level_price(low, near=ref) if low is not None else None
         if open_price is not None:
             self._prevday_open = float(open_price)
         self._dirty = True
@@ -584,7 +1082,7 @@ class LiveChartPlugin:
 
     def set_atm_strike(self, strike: Optional[float]) -> None:
         """Set ATM strike for vertical marker."""
-        self._atm_strike = float(strike) if strike is not None else None
+        self._atm_strike = _valid_level_price(strike, near=_safe_float(self._market_info.get("spot"))) if strike is not None else None
         self._dirty = True
         self._render()
 
@@ -715,19 +1213,24 @@ class LiveChartPlugin:
             self._market_info["pcr"] = pcr
             self._market_info["regime_label"] = regime_label or self._market_info.get("regime_label", "")
             self._market_info["market_status"] = market_status or self._market_info.get("market_status", "")
+            ref_spot = _safe_float(spot)
             if atm_strike is not None:
-                self._atm_strike = float(atm_strike)
-            self._session_high = float(session_high) if session_high is not None else self._session_high
-            self._session_low = float(session_low) if session_low is not None else self._session_low
-            self._prevday_high = float(prevday_high) if prevday_high is not None else self._prevday_high
-            self._prevday_low = float(prevday_low) if prevday_low is not None else self._prevday_low
+                self._atm_strike = _valid_level_price(atm_strike, near=ref_spot)
+            if session_high is not None:
+                self._session_high = _valid_level_price(session_high, near=ref_spot)
+            if session_low is not None:
+                self._session_low = _valid_level_price(session_low, near=ref_spot)
+            if prevday_high is not None:
+                self._prevday_high = _valid_level_price(prevday_high, near=ref_spot)
+            if prevday_low is not None:
+                self._prevday_low = _valid_level_price(prevday_low, near=ref_spot)
             if prediction_rows is not None:
                 self.load_prediction_rows(prediction_rows)
             if trade_event_rows is not None:
                 self.load_trade_event_rows(trade_event_rows)
             # Mark dirty and render ONCE after all updates
             self._dirty = True
-            self._render()
+            self._request_render()
         finally:
             self._batch_updates = False
 
@@ -853,30 +1356,39 @@ class LiveChartPlugin:
 
         for row in self._prediction_rows:
             try:
-                ts_val = row.get("ts")
+                ts_val = row.get("ts") or row.get("timestamp")
                 if ts_val is None:
                     continue
-                ts_num: float
-                if isinstance(ts_val, (int, float)):
-                    ts_num = float(ts_val)
-                elif isinstance(ts_val, datetime):
+                x: float | None = None
+                if isinstance(ts_val, datetime):
+                    if ts_val.year < 2000 or ts_val.year > 2100:
+                        print(f"[CHART-OVERLAY-SKIP] reason=invalid_datetime x={ts_val} y=-", flush=True)
+                        continue
                     ts_num = mdates.date2num(ts_val)
+                    x = x_map.get(ts_num)
+                    if x is None:
+                        x = ts_num
                 else:
-                    try:
-                        ts_num = float(ts_val)
-                    except Exception:
+                    epoch = _normalize_epoch_seconds(ts_val)
+                    if epoch is None:
+                        print(f"[CHART-OVERLAY-SKIP] reason=invalid_timestamp x={ts_val} y=-", flush=True)
                         continue
+                    dt = datetime.fromtimestamp(epoch)
+                    ts_num = mdates.date2num(dt)
+                    x = x_map.get(ts_num)
+                    if x is None:
+                        x = ts_num
 
-                x = x_map.get(ts_num)
-                if x is None:
-                    try:
-                        x = mdates.date2num(datetime.fromtimestamp(ts_num))
-                    except Exception:
-                        continue
+                x = _safe_mpl_date(x)
+                if x is None or not _valid_mpl_date_x(x):
+                    _log_chart_data_skip("render_signals", "x", ts_val, None, "invalid_mpl_x")
+                    continue
 
-                # Find nearest y
-                idx = np.argmin(np.abs(np.array(xs) - x)) if len(xs) > 0 else 0
-                y = float(closes[min(idx, len(closes) - 1)])
+                idx = int(np.argmin(np.abs(np.array(xs) - x))) if len(xs) > 0 else 0
+                y = _safe_float(closes[min(idx, len(closes) - 1)])
+                if y is None or not _valid_chart_y(y, near=y):
+                    _log_chart_data_skip("render_signals", "y", x, y, "invalid_y")
+                    continue
 
                 pred_class = int(row.get("predicted_class", -1))
                 trade_candidate = str(row.get("trade_candidate", "")).upper().strip()
@@ -933,22 +1445,27 @@ class LiveChartPlugin:
         for key, g in groups.items():
             if not g["x"]:
                 continue
+            near = _safe_float(g["y"][-1]) if g["y"] else None
+            sx, sy = _filter_xy_pairs(g["x"], g["y"], source=f"render_signals:{key}", near_y=near)
+            if not sx:
+                continue
+            sizes = g["sizes"][-len(sx):] if len(g["sizes"]) >= len(sx) else g["sizes"]
             if key == "blocked":
-                # Hollow marker for blocked
-                scat = self.ax_price.scatter(
-                    g["x"], g["y"], s=g["sizes"],
+                scat = _safe_scatter(
+                    self.ax_price, sx, sy, s=sizes,
                     marker=g["marker"], facecolors="none",
                     edgecolors=g["color"], linewidths=1.5,
-                    zorder=7, alpha=0.9
+                    zorder=7, alpha=0.9, source=f"render_signals:{key}",
                 )
             else:
-                scat = self.ax_price.scatter(
-                    g["x"], g["y"], s=g["sizes"],
+                scat = _safe_scatter(
+                    self.ax_price, sx, sy, s=sizes,
                     marker=g["marker"], c=g["color"],
                     edgecolors="black", linewidths=0.5,
-                    zorder=7, alpha=0.9
+                    zorder=7, alpha=0.9, source=f"render_signals:{key}",
                 )
-            self._signal_scatters.append(scat)
+            if scat is not None:
+                self._signal_scatters.append(scat)
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                  #
@@ -1013,9 +1530,11 @@ class LiveChartPlugin:
             return None
         if xs_len <= 0 or closes_len <= 0:
             return None
-        try:
-            target_x = mdates.date2num(datetime.fromtimestamp(float(timestamp)))
-        except Exception:
+        epoch = _normalize_epoch_seconds(timestamp)
+        if epoch is None:
+            return None
+        target_x = mdates.date2num(datetime.fromtimestamp(epoch))
+        if not _valid_mpl_date_x(float(target_x)):
             return None
         best_idx = min(range(min(xs_len, closes_len)), key=lambda idx: abs(xs[idx] - target_x))
         try:
@@ -1027,9 +1546,9 @@ class LiveChartPlugin:
         if level is None:
             line.set_visible(False)
             return
-        try:
-            y = float(level)
-        except Exception:
+        ref = _safe_float(self._last_render_closes[-1]) if getattr(self, "_last_render_closes", None) else None
+        y = _valid_level_price(level, near=ref)
+        if y is None:
             line.set_visible(False)
             return
         line.set_ydata([y, y])
@@ -1055,15 +1574,69 @@ class LiveChartPlugin:
         t = getattr(c, "time", None)
         if t is None:
             t = getattr(c, "timestamp", None)
+        if t is None and isinstance(c, dict):
+            t = c.get("time") or c.get("timestamp") or c.get("ts")
         if t is None:
             return None
         if isinstance(t, datetime):
+            if t.year < 2000 or t.year > 2100:
+                return None
             return t
-        # Strategy Candle typically uses datetime; fall back to epoch seconds.
         try:
-            return datetime.fromtimestamp(float(t))
+            if hasattr(t, "to_pydatetime"):
+                dt = t.to_pydatetime()
+                if dt.year < 2000 or dt.year > 2100:
+                    return None
+                return dt
+        except Exception:
+            pass
+        epoch = _normalize_epoch_seconds(t)
+        if epoch is None:
+            return None
+        try:
+            return datetime.fromtimestamp(epoch)
         except Exception:
             return None
+
+    def _sanitize_candles_for_render(self, candles: list[Any]) -> list[Any]:
+        raw_n = len(candles or [])
+        valid: list[Any] = []
+        dropped_bad_ts = dropped_bad_price = 0
+        seen_ts: set[float] = set()
+        min_ts = max_ts = None
+        for c in candles or []:
+            dt = self._candle_dt(c)
+            if dt is None:
+                dropped_bad_ts += 1
+                continue
+            ts_key = float(dt.timestamp())
+            if ts_key in seen_ts:
+                dropped_bad_ts += 1
+                continue
+            o = _valid_price(getattr(c, "open", None) if not isinstance(c, dict) else c.get("open"))
+            h = _valid_price(getattr(c, "high", None) if not isinstance(c, dict) else c.get("high"))
+            l = _valid_price(getattr(c, "low", None) if not isinstance(c, dict) else c.get("low"))
+            cl = _valid_price(getattr(c, "close", None) if not isinstance(c, dict) else c.get("close"))
+            if cl is None:
+                dropped_bad_price += 1
+                continue
+            if o is None:
+                o = cl
+            if h is None:
+                h = max(o, cl)
+            if l is None:
+                l = min(o, cl)
+            seen_ts.add(ts_key)
+            min_ts = dt if min_ts is None or dt < min_ts else min_ts
+            max_ts = dt if max_ts is None or dt > max_ts else max_ts
+            valid.append(c)
+        valid.sort(key=lambda row: self._candle_dt(row).timestamp() if self._candle_dt(row) else 0.0)
+        print(
+            f"[CHART-SANITIZE] raw={raw_n} valid={len(valid)} dropped_bad_ts={dropped_bad_ts} "
+            f"dropped_bad_price={dropped_bad_price} min_ts={min_ts} max_ts={max_ts}",
+            flush=True,
+        )
+        return valid
 
     def _normalize_sequence(self, values: Any) -> list[Any]:
         try:
@@ -1322,7 +1895,210 @@ class LiveChartPlugin:
     #  Main render                                                       #
     # ------------------------------------------------------------------ #
 
+    def safe_ax_text(self, ax: Any, x: Any, y: Any, text: str, *, transform: Any = None, **kwargs: Any) -> Any:
+        if transform is not None:
+            try:
+                xf = float(x)
+                yf = float(y)
+                if not (np.isfinite(xf) and np.isfinite(yf) and -5.0 <= xf <= 5.0 and -5.0 <= yf <= 5.0):
+                    _log_chart_data_skip("safe_ax_text", "axes_xy", x, y, "invalid_axes_coordinate")
+                    return None
+            except Exception:
+                _log_chart_data_skip("safe_ax_text", "axes_xy", x, y, "invalid_axes_coordinate")
+                return None
+            try:
+                return ax.text(x, y, text, transform=transform, **kwargs)
+            except Exception as exc:
+                _log_chart_data_skip("safe_ax_text", "axes_xy", x, y, f"text_failed:{type(exc).__name__}")
+                return None
+        near = _safe_float(y)
+        if not _valid_chart_xy(x, y, near_y=near):
+            _log_chart_data_skip("safe_ax_text", "data_xy", x, y, "invalid_data_coordinate")
+            return None
+        try:
+            xf = _safe_mpl_date(x)
+            yf = _safe_float(y)
+            return ax.text(xf, yf, text, **kwargs)
+        except Exception as exc:
+            _log_chart_data_skip("safe_ax_text", "data_xy", x, y, f"text_failed:{type(exc).__name__}")
+            return None
+
+    def _sanitize_draw_artists(self) -> None:
+        for ax in (self.ax_price, self.ax_rsi):
+            for txt in list(getattr(ax, "texts", []) or []):
+                try:
+                    x, y = txt.get_position()
+                    transform = txt.get_transform()
+                    if transform is ax.transAxes:
+                        if not _is_finite_number(x) or not _is_finite_number(y) or not (-5.0 <= float(x) <= 5.0 and -5.0 <= float(y) <= 5.0):
+                            _log_chart_data_skip("sanitize_draw", "axes_text", x, y, "invalid_axes_artist")
+                            txt.set_visible(False)
+                    else:
+                        label = str(txt.get_text() or "").strip()
+                        if not label:
+                            continue
+                        near = _safe_float(self._last_render_closes[-1]) if getattr(self, "_last_render_closes", None) else None
+                        if not _valid_chart_xy(x, y, near_y=near):
+                            _log_chart_data_skip("sanitize_draw", "data_text", x, y, "invalid_data_artist")
+                            txt.set_visible(False)
+                except Exception:
+                    try:
+                        txt.set_visible(False)
+                    except Exception:
+                        pass
+            for ann in list(getattr(ax, "annotations", []) or []):
+                try:
+                    x, y = ann.xy
+                    near = _safe_float(y)
+                    if not _valid_chart_xy(x, y, near_y=near):
+                        _log_chart_data_skip("sanitize_draw", "annotation", x, y, "invalid_annotation")
+                        ann.set_visible(False)
+                except Exception:
+                    try:
+                        ann.set_visible(False)
+                    except Exception:
+                        pass
+            for label in _axis_tick_labels(ax):
+                try:
+                    pos = label.get_position()
+                    if not (_is_finite_number(pos[0]) and _is_finite_number(pos[1]) and abs(float(pos[0])) < 1e6 and abs(float(pos[1])) < 1e6):
+                        label.set_visible(False)
+                except Exception:
+                    try:
+                        label.set_visible(False)
+                    except Exception:
+                        pass
+        fig = getattr(self, "fig", None)
+        if fig is not None:
+            for text in list(getattr(fig, "texts", []) or []):
+                try:
+                    x, y = text.get_position()
+                    if not (_is_finite_number(x) and _is_finite_number(y)):
+                        text.set_visible(False)
+                except Exception:
+                    try:
+                        text.set_visible(False)
+                    except Exception:
+                        pass
+
+    def _sanitize_text_artists(self) -> None:
+        self._sanitize_draw_artists()
+
+    def _clamp_axis_limits(self) -> None:
+        xs_cache = getattr(self, "_last_render_xs", None) or []
+        ys_cache = getattr(self, "_last_render_closes", None) or []
+        if not xs_cache or not ys_cache:
+            return
+        try:
+            xs = [float(x) for x in xs_cache if _valid_mpl_date_x(x)]
+            ys = [float(y) for y in ys_cache if _valid_chart_y(y, near=_safe_float(y))]
+            if not xs or not ys:
+                return
+            width = max((xs[-1] - xs[0]) / max(len(xs), 1) * 0.7, 1.0 / (24 * 60) * 0.7)
+            pad = max((max(ys) - min(ys)) * 0.08, 1e-6)
+            self.ax_price.set_xlim(xs[0] - width, xs[-1] + width)
+            self.ax_price.set_ylim(min(ys) - pad, max(ys) + pad)
+            self.ax_rsi.set_xlim(xs[0] - width, xs[-1] + width)
+            self.ax_rsi.set_ylim(0, 100)
+        except Exception as exc:
+            _log_chart_data_skip("clamp_axis_limits", "limits", None, None, f"failed:{type(exc).__name__}")
+
+    def _hide_unsafe_artists_for_draw(self) -> None:
+        for ax in (self.ax_price, self.ax_rsi):
+            for text in list(getattr(ax, "texts", []) or []):
+                try:
+                    text.set_visible(False)
+                except Exception:
+                    pass
+            for ann in list(getattr(ax, "annotations", []) or []):
+                try:
+                    ann.set_visible(False)
+                except Exception:
+                    pass
+            legend_getter = getattr(ax, "get_legend", None)
+            if callable(legend_getter):
+                try:
+                    legend = legend_getter()
+                    if legend is not None:
+                        legend.set_visible(False)
+                except Exception:
+                    pass
+            for label in _axis_tick_labels(ax):
+                try:
+                    label.set_visible(False)
+                except Exception:
+                    pass
+        fig = getattr(self, "fig", None)
+        if fig is not None:
+            for text in list(getattr(fig, "texts", []) or []):
+                try:
+                    text.set_visible(False)
+                except Exception:
+                    pass
+
+    def _render_emergency_basic_candles(self) -> None:
+        """Last-resort render: sanitized close prices only."""
+        xs = list(getattr(self, "_last_render_xs", None) or [])
+        closes = list(getattr(self, "_last_render_closes", None) or [])
+        paired = [(x, c) for x, c in zip(xs, closes) if _valid_mpl_date_x(x) and _valid_chart_y(c, near=c)]
+        if not paired:
+            self.ax_price.clear()
+            self.ax_rsi.clear()
+            self._style_axes()
+            self.safe_ax_text(
+                self.ax_price, 0.5, 0.5, "No valid candle data",
+                transform=self.ax_price.transAxes,
+                ha="center", va="center", fontsize=12, color="#94a3b8",
+            )
+            return
+        px, py = zip(*paired)
+        self.ax_price.clear()
+        self.ax_rsi.clear()
+        self._style_axes()
+        _safe_plot(self.ax_price, px, py, linewidth=1.2, color="#38bdf8", source="emergency_basic")
+        self.safe_ax_text(
+            self.ax_price,
+            0.5,
+            0.92,
+            "Advanced overlays disabled due invalid chart coordinate",
+            transform=self.ax_price.transAxes,
+            ha="center",
+            va="top",
+            fontsize=9,
+            color="#f59e0b",
+        )
+        self._advanced_overlays_disabled = True
+        self._clamp_axis_limits()
+
+    def _safe_draw_idle(self, *, fallback_basic: bool = False) -> None:
+        try:
+            self._clamp_axis_limits()
+            self._sanitize_draw_artists()
+            self.canvas.draw()
+            self._advanced_overlays_disabled = False
+        except (TypeError, ValueError, OverflowError) as exc:
+            print(f"[CHART-RENDER-ERROR] type={type(exc).__name__} message={exc}", flush=True)
+            if fallback_basic:
+                try:
+                    self._hide_unsafe_artists_for_draw()
+                    self.canvas.draw()
+                    print("[CHART-RENDER] fallback=basic_candles_only", flush=True)
+                    return
+                except Exception:
+                    pass
+                try:
+                    self._render_emergency_basic_candles()
+                    self.canvas.draw()
+                    print("[CHART-RENDER] fallback=emergency_basic_candles", flush=True)
+                    return
+                except Exception as fallback_exc:
+                    print(f"[CHART-RENDER-ERROR] fallback_failed={type(fallback_exc).__name__}:{fallback_exc}", flush=True)
+            raise
+
     def _render(self) -> None:
+        # [STOP-BOT] Skip render when paused (preserves visible candles)
+        if getattr(self, "_paused", False):
+            return
         # [CHART] Skip render during batch mode — caller is batching multiple
         # state changes and will trigger a single render at the end.
         if self._batch_updates:
@@ -1331,19 +2107,38 @@ class LiveChartPlugin:
             return
         self._dirty = False
 
+        # [CHART-RENDER] Log render start
+        raw_count = len(self._raw_candles) if hasattr(self, '_raw_candles') and self._raw_candles else 0
+        print(f"[CHART-RENDER] starting render raw_candles={raw_count}")
+
         if not hasattr(self, "_raw_candles") or not self._raw_candles:
             self._raw_candles = self._candles
 
         if not self._raw_candles:
             self._clear_artists()
-            self.canvas.draw_idle()
+            self.ax_price.clear()
+            self.ax_rsi.clear()
+            self._style_axes()
+            self._init_artists()
+            # [CHART-FALLBACK] Show message when no candle data
+            print("[CHART-RENDER][EMPTY] showing fallback message", flush=True)
+            self.safe_ax_text(self.ax_price, 0.5, 0.5, "No candle data available",
+                              transform=self.ax_price.transAxes,
+                              ha='center', va='center', fontsize=12, color='#94a3b8')
+            self._safe_draw_idle()
+            self._last_render_ts = time.time()
             return
 
+        self._raw_candles = self._sanitize_candles_for_render(self._raw_candles)
         self._candles = self._resample_candles_to_timeframe(self._raw_candles, self.timeframe)
 
         if not self._candles:
             self._clear_artists()
-            self.canvas.draw_idle()
+            # [CHART-FALLBACK] Show message when resampling returns empty
+            self.safe_ax_text(self.ax_price, 0.5, 0.5, "No candle data available",
+                              transform=self.ax_price.transAxes,
+                              ha='center', va='center', fontsize=12, color='#94a3b8')
+            self._safe_draw_idle()
             return
 
         dts: list[datetime] = []
@@ -1357,14 +2152,22 @@ class LiveChartPlugin:
             dt = self._candle_dt(c)
             if dt is None:
                 continue
-            try:
-                o = float(getattr(c, "open"))
-                h = float(getattr(c, "high"))
-                l = float(getattr(c, "low"))
-                cl = float(getattr(c, "close"))
-                v = float(getattr(c, "volume", 0.0))
-            except Exception:
+            o = _valid_price(getattr(c, "open", None) if not isinstance(c, dict) else c.get("open"))
+            h = _valid_price(getattr(c, "high", None) if not isinstance(c, dict) else c.get("high"))
+            l = _valid_price(getattr(c, "low", None) if not isinstance(c, dict) else c.get("low"))
+            cl = _valid_price(getattr(c, "close", None) if not isinstance(c, dict) else c.get("close"))
+            if cl is None:
                 continue
+            if o is None:
+                o = cl
+            if h is None:
+                h = max(o, cl)
+            if l is None:
+                l = min(o, cl)
+            try:
+                v = float(getattr(c, "volume", 0.0) if not isinstance(c, dict) else c.get("volume", 0.0))
+            except Exception:
+                v = 0.0
             dts.append(dt)
             opens.append(o)
             highs.append(h)
@@ -1374,8 +2177,14 @@ class LiveChartPlugin:
 
         if not closes:
             self._clear_artists()
-            self.canvas.draw_idle()
+            self._safe_draw_idle()
             return
+
+        # [CHART-RENDER] Use ax.clear() pattern: clear axes, re-init artists, redraw
+        self.ax_price.clear()
+        self.ax_rsi.clear()
+        self._style_axes()
+        self._init_artists()
 
         prev_xlim = self._stored_xlim if self._has_user_view else None
         prev_price_ylim = self._stored_price_ylim if self._has_user_view else None
@@ -1404,7 +2213,27 @@ class LiveChartPlugin:
         except Exception:
             pass
 
-        xs = mdates.date2num(dts)
+        xs_raw = mdates.date2num(dts)
+        paired = [
+            (float(x), o, h, l, c)
+            for x, o, h, l, c in zip(xs_raw, opens, highs, lows, closes)
+            if _valid_mpl_date_x(x)
+        ]
+        if not paired:
+            self._clear_artists()
+            self.safe_ax_text(
+                self.ax_price, 0.5, 0.5, "Invalid candle timestamps",
+                transform=self.ax_price.transAxes,
+                ha="center", va="center", fontsize=12, color="#94a3b8",
+            )
+            self._safe_draw_idle(fallback_basic=True)
+            return
+        xs, opens, highs, lows, closes = map(list, zip(*paired))
+        self._last_render_xs = list(xs)
+        self._last_render_opens = list(opens)
+        self._last_render_highs = list(highs)
+        self._last_render_lows = list(lows)
+        self._last_render_closes = list(closes)
 
         width = max(1.0 / (24 * 60) * 0.7, (xs[-1] - xs[0]) / max(len(xs), 1) * 0.7)
 
@@ -1446,14 +2275,22 @@ class LiveChartPlugin:
         ema_u = self._ema_series(closes, self.ema_ultra)
         ema_sp = self._ema_series(closes, self.ema_super)
 
-        def _line_data(ys: list[Optional[float]]) -> tuple[list[float], list[float]]:
+        def _line_data(ys: list[Optional[float]], *, rsi: bool = False) -> tuple[list[float], list[float]]:
+            near = _safe_float(closes[-1]) if closes else None
             xs2: list[float] = []
             ys2: list[float] = []
             for x, y in zip(xs, ys):
                 if y is None:
                     continue
-                xs2.append(x)
-                ys2.append(float(y))
+                yf = _safe_float(y)
+                if yf is None or not _valid_chart_y(yf, near=near, rsi=rsi):
+                    _log_chart_data_skip("line_data", "y", x, y, "invalid_indicator_y")
+                    continue
+                if not _valid_mpl_date_x(x):
+                    _log_chart_data_skip("line_data", "x", x, y, "invalid_indicator_x")
+                    continue
+                xs2.append(float(x))
+                ys2.append(yf)
             return xs2, ys2
 
         self._ema_fast_line.set_data(*_line_data(ema_f))
@@ -1479,7 +2316,7 @@ class LiveChartPlugin:
 
         # ---- RSI ----
         rsi_s = self._rsi_series(closes, self.rsi_period)
-        self._rsi_line.set_data(*_line_data(rsi_s))
+        self._rsi_line.set_data(*_line_data(rsi_s, rsi=True))
 
         # ---- VWAP ----
         if self.vwap_enabled and self._overlays.get("vwap", True):
@@ -1594,9 +2431,13 @@ class LiveChartPlugin:
             self._atm_hline.set_xdata([xs[0], xs[-1]])
             self._atm_hline.set_visible(True)
             # Label at right edge of chart
-            self._atm_label.set_position((xs[-1], atm_price))
-            self._atm_label.set_text(f"  ATM {self._atm_strike:.0f}")
-            self._atm_label.set_visible(True)
+            if _valid_mpl_date_x(xs[-1]) and _finite_plot_coord(atm_price):
+                self._atm_label.set_position((xs[-1], atm_price))
+                self._atm_label.set_text(f"  ATM {self._atm_strike:.0f}")
+                self._atm_label.set_visible(True)
+            else:
+                print(f"[CHART-OVERLAY-SKIP] reason=invalid_coordinate x={xs[-1]} y={atm_price}", flush=True)
+                self._atm_label.set_visible(False)
         else:
             self._atm_hline.set_visible(False)
             self._atm_label.set_visible(False)
@@ -1607,9 +2448,13 @@ class LiveChartPlugin:
             self._current_price_line.set_ydata([last_close, last_close])
             self._current_price_line.set_xdata([xs[0], xs[-1]])
             self._current_price_line.set_visible(True)
-            self._current_price_label.set_position((xs[-1], last_close))
-            self._current_price_label.set_text(f"  LTP {last_close:.2f}")
-            self._current_price_label.set_visible(True)
+            if _valid_mpl_date_x(xs[-1]) and _finite_plot_coord(last_close):
+                self._current_price_label.set_position((xs[-1], last_close))
+                self._current_price_label.set_text(f"  LTP {last_close:.2f}")
+                self._current_price_label.set_visible(True)
+            else:
+                print(f"[CHART-OVERLAY-SKIP] reason=invalid_coordinate x={xs[-1]} y={last_close}", flush=True)
+                self._current_price_label.set_visible(False)
         else:
             self._current_price_line.set_visible(False)
             self._current_price_label.set_visible(False)
@@ -1634,12 +2479,17 @@ class LiveChartPlugin:
         for m in self._marks:
             if focus is not None and m.trade_id != focus:
                 continue
-            try:
-                x = mdates.date2num(datetime.fromtimestamp(float(m.ts)))
-            except Exception:
+            epoch = _normalize_epoch_seconds(m.ts)
+            if epoch is None:
+                print(f"[CHART-OVERLAY-SKIP] reason=invalid_xy trade_id={m.trade_id} x={m.ts} y=n/a", flush=True)
+                continue
+            x = mdates.date2num(datetime.fromtimestamp(epoch))
+            if not _valid_mpl_date_x(float(x)):
+                print(f"[CHART-OVERLAY-SKIP] reason=invalid_xy trade_id={m.trade_id} x={x} y=n/a", flush=True)
                 continue
             price_y = self._nearest_price_at_timestamp(m.ts, xs, closes)
-            if price_y is None:
+            if price_y is None or not _finite_plot_coord(price_y):
+                print(f"[CHART-OVERLAY-SKIP] reason=invalid_xy trade_id={m.trade_id} x={x} y={price_y}", flush=True)
                 continue
             is_buy = str(m.side).upper() == "BUY"
             option_type = str(m.option_type).upper()
@@ -1647,9 +2497,15 @@ class LiveChartPlugin:
             marker = "^" if is_buy else "v"
             y_offset = price_span * (0.018 if is_buy else -0.018)
             text_offset = price_span * (0.05 if is_buy else -0.05)
-            scatter = self.ax_price.scatter(
+            marker_y = price_y + y_offset
+            text_y = price_y + text_offset
+            if not (_finite_plot_coord(x) and _finite_plot_coord(marker_y) and _finite_plot_coord(text_y)):
+                print(f"[CHART-OVERLAY-SKIP] reason=invalid_xy trade_id={m.trade_id} x={x} y={marker_y}", flush=True)
+                continue
+            scatter = _safe_scatter(
+                self.ax_price,
                 [x],
-                [price_y + y_offset],
+                [marker_y],
                 marker=marker,
                 s=70,
                 color=color,
@@ -1657,27 +2513,31 @@ class LiveChartPlugin:
                 linewidths=0.4,
                 zorder=6,
                 alpha=0.95,
+                source="trade_marker",
             )
-            self._marker_lines.append(scatter)
-            self._marker_texts.append(
-                self.ax_price.annotate(
-                    m.label or m.event.title(),
-                    xy=(x, price_y + y_offset),
-                    xytext=(x, price_y + text_offset),
-                    textcoords="data",
-                    fontsize=7,
-                    color=color,
-                    ha="center",
-                    va="bottom" if is_buy else "top",
-                    bbox={
-                        "boxstyle": "round,pad=0.2",
-                        "fc": "black",
-                        "ec": color,
-                        "alpha": 0.35,
-                    },
-                    zorder=7,
-                )
+            if scatter is not None:
+                self._marker_lines.append(scatter)
+            ann = _safe_annotate(
+                self.ax_price,
+                m.label or m.event.title(),
+                (x, marker_y),
+                xytext=(x, text_y),
+                textcoords="data",
+                fontsize=7,
+                color=color,
+                ha="center",
+                va="bottom" if is_buy else "top",
+                bbox={
+                    "boxstyle": "round,pad=0.2",
+                    "fc": "black",
+                    "ec": color,
+                    "alpha": 0.35,
+                },
+                zorder=7,
+                source="trade_marker",
             )
+            if ann is not None:
+                self._marker_texts.append(ann)
 
         # ---- Entry / Stop / Target lines ----
         entry_level, stop_level, target_level = self._extract_trade_barriers()
@@ -1686,7 +2546,12 @@ class LiveChartPlugin:
         self._set_optional_line(self._target_line, target_level)
 
         # ---- ML Signals ----
-        self._render_signals(xs, closes)
+        overlays_ok = True
+        try:
+            self._render_signals(xs, closes)
+        except Exception as overlay_exc:
+            overlays_ok = False
+            print(f"[CHART-OVERLAY-SKIP] reason=render_exception error={overlay_exc}", flush=True)
 
         # ---- Axis formatting ----
         self.ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
@@ -1710,8 +2575,14 @@ class LiveChartPlugin:
         finally:
             self._suspend_view_tracking = False
 
-        self.fig.tight_layout()
-        self.canvas.draw_idle()
+        _safe_tight_layout(self.fig)
+        candle_count = len(self._candles) if hasattr(self, '_candles') and self._candles else 0
+        now = time.time()
+        if (now - float(getattr(self, "_last_render_log_ts", 0.0) or 0.0)) >= 5.0:
+            print(f"[CHART-RENDER] overlays_ok={overlays_ok} candles={candle_count}")
+            self._last_render_log_ts = now
+        self._safe_draw_idle(fallback_basic=True)
+        self._last_render_ts = now
 
     def _clear_artists(self) -> None:
         """Clear all artist data when no candles available."""
@@ -1830,11 +2701,40 @@ class TimeSeriesMultiLinePlugin:
                     ys.append(float(v))
                 except Exception:
                     continue
-            if xs and ys:
-                self.ax.plot(xs, ys, linewidth=1.0, label=str(label))
+            near = _safe_float(ys[-1]) if ys else None
+            sx, sy = _filter_xy_pairs(
+                xs,
+                ys,
+                source="timeseries_plugin",
+                near_y=near,
+                allow_negative=True,
+            )
+            if sx and sy:
+                _safe_plot(
+                    self.ax,
+                    sx,
+                    sy,
+                    linewidth=1.0,
+                    label=str(label),
+                    source="timeseries_plugin",
+                    allow_negative=True,
+                )
                 plotted += 1
 
         if plotted:
+            try:
+                _safe_axhline(
+                    self.ax,
+                    0.0,
+                    color="#888888",
+                    linewidth=0.8,
+                    alpha=0.6,
+                    linestyle=":",
+                    source="timeseries_plugin_zero",
+                    _allow_negative=True,
+                )
+            except Exception:
+                pass
             # Keep legends compact (dashboard can have multiple legs).
             try:
                 handles, labels = self.ax.get_legend_handles_labels()
@@ -1846,10 +2746,7 @@ class TimeSeriesMultiLinePlugin:
             except Exception:
                 pass
 
-        try:
-            self.fig.tight_layout()
-        except Exception:
-            pass
+        _safe_tight_layout(self.fig)
         self.canvas.draw_idle()
 
 
@@ -1928,15 +2825,18 @@ class OptionChainIVSmilePlugin:
         pe_pts.sort(key=lambda x: x[0])
 
         if ce_pts:
-            self.ax.plot([p[0] for p in ce_pts], [p[1] for p in ce_pts], label="CE", linewidth=1.0, color="cyan")
+            _safe_plot(
+                self.ax, [p[0] for p in ce_pts], [p[1] for p in ce_pts],
+                label="CE", linewidth=1.0, color="cyan", source="iv_smile_ce",
+            )
         if pe_pts:
-            self.ax.plot([p[0] for p in pe_pts], [p[1] for p in pe_pts], label="PE", linewidth=1.0, color="magenta")
+            _safe_plot(
+                self.ax, [p[0] for p in pe_pts], [p[1] for p in pe_pts],
+                label="PE", linewidth=1.0, color="magenta", source="iv_smile_pe",
+            )
 
         if spot is not None:
-            try:
-                self.ax.axvline(float(spot), color="gray", linewidth=1.0, alpha=0.6)
-            except Exception:
-                pass
+            _safe_axvline(self.ax, spot, color="gray", linewidth=1.0, alpha=0.6, source="iv_smile_spot")
 
         try:
             if ce_pts or pe_pts:
@@ -1944,8 +2844,5 @@ class OptionChainIVSmilePlugin:
         except Exception:
             pass
 
-        try:
-            self.fig.tight_layout()
-        except Exception:
-            pass
+        _safe_tight_layout(self.fig)
         self.canvas.draw_idle()

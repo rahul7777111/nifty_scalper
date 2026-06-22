@@ -9,21 +9,55 @@ ENV/
 
 # Environment variables (Sensitive)
 .scalper.env
+.env
+.env.*
+!.env.example
 
 # Logs
 *.log
 .scalper.ui.log
 mconnect.log
+ui_stdout.log
+ui_stderr.log
 
 # Large Data Files
 *.csv
 scripmaster.csv
+data/
+models/
+reports/
+artifacts/
+archive/
+backups/
+logs/
+dist/
 
 # Local databases / artifacts
 *.db
 diff*.txt
 error*.txt
+*.prof
+*.pkl
+*.sqlite*
+*.jsonl
+.DS_Store
+
+# Generated config snapshots / local config
+config/*.backup*.json
+config/*.env
 
 # IDEs
 .vscode/
 .idea/
+.claude/
+.codex/
+.grok/
+.kimchi/
+.pytest_cache/
+.pytest_tmp/
+.pytest_tmp_rf/
+.tmp_pytest*/
+.uv-cache/
+.uv-python/
+myenv/
+desktop.ini

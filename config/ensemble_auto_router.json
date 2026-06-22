@@ -1,0 +1,83 @@
+{
+  "enabled": true,
+  "paper_mode_enabled": true,
+  "ensemble_min_valid_models": 2,
+  "ensemble_min_confidence": 0.65,
+  "ensemble_min_direction_edge": 0.2,
+  "ensemble_max_model_disagreement": 0.35,
+  "config_version": 1,
+  "debug_allow_low_edge_paper_trade": false,
+  "artifact_root": "artifacts",
+  "artifact_search_paths": [
+    "artifacts",
+    "artifacts/models",
+    "artifacts/candidates",
+    "artifacts/ml_signals"
+  ],
+  "models": {
+    "elasticnet": {
+      "enabled": true,
+      "label": "ElasticNet Logistic Regression",
+      "artifact_path": "artifacts/candidates/elasticnet_BOTH_directional_auto_BOTH_dir_auto_t30_20260610_130953",
+      "weight": 0.3,
+      "side_policy": "AUTO_DIRECTIONAL"
+    },
+    "logistic_regression": {
+      "enabled": true,
+      "label": "Logistic Regression",
+      "artifact_path": "artifacts/candidates/logistic_regression_BOTH_directional_auto_BOTH_dir_auto_t30_20260610_130953",
+      "weight": 0.2,
+      "side_policy": "AUTO_DIRECTIONAL"
+    },
+    "calibrated_logistic_regression": {
+      "enabled": true,
+      "label": "Calibrated Logistic Regression",
+      "artifact_path": "artifacts/candidates/calibrated_logistic_regression_BOTH_symmetric_BOTH_sym_t30_20260610_130953",
+      "weight": 0.25,
+      "side_policy": "BOTH_SYMMETRIC"
+    },
+    "xgboost": {
+      "enabled": true,
+      "label": "XGBoost",
+      "artifact_path": "artifacts/candidates/xgboost_volatility_breakout_vol_breakout_t30_20260610_130953",
+      "weight": 0.25,
+      "side_policy": "BOTH"
+    }
+  },
+  "thresholds": {
+    "ensemble_min_confidence": 0.65,
+    "ensemble_min_direction_edge": 0.2,
+    "ensemble_max_model_disagreement": 0.35,
+    "ensemble_min_valid_models": 2
+  },
+  "liquidity": {
+    "max_spread_pct": 0.12,
+    "min_volume": 0,
+    "min_oi": 0,
+    "min_ltp": 0.05
+  },
+  "duplicate_trade_rules": {
+    "max_trades_per_day": 3,
+    "one_position_per_side": true
+  },
+  "paper_trading": {
+    "lot_size": 65,
+    "brokerage_per_order": 5.0,
+    "slippage_pct": 0.001,
+    "cost_bps": 1.5,
+    "trade_log_path": "reports/ensemble_auto_router_trades.csv",
+    "summary_path": "reports/ensemble_auto_router_summary.json"
+  },
+  "exits": {
+    "stop_loss_pct": 0.1,
+    "target_pct": 0.2,
+    "max_hold_bars": 5,
+    "force_exit_time": "15:20",
+    "entry_cutoff_time": "15:00",
+    "daily_loss_limit": -2500.0
+  },
+  "logging": {
+    "debug": true,
+    "log_model_details": true
+  }
+}

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import base64
 import getpass
+import json
 import os
 import sys
+import time
 import re
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 try:
     import pyotp
@@ -250,6 +253,94 @@ def generate_access_token_via_totp() -> str:
     )
 
     return access_token
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# m.Stock JWT token expiry helpers  (mirrors dhan_auth.py pattern)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def decode_mstock_jwt(token: str) -> Dict[str, Any]:
+    """Decode a m.Stock JWT payload (base64url) without verifying the signature.
+
+    Returns the decoded payload dict, or an empty dict on any decode error.
+    Safe to call with malformed/empty tokens — never raises.
+    """
+    raw = str(token or "").strip()
+    if not raw:
+        return {}
+    try:
+        parts = raw.split(".")
+        if len(parts) < 2:
+            return {}
+        payload_b64 = parts[1]
+        # PKCS7 padding for base64 decoder
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        decoded = base64.urlsafe_b64decode(payload_b64.encode("utf-8"))
+        parsed = json.loads(decoded.decode("utf-8"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def mstock_token_expiry_epoch(token: str) -> Optional[int]:
+    """Return the UTC epoch (seconds) of the JWT exp claim, or None if absent."""
+    payload = decode_mstock_jwt(token)
+    try:
+        exp = payload.get("exp")
+        return int(exp) if exp is not None else None
+    except Exception:
+        return None
+
+
+def is_mstock_token_expiring(token: str, *, within_seconds: int = 900) -> bool:
+    """Return True when the m.Stock JWT expires within `within_seconds` (default 15 min).
+
+    Returns False for empty/malformed tokens (fail-open for non-critical paths).
+    Critical paths MUST call _ensure_valid_token which enforces stricter checks.
+    """
+    exp = mstock_token_expiry_epoch(token)
+    if exp is None:
+        return False
+    try:
+        return exp <= int(time.time()) + int(within_seconds)
+    except Exception:
+        return False
+
+
+def safe_refresh_mstock_token() -> Optional[str]:
+    """Attempt safe TOTP-based token refresh via the SDK.
+
+    Returns a new access token string on success, or None on any failure.
+    Logs warnings so operators can debug failures.
+
+    Does NOT raise — callers must handle None and fail closed.
+    """
+    try:
+        username = str(os.getenv("MSTOCK_USERNAME", "")).strip()
+        password = os.getenv("MSTOCK_PASSWORD", "")
+        api_key = str(
+            os.getenv("MSTOCK_API_KEY", "")
+            or getattr(__config__, "API_KEY", "")
+            or ""
+        ).strip()
+        totp_secret = str(os.getenv("MSTOCK_TOTP_SECRET", "")).strip()
+
+        if not (username and password and api_key and totp_secret):
+            print(
+                "[TOKEN] Safe-refresh skipped: MSTOCK_USERNAME/PASSWORD/API_KEY/TOTP_SECRET "
+                "not all configured."
+            )
+            return None
+
+        # reuse existing login helpers; login_with_totp updates env + returns token
+        new_token = login_with_totp(username, password, api_key, totp_secret)
+        if new_token and str(new_token).strip():
+            print(f"[TOKEN] Safe-refresh succeeded, new token acquired.")
+            return str(new_token).strip()
+        return None
+    except Exception as exc:
+        print(f"[TOKEN] Safe-refresh failed: {exc}")
+        return None
 
 
 def main() -> None:

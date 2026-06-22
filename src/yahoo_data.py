@@ -14,7 +14,10 @@ from typing import List, Optional
 _yf = None
 _yf_import_error: str | None = None
 
-from market_data import Candle
+try:
+    from .market_data import Candle
+except ImportError:
+    from market_data import Candle
 
 
 @dataclass(frozen=True)

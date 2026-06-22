@@ -3,7 +3,7 @@ import os
 from dataclasses import dataclass
 import importlib.util
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 
 
 @dataclass
@@ -42,6 +42,24 @@ class StrategyConfig:
     ml_disable_all: bool = False
     ml_max_daily_paper_loss: float = 5000.0
     ml_max_consecutive_paper_losses: int = 3
+
+    # ---- Micro-live (live probe) mode — extreme safety defaults ----
+    enable_micro_live: bool = False                        # DISABLED by default
+    micro_live_max_trades_per_day: int = 1                 # 1 trade per day max
+    micro_live_max_lots: int = 1                           # 1 lot max
+    micro_live_min_probability: float = 0.70              # 70% confidence minimum
+    micro_live_max_daily_loss: float = 500.0               # Rs 500 max daily loss
+    micro_live_force_exit_time: str = "15:10"              # auto-squareoff by 3:10 PM
+    micro_live_require_spread_pct: float = 0.01           # max 1% spread
+    micro_live_require_min_premium: float = 10.0          # min Rs 10 premium
+    micro_live_strict_kill_switch: bool = True            # kill switch MUST be False
+
+    # ---- Paper Forward-Test Runner ----
+    paper_forward_test_interval_sec: int = 300       # 5 min between checks
+    paper_forward_test_max_trades_per_day: int = 5   # stop after N trades
+    paper_forward_test_output_dir: str = "reports/paper_forward_test"
+    paper_forward_test_require_market_hours: bool = True
+    paper_forward_test_min_runtime_minutes: int = 30  # run at least 30 min
 
     # ---- Notifier Settings ----
     telegram_bot_token: str = ""
@@ -494,6 +512,11 @@ class StrategyConfig:
     gpt_enable: bool = False
     gpt_enabled: bool = False
     use_gpt_market_analysis: bool = False
+    # When True, GPT is queried for market commentary (strategy suggestions, trade
+    # approval). When False (default), GPT calls are skipped entirely and ML trading
+    # proceeds without GPT commentary. HTTP 402 errors from GPT MUST NOT block
+    # shadow mode, paper-forward, or ML signal generation regardless of this flag.
+    gpt_market_commentary_enabled: bool = False
     # "gate" blocks entries unless GPT returns TAKE; "advice" only logs.
     gpt_mode: str = "gate"
     # Apply GPT gating in paper mode as well (README: default enabled).
@@ -744,7 +767,7 @@ class StrategyConfig:
     delta_hedge_vol_high_tol_factor: float = 1.5
 
     # ---- Strategy Win-Rate Tracker ----
-    winrate_tracker_enabled: bool = False
+    winrate_tracker_enabled: bool = True
     winrate_lookback: int = 10
     winrate_min_wins: int = 3
     winrate_max_loss_streak: int = 3
@@ -1150,6 +1173,16 @@ def load_strategy_config() -> StrategyConfig:
         cfg.gpt_timeout_sec = float(os.getenv("MSTOCK_GPT_TIMEOUT_SEC", str(cfg.gpt_timeout_sec)))
     except Exception:
         pass
+    try:
+        cfg.gpt_market_commentary_enabled = str(
+            os.getenv(
+                "GPT_MARKET_COMMENTARY_ENABLED",
+                os.getenv("MSTOCK_GPT_MARKET_COMMENTARY_ENABLED", "false"),
+            )
+            or "false"
+        ).strip().lower() in {"1", "true", "yes", "y"}
+    except Exception:
+        cfg.gpt_market_commentary_enabled = False
     v_auto = os.getenv("MSTOCK_GPT_AUTO_SELECT")
     if v_auto is not None:
         try:
@@ -2248,6 +2281,47 @@ def load_strategy_config() -> StrategyConfig:
     except Exception:
         pass
 
+    # ---- Paper Forward-Test Runner ----
+    try:
+        cfg.paper_forward_test_interval_sec = int(
+            os.getenv("SCALPER_PAPER_FWD_INTERVAL_SEC", str(cfg.paper_forward_test_interval_sec))
+        )
+    except Exception:
+        pass
+    try:
+        cfg.paper_forward_test_max_trades_per_day = int(
+            os.getenv("SCALPER_PAPER_FWD_MAX_TRADES", str(cfg.paper_forward_test_max_trades_per_day))
+        )
+    except Exception:
+        pass
+    cfg.paper_forward_test_output_dir = os.getenv(
+        "SCALPER_PAPER_FWD_OUTPUT_DIR", cfg.paper_forward_test_output_dir
+    ).strip()
+    try:
+        cfg.paper_forward_test_require_market_hours = str(
+            os.getenv("SCALPER_PAPER_FWD_REQUIRE_MARKET_HOURS", str(cfg.paper_forward_test_require_market_hours))
+        ).strip().lower() in {"1", "true", "yes", "y"}
+    except Exception:
+        pass
+    try:
+        cfg.paper_forward_test_min_runtime_minutes = int(
+            os.getenv("SCALPER_PAPER_FWD_MIN_RUNTIME_MINUTES", str(cfg.paper_forward_test_min_runtime_minutes))
+        )
+    except Exception:
+        pass
+
+    try:
+        cfg.enable_micro_live = str(os.getenv("SCALPER_ENABLE_MICRO_LIVE", "")).strip().lower() in {"1", "true", "yes", "y"}
+        cfg.micro_live_max_trades_per_day = int(os.getenv("SCALPER_MICRO_LIVE_MAX_TRADES", str(cfg.micro_live_max_trades_per_day)))
+        cfg.micro_live_max_lots = int(os.getenv("SCALPER_MICRO_LIVE_MAX_LOTS", str(cfg.micro_live_max_lots)))
+        cfg.micro_live_min_probability = float(os.getenv("SCALPER_MICRO_LIVE_MIN_PROB", str(cfg.micro_live_min_probability)))
+        cfg.micro_live_max_daily_loss = float(os.getenv("SCALPER_MICRO_LIVE_MAX_DAILY_LOSS", str(cfg.micro_live_max_daily_loss)))
+        cfg.micro_live_force_exit_time = str(os.getenv("SCALPER_MICRO_LIVE_FORCE_EXIT", str(cfg.micro_live_force_exit_time)))
+        cfg.micro_live_require_spread_pct = float(os.getenv("SCALPER_MICRO_LIVE_MAX_SPREAD", str(cfg.micro_live_require_spread_pct)))
+        cfg.micro_live_require_min_premium = float(os.getenv("SCALPER_MICRO_LIVE_MIN_PREMIUM", str(cfg.micro_live_require_min_premium)))
+    except Exception:
+        pass
+
     weekly_only = os.getenv("MSTOCK_NIFTY_WEEKLY_ONLY")
     if weekly_only is not None:
         cfg.nifty_weekly_only = str(weekly_only).strip().lower() in {"1", "true", "yes", "y"}
@@ -2719,3 +2793,338 @@ def validate_strategy_config(cfg: StrategyConfig) -> list[str]:
     except Exception:
         pass
     return warns
+
+
+# =============================================================================
+# RealTradingGate — comprehensive real-trading safety gate
+# =============================================================================
+
+
+@dataclass
+class RealTradingGate:
+    """All conditions that must pass before real trading is allowed.
+
+    Every field is a safety check. The system is LIVE only when ALL of them
+    are satisfied (or explicitly overridden with safe values).
+    """
+
+    # ── Master switches ──────────────────────────────────────────────────────
+    enable_live_trading: bool = False
+    scalper_allow_live_orders: bool = False   # SCALPER_ALLOW_LIVE_ORDERS=true
+    scalper_real_trading_ack: bool = False    # SCALPER_REAL_TRADING_ACK=true
+
+    # ── Broker credential health ─────────────────────────────────────────────
+    broker_token_valid: bool = True
+    broker_token_expiring: bool = True        # True = invalid/expiring (blocks)
+
+    # ── Order infrastructure ─────────────────────────────────────────────────
+    order_polling_available: bool = False
+
+    # ── Kill switches ────────────────────────────────────────────────────────
+    kill_switch_active: bool = True           # True = kill switch ON (blocks)
+
+    # ── Readiness from prior audit reports ──────────────────────────────────
+    paper_readiness_pass: bool = False
+    broker_safety_pass: bool = False
+
+    # ── Feature coverage ─────────────────────────────────────────────────────
+    dry_run_coverage_pct: float = 0.0
+
+    # ── Model readiness ──────────────────────────────────────────────────────
+    model_pkl_exists: bool = False
+    current_probability: float = 0.0
+    probability_threshold: float = 0.5
+
+    # ── Entry quality ────────────────────────────────────────────────────────
+    spread_pct: float = 999.0
+    max_spread_pct: float = 0.02
+    premium: float = 0.0
+    min_premium: float = 5.0
+
+    # ── Risk clamps ──────────────────────────────────────────────────────────
+    max_daily_loss_breached: bool = False
+    max_trades_per_day_breached: bool = False
+
+    # ── Market state ─────────────────────────────────────────────────────────
+    market_hours_valid: bool = True
+    open_stale_position: bool = False
+
+
+def real_trading_allowed(gate: RealTradingGate) -> tuple[bool, list[str]]:
+    """Central gate: returns (allowed, list_of_blockers).
+
+    ALL conditions must pass for real trading to be allowed.
+    Add a call to this at every real-order entry point.
+    """
+    blockers: list[str] = []
+
+    if not gate.enable_live_trading:
+        blockers.append("enable_live_trading is False")
+    if not gate.scalper_allow_live_orders:
+        blockers.append("SCALPER_ALLOW_LIVE_ORDERS must be set to true")
+    if not gate.scalper_real_trading_ack:
+        blockers.append("SCALPER_REAL_TRADING_ACK must be set to true")
+    if gate.broker_token_expiring:
+        blockers.append("broker token is missing, expiring, or expired")
+    if not gate.broker_token_valid:
+        blockers.append("broker token is not valid")
+    if not gate.order_polling_available:
+        blockers.append("order status polling not available")
+    if gate.kill_switch_active:
+        blockers.append("kill switch is active")
+    if not gate.paper_readiness_pass:
+        blockers.append("paper readiness not PASS")
+    if not gate.broker_safety_pass:
+        blockers.append("broker safety checks have not passed")
+    if gate.dry_run_coverage_pct < 95.0:
+        blockers.append(f"dry-run coverage {gate.dry_run_coverage_pct:.1f}% < 95%")
+    if not gate.model_pkl_exists:
+        blockers.append("model_pkl is null or missing")
+    if gate.current_probability < gate.probability_threshold:
+        blockers.append(
+            f"probability {gate.current_probability:.4f} < threshold {gate.probability_threshold:.4f}"
+        )
+    if gate.spread_pct > gate.max_spread_pct:
+        blockers.append(
+            f"spread {gate.spread_pct*100:.2f}% > max {gate.max_spread_pct*100:.2f}%"
+        )
+    if gate.premium < gate.min_premium:
+        blockers.append(f"premium {gate.premium:.2f} < min {gate.min_premium:.2f}")
+    if gate.max_daily_loss_breached:
+        blockers.append("max daily loss breach detected")
+    if gate.max_trades_per_day_breached:
+        blockers.append("max trades per day exceeded")
+    if not gate.market_hours_valid:
+        blockers.append("outside valid market hours")
+    if gate.open_stale_position:
+        blockers.append("open stale position from previous session")
+
+    return (len(blockers) == 0, blockers)
+
+
+# =============================================================================
+# micro_live_allowed — lightweight live trading for tiny positions
+# =============================================================================
+
+
+def micro_live_allowed(
+    cfg: Any,
+    *,
+    probability: float,
+    spread_pct: float,
+    premium: float,
+    trades_today: int,
+    daily_pnl: float,
+    kill_switch: bool,
+) -> tuple[bool, list[str]]:
+    """Evaluate micro-live mode safety gate.
+
+    Micro-live is a restricted subset of full live trading with tighter
+    constraints: 1 trade/day, 1 lot, 70%+ probability, spread <= 1%, premium >= Rs10.
+    """
+    blockers: list[str] = []
+
+    enable_micro_live = bool(getattr(cfg, "enable_micro_live", False))
+    if not enable_micro_live:
+        blockers.append("enable_micro_live is False")
+
+    strict_kill = bool(getattr(cfg, "micro_live_strict_kill_switch", True))
+    if kill_switch and strict_kill:
+        blockers.append("kill switch is active")
+
+    min_prob = float(getattr(cfg, "micro_live_min_probability", 0.70))
+    if probability < min_prob:
+        blockers.append(f"probability {probability:.4f} < micro_live min {min_prob:.4f}")
+
+    max_spread = float(getattr(cfg, "micro_live_require_spread_pct", 0.01))
+    if spread_pct > max_spread:
+        blockers.append(f"spread {spread_pct*100:.2f}% > micro_live max {max_spread*100:.2f}%")
+
+    min_premium = float(getattr(cfg, "micro_live_require_min_premium", 10.0))
+    if premium < min_premium:
+        blockers.append(f"premium {premium:.2f} < micro_live min {min_premium:.2f}")
+
+    max_trades = int(getattr(cfg, "micro_live_max_trades_per_day", 1))
+    if trades_today >= max_trades:
+        blockers.append(f"micro_live trades today {trades_today} >= max {max_trades}")
+
+    max_loss = float(getattr(cfg, "micro_live_max_daily_loss", 500.0))
+    if daily_pnl <= -max_loss:
+        blockers.append(f"daily P&L Rs{daily_pnl:.2f} exceeds micro_live max loss Rs{max_loss:.2f}")
+
+    return (len(blockers) == 0, blockers)
+
+
+# =============================================================================
+# LiveTradeGate — the 8+ explicit gates required before any real broker order
+# =============================================================================
+
+from dataclasses import dataclass as _dc
+
+
+@_dc
+class LiveTradeGate:
+    """All conditions that must be simultaneously true for a real 1-lot (or scaled) live order."""
+
+    # Master env combination (new names per task spec)
+    live_mode: bool = False                    # LIVE_MODE=true
+    order_placement_enabled: bool = False      # ORDER_PLACEMENT_ENABLED=true
+    live_order_dry_run: bool = True            # LIVE_ORDER_DRY_RUN must be false for real orders
+    kill_switch_active: bool = True            # SCALPER_KILL_SWITCH != 1
+
+    # Candidate lifecycle / whitelist
+    candidate_live_whitelisted: bool = False
+    candidate_status: str = "DISABLED"         # must be LIVE_1_LOT or LIVE_SCALED
+
+    # Broker / session
+    broker_session_valid: bool = False
+
+    # Market data freshness (caller supplies)
+    option_chain_fresh: bool = False
+    selected_expiry_valid: bool = False
+    current_time_le_entry_cutoff: bool = False
+
+    # Quote quality
+    spread_pct: float = 999.0
+    max_spread_pct: float = 0.02
+    premium: float = 0.0
+    min_premium: float = 5.0
+    max_premium: float = 1e9
+
+    # Trade construction rules
+    stop_loss_exists: bool = False
+    exit_rule_exists: bool = False
+
+    # Risk / position limits (caller supplies current state)
+    open_positions: int = 0
+    max_open_positions: int = 6
+    trades_today: int = 0
+    max_trades_per_day: int = 2
+    daily_loss: float = 0.0
+    max_daily_loss: float = 1000.0
+    duplicate_open_position: bool = False
+
+    # First-live rule
+    order_type_is_limit: bool = True           # LIMIT required for first live (1-lot) phase
+
+
+def live_trade_allowed(gate: LiveTradeGate) -> Tuple[bool, List[str]]:
+    """
+    Central live-trade gate. Returns (allowed, list_of_blockers).
+
+    This is the explicit matrix required by the promotion pipeline spec.
+    It is intended to be called from mstock_client.place_order (and any other
+    real-order entry point) in addition to the existing RealTradingGate.
+    """
+    blockers: List[str] = []
+
+    if not gate.live_mode:
+        blockers.append("LIVE_MODE is not true")
+    if not gate.order_placement_enabled:
+        blockers.append("ORDER_PLACEMENT_ENABLED is not true")
+    if gate.live_order_dry_run:
+        blockers.append("LIVE_ORDER_DRY_RUN must be false for real orders")
+    if gate.kill_switch_active:
+        blockers.append("SCALPER_KILL_SWITCH is active (or set to 1/true)")
+
+    if not gate.candidate_live_whitelisted:
+        blockers.append("candidate.live_whitelisted is false")
+    if gate.candidate_status not in ("LIVE_1_LOT", "LIVE_SCALED"):
+        blockers.append(f"candidate.status={gate.candidate_status} not in [LIVE_1_LOT, LIVE_SCALED]")
+
+    if not gate.broker_session_valid:
+        blockers.append("broker_session_valid is false")
+
+    if not gate.option_chain_fresh:
+        blockers.append("option_chain_fresh is false (stale chain)")
+    if not gate.selected_expiry_valid:
+        blockers.append("selected_expiry_valid is false")
+    if not gate.current_time_le_entry_cutoff:
+        blockers.append("current_time after entry cutoff")
+
+    if gate.spread_pct > gate.max_spread_pct:
+        blockers.append(f"spread_pct {gate.spread_pct:.4f} > max {gate.max_spread_pct:.4f}")
+    if gate.premium < gate.min_premium:
+        blockers.append(f"premium {gate.premium:.2f} < min {gate.min_premium:.2f}")
+    if gate.premium > gate.max_premium:
+        blockers.append(f"premium {gate.premium:.2f} > max {gate.max_premium:.2f}")
+
+    if not gate.stop_loss_exists:
+        blockers.append("stop_loss rule missing")
+    if not gate.exit_rule_exists:
+        blockers.append("exit_rule missing")
+
+    if gate.open_positions >= gate.max_open_positions:
+        blockers.append(f"open_positions {gate.open_positions} >= max {gate.max_open_positions}")
+    if gate.trades_today >= gate.max_trades_per_day:
+        blockers.append(f"trades_today {gate.trades_today} >= max {gate.max_trades_per_day}")
+    if gate.daily_loss <= -gate.max_daily_loss:
+        blockers.append(f"daily_loss {gate.daily_loss:.2f} <= -max_daily_loss {gate.max_daily_loss:.2f}")
+    if gate.duplicate_open_position:
+        blockers.append("duplicate open position for same leg")
+
+    # First-live rule
+    if not gate.order_type_is_limit:
+        blockers.append("order_type must be LIMIT for first live (1-lot) phase")
+
+    return (len(blockers) == 0, blockers)
+
+
+def load_live_trade_gate_from_env(
+    *,
+    candidate_whitelisted: bool,
+    candidate_status: str,
+    broker_session_ok: bool,
+    chain_fresh: bool,
+    expiry_ok: bool,
+    before_cutoff: bool,
+    spread: float,
+    premium_val: float,
+    has_sl: bool,
+    has_exit: bool,
+    open_pos: int,
+    trades_today: int,
+    daily_pnl: float,
+    is_duplicate: bool,
+    order_type_limit: bool = True,
+    max_open: int = 6,
+    max_trades: int = 2,
+    max_loss: float = 1000.0,
+    max_spread: float = 0.02,
+    min_prem: float = 5.0,
+) -> LiveTradeGate:
+    """Convenience: build a LiveTradeGate from the four new env vars + runtime state."""
+    from .candidate_lifecycle import (  # local import to avoid cycles at module load
+        get_live_mode_env,
+        get_order_placement_enabled_env,
+        get_live_order_dry_run_env,
+        get_kill_switch_active,
+    )
+
+    return LiveTradeGate(
+        live_mode=get_live_mode_env(),
+        order_placement_enabled=get_order_placement_enabled_env(),
+        live_order_dry_run=get_live_order_dry_run_env(),
+        kill_switch_active=get_kill_switch_active(),
+        candidate_live_whitelisted=candidate_whitelisted,
+        candidate_status=candidate_status,
+        broker_session_valid=broker_session_ok,
+        option_chain_fresh=chain_fresh,
+        selected_expiry_valid=expiry_ok,
+        current_time_le_entry_cutoff=before_cutoff,
+        spread_pct=spread,
+        max_spread_pct=max_spread,
+        premium=premium_val,
+        min_premium=min_prem,
+        stop_loss_exists=has_sl,
+        exit_rule_exists=has_exit,
+        open_positions=open_pos,
+        max_open_positions=max_open,
+        trades_today=trades_today,
+        max_trades_per_day=max_trades,
+        daily_loss=daily_pnl,
+        max_daily_loss=max_loss,
+        duplicate_open_position=is_duplicate,
+        order_type_is_limit=order_type_limit,
+    )
+

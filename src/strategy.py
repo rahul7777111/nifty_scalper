@@ -107,6 +107,13 @@ from exit_optimizer import (
 )
 from label_policies import get_label_policy_spec
 from ml_signals import evaluate_ml_gating_before_execution, feature_vector_from_candles, load_model, predict
+
+# Production candidate router (must be called for every entry decision path)
+try:
+    from candidate_router import route_candidate_decision, get_last_router_decision
+except Exception:  # noqa: BLE001
+    route_candidate_decision = None  # type: ignore
+    get_last_router_decision = None  # type: ignore
 from position_sizing import calculate_position_size, volatility_target_size, kelly_fraction
 from trailing import atr_trailing_stop
 from backtest_harness import simulate_simple
@@ -272,6 +279,7 @@ class NiftyScalper:
     ) -> None:
         self.client = client
         self.cfg = cfg
+        self.paper_mode = not bool(getattr(cfg, "enable_live_trading", False))
         self.state = TradeState(open_orders=[], open_multi=[], open_directional=[])
         self._event_sink = event_sink
         self._on_tick = on_tick
@@ -313,6 +321,13 @@ class NiftyScalper:
         # Auto-mode strategy lock (reduces churn between directional/premium branches).
         self._auto_strat_locked: Optional[str] = None
         self._auto_strat_locked_ts: float = 0.0
+
+        # ---- Reroute cooldown and max-attempts tracking ----
+        self._reroute_cooldown_seconds: float = 30.0
+        self._last_reroute_ts: float = 0.0
+        self._reroute_count_this_cycle: int = 0
+        self._cycle_reroute_reset_ts: float = 0.0
+        self._max_reroutes_per_cycle: int = 3
 
         # When intraday candles are enabled but the intraday endpoint returns empty
         # (common for some tokens/accounts), we can synthesize candles from live LTP
@@ -3733,6 +3748,29 @@ class NiftyScalper:
         blocked_reason: str,
         attempted_strategies: Optional[set[str]] = None,
     ) -> Optional[Dict[str, object]]:
+        # Fail-fast: option-chain unavailable reasons do not benefit from rerouting.
+        reason_lower = str(blocked_reason or "").lower()
+        option_chain_fail_keywords = (
+            "option chain empty",
+            "option chain parameters are not configured",
+            "missing_config",
+            "ip_mismatch",
+            "ip mismatch",
+        )
+        if any(kw in reason_lower for kw in option_chain_fail_keywords):
+            print("[AUTO][REROUTE] blocked: option chain unavailable, skipping all fallback strategies")
+            return None
+
+        # Cooldown guard: suppress reroutes within the cooldown window.
+        now_ts = float(time.time())
+        if self._last_reroute_ts > 0.0 and (now_ts - self._last_reroute_ts) < self._reroute_cooldown_seconds:
+            return None
+
+        # Max-attempts-per-cycle guard.
+        if self._reroute_count_this_cycle >= self._max_reroutes_per_cycle:
+            print("[AUTO][REROUTE] stopped: max attempts per cycle reached")
+            return None
+
         blocked_key = self._resolve_auto_strategy_candidate(blocked_strategy)
         candidates = self._alternative_strategy_candidates_for_block(
             current_strategy=str(blocked_key or blocked_strategy),
@@ -3758,6 +3796,10 @@ class NiftyScalper:
         }
         if not alt_name or alt_name == blocked_key or alt_name in attempted_keys:
             return None
+
+        # Commit the reroute: bump counter and timestamp.
+        self._reroute_count_this_cycle += 1
+        self._last_reroute_ts = now_ts
 
         return {
             "trade_name": str(alt_name),
@@ -4051,6 +4093,44 @@ class NiftyScalper:
     def _place_order_with_retry(self, **kwargs: object) -> Order:
         if self._kill_switch_active():
             raise RuntimeError("[KILL_SWITCH] Active — live orders blocked")
+
+        # =====================================================================
+        # PHASE 6: Router + live enablement gate at the actual order choke point.
+        # No bypass allowed. Checked on every place_order attempt.
+        # =====================================================================
+        router_ok = bool(getattr(self, "_last_router_allowed", True))
+        router_dec = getattr(self, "_last_router_decision", None) or {}
+        live_orders_env_ok = str(os.getenv("MSTOCK_ENABLE_LIVE_ORDERS", "")).strip().lower() in {"1", "true", "yes"}
+        cfg_live_ok = bool(getattr(self.cfg, "enable_live_trading", False))
+        if router_dec and router_dec.get("final_signal", "NO_TRADE") == "NO_TRADE":
+            router_ok = False
+
+        if (not router_ok) or (not (live_orders_env_ok or cfg_live_ok)):
+            LOGGER.info(
+                "[LIVE-GATE] candidate_id=%s preset=%s side=%s final_signal=%s shadow_ready=%s "
+                "live_orders_enabled=%s order_allowed=%s reason=%s",
+                router_dec.get("candidate_id", "") if router_dec else "",
+                router_dec.get("selected_preset", "") if router_dec else "",
+                router_dec.get("side_decision", "") if router_dec else "",
+                router_dec.get("final_signal", "NO_TRADE") if router_dec else "NO_TRADE",
+                router_dec.get("shadow_ready", False) if router_dec else False,
+                live_orders_env_ok,
+                False,
+                "router_or_mstock_enable_live_orders_block",
+            )
+            if not (live_orders_env_ok or cfg_live_ok):
+                try:
+                    self.cfg.enable_live_trading = False
+                except Exception:
+                    pass
+            raise RuntimeError("ORDER_BLOCKED_BY_ROUTER_OR_LIVE_GATE")
+
+        # BLOCKER 6: explicit paper forward guard before any broker order
+        if router_dec and (router_dec.get("paper_forward_only") or not router_dec.get("live_orders_enabled", False) or not router_dec.get("broker_orders_enabled", False)):
+            LOGGER.info(
+                "[ORDER-GUARD] paper_forward_only=true live_orders_enabled=false broker_orders_enabled=false action=paper_state_only"
+            )
+            raise RuntimeError("ORDER_BLOCKED_PAPER_FORWARD_ONLY")
 
         attempts = 1
         delay = 0.0
@@ -8519,6 +8599,19 @@ class NiftyScalper:
             "pyramid_level": 0,
         }
         if append_state:
+            if existing is None:
+                try:
+                    open_count_now = len(self.state.open_directional) + len(self.state.open_multi)
+                    max_open_positions = int(getattr(self.cfg, "max_open_positions", 0) or 0)
+                except Exception:
+                    open_count_now = 0
+                    max_open_positions = 0
+                if max_open_positions > 0 and open_count_now >= max_open_positions:
+                    print(
+                        f"[RISK] Max open positions reached ({open_count_now}/{max_open_positions}); "
+                        f"blocking new directional entry {name}"
+                    )
+                    return None
             self.state.open_directional.append(tr)
         self.state.trades_today += 1
         self.state.last_entry_ts = time.time()
@@ -11146,6 +11239,18 @@ class NiftyScalper:
                         )
 
         if not appended:
+            try:
+                open_count_now = len(self.state.open_directional) + len(self.state.open_multi)
+                max_open_positions = int(getattr(self.cfg, "max_open_positions", 0) or 0)
+            except Exception:
+                open_count_now = 0
+                max_open_positions = 0
+            if max_open_positions > 0 and open_count_now >= max_open_positions:
+                print(
+                    f"[RISK] Max open positions reached ({open_count_now}/{max_open_positions}); "
+                    f"blocking new multi entry {name}"
+                )
+                return None
             self.state.open_multi.append(payload)
             self._note_opened_trade_type(position_type="multi", name=str(name))
 
@@ -13038,6 +13143,124 @@ class NiftyScalper:
             block("kill_switch_active")
             return
 
+        # ---- Fail-fast: if option chain is unavailable, skip all strategies this cycle ----
+        try:
+            client = getattr(self, 'client', None)
+            if client is not None and hasattr(client, '_option_chain_status'):
+                chain_status = str(getattr(client, '_option_chain_status', 'UNKNOWN') or 'UNKNOWN')
+                if chain_status in ('MISSING_CONFIG', 'FETCH_FAILED', 'EMPTY'):
+                    self._note_entry_blocked(f"option_chain_{chain_status.lower()}")
+                    # [OPTION-CHAIN] Throttled logging to prevent log spam
+                    self._log_throttled(
+                        f"[ENTRY] Option chain unavailable ({chain_status}) — skipping all strategies",
+                        key=f"option_chain_{chain_status}",
+                        interval_sec=30.0
+                    )
+                    return
+        except Exception:
+            pass
+
+        # =====================================================================
+        # PHASE 6: PRODUCTION WIRING — route_candidate_decision MUST be called
+        # before any entry decision that can lead to order placement.
+        # Router result drives final_signal / gates. Legacy ML is passed as fallback.
+        # =====================================================================
+        router_decision = None
+        router_final = "NO_TRADE"
+        router_allowed = False
+        router_no_trade_reason = "router_not_called"
+        try:
+            if route_candidate_decision is not None:
+                # Build minimal live-computable snapshot from current state (no future/return/label)
+                latest_candle = candles[-1] if candles else None
+                spot = float(getattr(latest_candle, "close", 0.0) or 0.0)
+                # Pull last ML prob computed in evaluate_entry_signals (or 0)
+                last_ml_p = float(getattr(self, "_last_ml_pred", 0.0) or 0.0)
+                last_ml_thr = float(getattr(self, "_last_ml_threshold", 0.5) or 0.5)
+                legacy_sig = {"ml_prob": last_ml_p, "threshold": last_ml_thr, "reason": "from_evaluate_entry_signals"}
+
+                # Active candidate wiring (env-driven, safe defaults)
+                active_cid = (os.getenv("MSTOCK_ACTIVE_CANDIDATE_ID") or "").strip() or None
+                # Candidate dir search order (no hard-coded secrets)
+                cdir = None
+                for cand in ("artifacts/candidates", "models/candidates", "data/candidates"):
+                    if os.path.isdir(cand):
+                        cdir = cand
+                        break
+                if not cdir:
+                    cdir = "models/candidates"
+
+                mode_hint = "live" if bool(getattr(self.cfg, "enable_live_trading", False)) else "shadow"
+                router_decision = route_candidate_decision(
+                    market_snapshot={
+                        "spot": spot,
+                        "last_close": spot,
+                        "regime": str(getattr(self, "_last_regime_profile", {}).get("regime", "unknown")),
+                        "market_regime": str(getattr(self, "_last_regime_profile", {}).get("regime", "unknown")),
+                        "atr_pct": float(self._cached_atr or 0.01),
+                        "option_type": None,  # explicit side comes from preset/policy
+                    },
+                    option_chain_snapshot=None,
+                    legacy_signal=legacy_sig,
+                    mode=mode_hint,
+                    active_candidate_id=active_cid,
+                    candidate_dir=cdir,
+                    force_eval=False,  # never auto-force in live strategy path
+                )
+                router_final = str(router_decision.get("final_signal", "NO_TRADE"))
+                # All gates must be true for entry (except in pure shadow observation)
+                router_allowed = (
+                    router_final.startswith("BUY_")
+                    and bool(router_decision.get("allowed_by_model"))
+                    and bool(router_decision.get("allowed_by_preset"))
+                    and bool(router_decision.get("allowed_by_side_policy"))
+                    and bool(router_decision.get("allowed_by_liquidity"))
+                    and bool(router_decision.get("allowed_by_cost"))
+                    and bool(router_decision.get("allowed_by_risk"))
+                )
+                router_no_trade_reason = router_decision.get("no_trade_reason") or ""
+                # Stash for GUI + later placement guards
+                self._last_router_decision = router_decision
+                self._last_router_allowed = router_allowed
+            else:
+                # Router module not importable — fail closed for new candidate path
+                router_allowed = False
+                router_no_trade_reason = "candidate_router_unavailable"
+                self._last_router_decision = None
+                self._last_router_allowed = False
+        except Exception as _exc:
+            router_allowed = False
+            router_no_trade_reason = f"router_exception:{type(_exc).__name__}"
+            self._last_router_decision = {"error": str(_exc)}
+            self._last_router_allowed = False
+
+        # If router says NO or any gate failed, block new entries from candidate path.
+        # (Legacy non-candidate branches may still run for compatibility but will also be gated at placement.)
+        if not router_allowed and router_decision is not None:
+            # Log the gate decision
+            live_enabled_flag = str(os.getenv("MSTOCK_ENABLE_LIVE_ORDERS", "")).strip().lower() in {"1", "true", "yes"}
+            LOGGER.info(
+                "[LIVE-GATE] candidate_id=%s preset=%s side=%s final_signal=%s shadow_ready=%s "
+                "live_orders_enabled=%s order_allowed=%s reason=%s",
+                (router_decision or {}).get("candidate_id", ""),
+                (router_decision or {}).get("selected_preset", ""),
+                (router_decision or {}).get("side_decision", ""),
+                router_final,
+                (router_decision or {}).get("shadow_ready", False),
+                live_enabled_flag,
+                False,
+                router_no_trade_reason or "router_block",
+            )
+            # In live mode we are extra strict; in shadow/paper we still respect router final for candidate flow.
+            if bool(getattr(self.cfg, "enable_live_trading", False)) or router_final == "NO_TRADE":
+                block(f"router_{router_no_trade_reason or 'no_trade'}")
+                # Do not return here for all paths — some legacy sleeves still exist — but we set a hard flag.
+                self._router_forced_block = True
+            else:
+                self._router_forced_block = False
+        else:
+            self._router_forced_block = False
+
         attempted_auto_strategies_set = {
             self._resolve_auto_strategy_candidate(name)
             for name in set(attempted_auto_strategies or set())
@@ -13049,6 +13272,21 @@ class NiftyScalper:
                 "blocked_strategy": str(current_strategy or ""),
                 "blocked_reason": str(reason or ""),
             }
+
+            # ---- Early-exit for option-chain failures: do NOT attempt reroute ----
+            reason_lower = str(reason or "").lower()
+            option_chain_fail_keywords = (
+                "option chain empty",
+                "option chain parameters are not configured",
+                "missing_config",
+                "ip_mismatch",
+                "ip mismatch",
+            )
+            if any(kw in reason_lower for kw in option_chain_fail_keywords):
+                self._note_entry_blocked(reason, extras=extras)
+                print("[AUTO][REROUTE] blocked: option chain unavailable, skipping all fallback strategies")
+                return False
+
             try:
                 strategy_mode = self._normalize_strategy_name(str(getattr(self.cfg, "strategy_name", "") or ""))
             except Exception:
@@ -16823,6 +17061,10 @@ class NiftyScalper:
 
                 now_ts = float(time.time())
                 bucket_start_ts = now_ts - (now_ts % float(bucket_sec))
+                # ---- Reset reroute cycle counter every hour ----
+                if self._cycle_reroute_reset_ts == 0.0 or (now_ts - self._cycle_reroute_reset_ts) >= 3600:
+                    self._reroute_count_this_cycle = 0
+                    self._cycle_reroute_reset_ts = now_ts
                 # P4: Periodic regime monitor
                 if getattr(self.cfg, "gpt_regime_monitor_enabled", False):
                     try:

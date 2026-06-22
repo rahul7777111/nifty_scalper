@@ -7,6 +7,7 @@ setup for training RL-based exit agents.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 import numpy as np
 from typing import Any, Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -26,6 +27,132 @@ class ExitDecision:
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
+
+
+@dataclass
+class TripleBarrierState:
+    """Stateful triple-barrier exit container bound to a live position."""
+
+    prediction_id: str
+    policy_name: str
+    entry_price: float
+    profit_target_pct: float
+    stop_loss_pct: float
+    max_duration_bars: int
+    upper_profit_barrier: float
+    lower_stop_barrier: float
+    elapsed_bars: int = 0
+    last_bar_timestamp: str = ""
+    exit_lock: bool = False
+    exit_lock_ts: float = 0.0
+    exit_trigger_source: str = ""
+    final_execution_duration_bars: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "prediction_id": str(self.prediction_id or ""),
+            "policy_name": str(self.policy_name or ""),
+            "entry_price": float(self.entry_price),
+            "profit_target_pct": float(self.profit_target_pct),
+            "stop_loss_pct": float(self.stop_loss_pct),
+            "max_duration_bars": int(self.max_duration_bars),
+            "upper_profit_barrier": float(self.upper_profit_barrier),
+            "lower_stop_barrier": float(self.lower_stop_barrier),
+            "elapsed_bars": int(self.elapsed_bars),
+            "last_bar_timestamp": str(self.last_bar_timestamp or ""),
+            "exit_lock": bool(self.exit_lock),
+            "exit_lock_ts": float(self.exit_lock_ts or 0.0),
+            "exit_trigger_source": str(self.exit_trigger_source or ""),
+            "final_execution_duration_bars": int(self.final_execution_duration_bars or 0),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Optional[Dict[str, Any]]) -> Optional["TripleBarrierState"]:
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return cls(
+                prediction_id=str(payload.get("prediction_id") or ""),
+                policy_name=str(payload.get("policy_name") or ""),
+                entry_price=float(payload.get("entry_price") or 0.0),
+                profit_target_pct=float(payload.get("profit_target_pct") or 0.0),
+                stop_loss_pct=float(payload.get("stop_loss_pct") or 0.0),
+                max_duration_bars=max(1, int(payload.get("max_duration_bars") or 1)),
+                upper_profit_barrier=float(payload.get("upper_profit_barrier") or 0.0),
+                lower_stop_barrier=float(payload.get("lower_stop_barrier") or 0.0),
+                elapsed_bars=max(0, int(payload.get("elapsed_bars") or 0)),
+                last_bar_timestamp=str(payload.get("last_bar_timestamp") or ""),
+                exit_lock=bool(payload.get("exit_lock", False)),
+                exit_lock_ts=float(payload.get("exit_lock_ts") or 0.0),
+                exit_trigger_source=str(payload.get("exit_trigger_source") or ""),
+                final_execution_duration_bars=max(0, int(payload.get("final_execution_duration_bars") or 0)),
+            )
+        except Exception:
+            return None
+
+
+@dataclass
+class TripleBarrierEvaluation:
+    trigger_source: Optional[str]
+    elapsed_bars: int
+    current_price: float
+
+
+def initialize_triple_barrier_state(
+    *,
+    fill_price: float,
+    prediction_id: str,
+    policy_name: str,
+    profit_target_pct: float,
+    stop_loss_pct: float,
+    max_duration_bars: int,
+    bar_timestamp: Optional[datetime] = None,
+) -> TripleBarrierState:
+    entry_price = float(fill_price)
+    return TripleBarrierState(
+        prediction_id=str(prediction_id or ""),
+        policy_name=str(policy_name or ""),
+        entry_price=entry_price,
+        profit_target_pct=float(profit_target_pct),
+        stop_loss_pct=float(stop_loss_pct),
+        max_duration_bars=max(1, int(max_duration_bars)),
+        upper_profit_barrier=entry_price * (1.0 + float(profit_target_pct)),
+        lower_stop_barrier=entry_price * (1.0 - float(stop_loss_pct)),
+        elapsed_bars=0,
+        last_bar_timestamp=bar_timestamp.isoformat() if isinstance(bar_timestamp, datetime) else "",
+    )
+
+
+def evaluate_triple_barrier_state(
+    state: TripleBarrierState,
+    *,
+    current_price: float,
+    bar_timestamp: Optional[datetime] = None,
+    count_bar_close: bool = True,
+) -> TripleBarrierEvaluation:
+    price = float(current_price)
+    if price >= float(state.upper_profit_barrier):
+        state.exit_trigger_source = "profit_target"
+        state.final_execution_duration_bars = int(state.elapsed_bars)
+        return TripleBarrierEvaluation("profit_target", int(state.elapsed_bars), price)
+    if price <= float(state.lower_stop_barrier):
+        state.exit_trigger_source = "stop_loss"
+        state.final_execution_duration_bars = int(state.elapsed_bars)
+        return TripleBarrierEvaluation("stop_loss", int(state.elapsed_bars), price)
+
+    if count_bar_close and isinstance(bar_timestamp, datetime):
+        bar_key = bar_timestamp.isoformat()
+        if bar_key and bar_key != str(state.last_bar_timestamp or ""):
+            if str(state.last_bar_timestamp or ""):
+                state.elapsed_bars += 1
+            state.last_bar_timestamp = bar_key
+
+    if int(state.elapsed_bars) >= int(state.max_duration_bars):
+        state.exit_trigger_source = "horizon_expiry"
+        state.final_execution_duration_bars = int(state.elapsed_bars)
+        return TripleBarrierEvaluation("horizon_expiry", int(state.elapsed_bars), price)
+
+    return TripleBarrierEvaluation(None, int(state.elapsed_bars), price)
 
 
 class ExitEnvironment:

@@ -1,0 +1,805 @@
+{
+  "_schema": "niftyscalper_live_feature_schema_v1",
+  "_description": "Schema map for all 114 features used in core_retrain_20260606_093842 models. Maps each feature to its required source, computation method, fallback policy, and prediction-blocking behaviour.",
+  "_source_model": "core_retrain_20260606_093842",
+  "_feature_count": 114,
+
+  "open": {
+    "required_source": "option_chain",
+    "computation_method": "Direct from option chain: oc.get('open') or option_contract_open_price",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "high": {
+    "required_source": "option_chain",
+    "computation_method": "Direct from option chain: oc.get('high') or option_contract_day_high",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "low": {
+    "required_source": "option_chain",
+    "computation_method": "Direct from option chain: oc.get('low') or option_contract_day_low",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ltp": {
+    "required_source": "option_chain",
+    "computation_method": "Direct from option chain: oc.get('ltp') or last_traded_price_of_contract",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "volume": {
+    "required_source": "option_chain",
+    "computation_method": "Direct from option chain: oc.get('volume') or contract_volume_today",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "oi": {
+    "required_source": "option_chain",
+    "computation_method": "Direct from option chain: oc.get('oi') or open_interest_of_contract",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "strike_price": {
+    "required_source": "option_context",
+    "computation_method": "Direct from option chain: oc.get('strike') or contract_strike_price",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "weekly": {
+    "required_source": "option_context",
+    "computation_method": "Direct from option chain: oc.get('is_weekly') or is_weekly_expiry",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "dte_days": {
+    "required_source": "option_context",
+    "computation_method": "Direct from option chain: oc.get('dte_days') or days_to_expiry_from_contract",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "is_weekly": {
+    "required_source": "option_context",
+    "computation_method": "Direct from option chain: oc.get('is_weekly') — bool flag",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "option_type_ce": {
+    "required_source": "option_context",
+    "computation_method": "oc.get('option_type') == 'CE' → 1.0 else 0.0",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "option_type_pe": {
+    "required_source": "option_context",
+    "computation_method": "oc.get('option_type') == 'PE' → 1.0 else 0.0",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "range_pct": {
+    "required_source": "candle",
+    "computation_method": "(candle.high - candle.low) / candle.close",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "oc_change_pct": {
+    "required_source": "option_chain",
+    "computation_method": "(oc.get('ltp') - oc.get('open')) / oc.get('open')",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "hl_change_pct": {
+    "required_source": "option_chain",
+    "computation_method": "(oc.get('high') - oc.get('low')) / oc.get('low')",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "oi_change_pct": {
+    "required_source": "option_chain",
+    "computation_method": "oc.get('change_in_oi') / oc.get('oi') if oi > 0",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "volume_change_pct": {
+    "required_source": "option_chain",
+    "computation_method": "Requires previous bar volume; live fallback is 0.0 (not computable without history)",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "ret_1": {
+    "required_source": "rolling",
+    "computation_method": "(closes[-1] - closes[-2]) / closes[-2] — 1-period return",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ret_3": {
+    "required_source": "rolling",
+    "computation_method": "(closes[-1] - closes[-4]) / closes[-4] — 3-period return",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ret_5": {
+    "required_source": "rolling",
+    "computation_method": "(closes[-1] - closes[-6]) / closes[-6] — 5-period return",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "oi_z_5": {
+    "required_source": "rolling",
+    "computation_method": "(oi - mean(oi[-5:])) / std(oi[-5:]) — requires 5-bar OI history; NOT computable in live snapshot without rolling store",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "volume_z_5": {
+    "required_source": "rolling",
+    "computation_method": "(vol - mean(vol[-5:])) / std(vol[-5:]) — requires 5-bar volume history; NOT computable in live snapshot without rolling store",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "weekday": {
+    "required_source": "time",
+    "computation_method": "float(dt.weekday()) — 0=Monday through 6=Sunday",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "month": {
+    "required_source": "time",
+    "computation_method": "float(dt.month) — 1 through 12",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "open_spot": {
+    "required_source": "candle",
+    "computation_method": "candles[0].open — first candle of the day (opening spot price)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "high_spot": {
+    "required_source": "candle",
+    "computation_method": "max(c.high for c in candles) — intraday spot high",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "low_spot": {
+    "required_source": "candle",
+    "computation_method": "min(c.low for c in candles) — intraday spot low",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "close": {
+    "required_source": "candle",
+    "computation_method": "candles[-1].close — last candle close price",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "volume_spot": {
+    "required_source": "candle",
+    "computation_method": "candles[-1].volume — last candle volume (spot market)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "spot_close": {
+    "required_source": "candle",
+    "computation_method": "candles[-1].close — same as 'close', spot market reference",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "spot_range_pct": {
+    "required_source": "candle",
+    "computation_method": "(max(c.high) - min(c.low)) / spot",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "spot_atr": {
+    "required_source": "candle",
+    "computation_method": "atr(candles, period=14) using spot candles",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "spot_rsi": {
+    "required_source": "candle",
+    "computation_method": "rsi([c.close for c in candles], period=14)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "spot_vwap": {
+    "required_source": "candle",
+    "computation_method": "sum(typical_price * volume) / sum(volume) where typical = (h+l+c)/3",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ctx_time_sin": {
+    "required_source": "time",
+    "computation_method": "sin(2π * session_minutes / 1440.0) — cyclical encoding of time-of-day",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ctx_time_cos": {
+    "required_source": "time",
+    "computation_method": "cos(2π * session_minutes / 1440.0) — cyclical encoding of time-of-day",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "is_opening_session": {
+    "required_source": "time",
+    "computation_method": "1.0 if 9:15 <= hour*60+min <= 10:30 else 0.0",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "weekday_spot": {
+    "required_source": "time",
+    "computation_method": "float(dt.weekday()) — same as 'weekday', spot market context",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ctx_spot": {
+    "required_source": "candle",
+    "computation_method": "snapshot.spot — current underlying spot price",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "distance_from_spot": {
+    "required_source": "option_context",
+    "computation_method": "abs(strike - spot) / spot",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "atm_distance": {
+    "required_source": "option_context",
+    "computation_method": "(strike - spot) / spot — negative=OTM, positive=ITM",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "strike_distance_pct": {
+    "required_source": "option_context",
+    "computation_method": "abs(strike - spot) / spot — same as distance_from_spot",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ctx_dte_norm": {
+    "required_source": "option_context",
+    "computation_method": "dte_days / 30.0 — normalised days-to-expiry (0-1 scale)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "last_open": {
+    "required_source": "candle",
+    "computation_method": "candles[-1].open — most recent candle open",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "last_high": {
+    "required_source": "candle",
+    "computation_method": "candles[-1].high — most recent candle high",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "last_low": {
+    "required_source": "candle",
+    "computation_method": "candles[-1].low — most recent candle low",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "last_close": {
+    "required_source": "candle",
+    "computation_method": "candles[-1].close — most recent candle close",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "last_volume": {
+    "required_source": "candle",
+    "computation_method": "candles[-1].volume — most recent candle volume",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "body_pct": {
+    "required_source": "candle",
+    "computation_method": "(candle.close - candle.open) / candle.close",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "gap_pct": {
+    "required_source": "candle",
+    "computation_method": "(candle.open - prev_candle.close) / prev_candle.close",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "upper_wick_pct": {
+    "required_source": "candle",
+    "computation_method": "(candle.high - max(candle.open, candle.close)) / (candle.high - candle.low)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "lower_wick_pct": {
+    "required_source": "candle",
+    "computation_method": "(min(candle.open, candle.close) - candle.low) / (candle.high - candle.low)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "close_location_pct": {
+    "required_source": "candle",
+    "computation_method": "(candle.close - candle.low) / (candle.high - candle.low) — 0=close at low, 1=close at high",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ret_10": {
+    "required_source": "rolling",
+    "computation_method": "(closes[-1] - closes[-11]) / closes[-11] — 10-period return",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ema_fast": {
+    "required_source": "candle",
+    "computation_method": "ema([c.close for c in candles], period=9)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ema_slow": {
+    "required_source": "candle",
+    "computation_method": "ema([c.close for c in candles], period=21)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ema_diff_pct": {
+    "required_source": "candle",
+    "computation_method": "(ema_fast - ema_slow) / candle.close",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "rsi_14": {
+    "required_source": "candle",
+    "computation_method": "rsi([c.close for c in candles], period=14)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "atr_14": {
+    "required_source": "candle",
+    "computation_method": "atr(candles, period=14) using option contract candles",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "atr_pct": {
+    "required_source": "candle",
+    "computation_method": "atr_14 / candle.close",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ctx_option_price": {
+    "required_source": "option_chain",
+    "computation_method": "oc.get('ltp') — same as ltp; context name for option contract price",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "option_to_spot_pct": {
+    "required_source": "option_context",
+    "computation_method": "oc.get('ltp') / snapshot.spot",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "volume_ratio": {
+    "required_source": "candle",
+    "computation_method": "last_volume / vol_mean (over lookback window)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "bullish_engulfing": {
+    "required_source": "candle",
+    "computation_method": "is_bullish_engulfing([prev_candle, last_candle]) — 1.0 if pattern detected",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "bearish_engulfing": {
+    "required_source": "candle",
+    "computation_method": "is_bearish_engulfing([prev_candle, last_candle]) — 1.0 if pattern detected",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "doji": {
+    "required_source": "candle",
+    "computation_method": "is_doji([last_candle], threshold=0.1) — 1.0 if body/range <= 0.1",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "hammer": {
+    "required_source": "candle",
+    "computation_method": "is_hammer([last_candle]) — 1.0 if hammer shape AND downtrend before",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "shooting_star": {
+    "required_source": "candle",
+    "computation_method": "is_shooting_star([last_candle]) — 1.0 if inverted hammer shape AND uptrend before",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ret_mean": {
+    "required_source": "rolling",
+    "computation_method": "mean(returns_series) over lookback window",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ret_std": {
+    "required_source": "rolling",
+    "computation_method": "pstdev(returns_series) over lookback window",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ret_min": {
+    "required_source": "rolling",
+    "computation_method": "min(returns_series) over lookback window",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ret_max": {
+    "required_source": "rolling",
+    "computation_method": "max(returns_series) over lookback window",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "vol_mean": {
+    "required_source": "rolling",
+    "computation_method": "mean(volumes_series) over lookback window",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "vol_std": {
+    "required_source": "rolling",
+    "computation_method": "pstdev(volumes_series) over lookback window",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "vol_min": {
+    "required_source": "rolling",
+    "computation_method": "min(volumes_series) over lookback window",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "vol_max": {
+    "required_source": "rolling",
+    "computation_method": "max(volumes_series) over lookback window",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "adx_14": {
+    "required_source": "candle",
+    "computation_method": "adx(candles, period=14) using Wilder's smoothing",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "choppiness_14": {
+    "required_source": "candle",
+    "computation_method": "choppiness_index(candles, period=14) — 0=strong trend, 100=choppy",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "supertrend_dir": {
+    "required_source": "candle",
+    "computation_method": "supertrend(candles, period=10, multiplier=3.0). direction: 1=up, -1=down",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "pivot_pp_dist_pct": {
+    "required_source": "candle",
+    "computation_method": "(close - pivot_pp) / close where pivot_pp = (high+low+close)/3",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "pivot_r1_dist_pct": {
+    "required_source": "candle",
+    "computation_method": "(close - pivot_r1) / close where pivot_r1 = 2*pp - low",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "pivot_s1_dist_pct": {
+    "required_source": "candle",
+    "computation_method": "(close - pivot_s1) / close where pivot_s1 = 2*pp - high",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "close_vs_open_pct": {
+    "required_source": "candle",
+    "computation_method": "(candle.close - candle.open) / candle.close",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "range_to_atr": {
+    "required_source": "candle",
+    "computation_method": "range_pct / atr_pct",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "momentum_lookback_pct": {
+    "required_source": "candle",
+    "computation_method": "(close - close[0 of lookback]) / close[0 of lookback]",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "regime_trending": {
+    "required_source": "candle",
+    "computation_method": "detect_regime(atr_vals, adx_vals, rsi_vals) == 'trending' → 1.0 else 0.0",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "regime_volatile": {
+    "required_source": "candle",
+    "computation_method": "detect_regime(atr_vals, adx_vals, rsi_vals) == 'volatile' → 1.0 else 0.0",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "regime_mean_reverting": {
+    "required_source": "candle",
+    "computation_method": "detect_regime(atr_vals, adx_vals, rsi_vals) == 'mean_reverting' → 1.0 else 0.0",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "regime_quiet": {
+    "required_source": "candle",
+    "computation_method": "detect_regime(atr_vals, adx_vals, rsi_vals) == 'quiet' → 1.0 else 0.0",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "ctx_adx": {
+    "required_source": "candle",
+    "computation_method": "adx(candles, period=14) — same as adx_14, context-named",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ctx_trend_strength": {
+    "required_source": "candle",
+    "computation_method": "adx(candles, period=14) / 100.0 — normalised trend strength",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ctx_choppiness": {
+    "required_source": "candle",
+    "computation_method": "choppiness_index(candles, period=14) — same as choppiness_14, context-named",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ctx_volume_sma": {
+    "required_source": "rolling",
+    "computation_method": "sma(volumes, period=lookback) — rolling volume SMA",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "vol_of_vol_14": {
+    "required_source": "candle",
+    "computation_method": "std(atr_pct_series[-14:]) — standard deviation of ATR% over 14 periods",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "dist_from_opening_high_pct": {
+    "required_source": "rolling",
+    "computation_method": "(close - opening_range_high) / opening_range_high — distance from 9:15-9:45 opening range high",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "dist_from_opening_low_pct": {
+    "required_source": "rolling",
+    "computation_method": "(close - opening_range_low) / opening_range_low — distance from 9:15-9:45 opening range low",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "opening_range_width_pct": {
+    "required_source": "rolling",
+    "computation_method": "(opening_range_high - opening_range_low) / close",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "dist_to_rolling_high_20": {
+    "required_source": "rolling",
+    "computation_method": "(rolling_high_20 - close) / close — distance to 20-bar rolling high",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "dist_to_rolling_low_20": {
+    "required_source": "rolling",
+    "computation_method": "(close - rolling_low_20) / close — distance to 20-bar rolling low",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "rolling_range_width_20": {
+    "required_source": "rolling",
+    "computation_method": "(rolling_high_20 - rolling_low_20) / close — 20-bar range as % of close",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "rolling_range_position_20": {
+    "required_source": "rolling",
+    "computation_method": "(close - rolling_low_20) / (rolling_high_20 - rolling_low_20) — 0=at low, 1=at high",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "realized_vol_30": {
+    "required_source": "rolling",
+    "computation_method": "pstdev(returns_series[-30:]) — realised volatility over 30 periods",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "atr_pct_regime_10": {
+    "required_source": "candle",
+    "computation_method": "atr_pct / mean(atr_pct_series[-10:]) — current ATR% relative to 10-bar mean",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "atr_percentile_60": {
+    "required_source": "candle",
+    "computation_method": "rolling_percentile(atr_pct_history, current_atr_pct, window=60)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "realized_vol_percentile_60": {
+    "required_source": "candle",
+    "computation_method": "rolling_percentile(realized_vol_history, current_rv, window=60)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "volatility_percentile_60": {
+    "required_source": "candle",
+    "computation_method": "Same as realized_vol_percentile_60 — volatility percentile over 60 periods",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "volatility_regime_classifier": {
+    "required_source": "candle",
+    "computation_method": "1.0 if (atr_percentile_60 >= 0.7 or realized_vol_percentile_60 >= 0.7) else 0.0",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "oi_CE": {
+    "required_source": "option_chain",
+    "computation_method": "oc.get('oi_CE') — ATM/CE open interest from option chain (not individual contract)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "oi_PE": {
+    "required_source": "option_chain",
+    "computation_method": "oc.get('oi_PE') — ATM/PE open interest from option chain (not individual contract)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "volume_CE": {
+    "required_source": "option_chain",
+    "computation_method": "oc.get('volume_CE') — ATM/CE volume from option chain (not individual contract)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "volume_PE": {
+    "required_source": "option_chain",
+    "computation_method": "oc.get('volume_PE') — ATM/PE volume from option chain (not individual contract)",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  },
+  "ce_pe_oi_ratio": {
+    "required_source": "option_chain",
+    "computation_method": "oi_CE / oi_PE if oi_PE > 0 else 0.0",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "ce_pe_volume_ratio": {
+    "required_source": "option_chain",
+    "computation_method": "volume_CE / volume_PE if volume_PE > 0 else 0.0",
+    "fallback_allowed": true,
+    "fallback_value": 0.0,
+    "blocks_prediction_if_missing": false
+  },
+  "final_iv": {
+    "required_source": "option_chain",
+    "computation_method": "oc.get('iv') or snapshot.atm_iv — contract implied volatility",
+    "fallback_allowed": false,
+    "fallback_value": null,
+    "blocks_prediction_if_missing": true
+  }
+}

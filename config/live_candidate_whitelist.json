@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-06-17T12:52:21.853640+00:00",
+  "mode": "live_dryrun_or_1lot_whitelist",
+  "safety_note": "Only whitelisted candidates with status LIVE_1_LOT or LIVE_SCALED may attempt real orders, and only when ORDER_PLACEMENT_ENABLED=true and LIVE_ORDER_DRY_RUN=false.",
+  "candidates": [],
+  "run_timestamp": "20260617_125221",
+  "promoted_to_live_dry_run": [],
+  "blocked_from_live_dry_run": [
+    {
+      "candidate_id": "elasticnet_BOTH_directional_auto_BOTH_dir_auto_t30_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "elasticnet_BOTH_directional_auto_BOTH_dir_auto_t35_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "logistic_regression_BOTH_directional_auto_BOTH_dir_auto_t30_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "logistic_regression_BOTH_directional_auto_BOTH_dir_auto_t35_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "calibrated_logistic_regression_BOTH_symmetric_BOTH_sym_t30_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "calibrated_logistic_regression_BOTH_symmetric_BOTH_sym_t35_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "xgboost_volatility_breakout_vol_breakout_t30_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "xgboost_volatility_breakout_vol_breakout_t35_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "elasticnet_PE_only_balanced_PE_only_balanced_t30_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "elasticnet_PE_only_balanced_PE_only_balanced_t35_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "elasticnet_BOTH_auto_balanced_BOTH_auto_bal_t30_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "elasticnet_BOTH_auto_balanced_BOTH_auto_bal_t35_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "logistic_regression_BOTH_auto_balanced_BOTH_auto_bal_t30_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "logistic_regression_BOTH_auto_balanced_BOTH_auto_bal_t35_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "xgboost_cost_survivor_balanced_cost_surv_bal_t30_20260610_130953",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "elasticnet_PE_only_conservative_PE_only_conservative_t30_20260610_142947",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "elasticnet_PE_only_conservative_PE_only_conservative_t35_20260610_142947",
+      "reason": "shadow_trade_count 0 < min 2"
+    },
+    {
+      "candidate_id": "elasticnet_PE_only_conservative_PE_only_conservative_t40_20260610_142947",
+      "reason": "shadow_trade_count 0 < min 2"
+    }
+  ],
+  "policy": "only the single best and safest candidate may receive LIVE_DRY_RUN + live_whitelisted=true"
+}

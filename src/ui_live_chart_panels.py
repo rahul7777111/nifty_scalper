@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 import json
 import logging
+import traceback
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -21,6 +22,7 @@ import matplotlib.dates as mdates
 from live_chart_snapshot import (
     LiveChartSnapshot,
     build_live_chart_snapshot,
+    normalize_live_chart_candles,
     option_chain_to_summary,
     compute_shadow_metrics,
     assess_data_health,
@@ -94,6 +96,52 @@ def wire_live_chart_panels(app: Any) -> None:
     # Expose the safe refresh method on ScalperUI
     app.refresh_live_chart_snapshot = lambda snapshot, a=app: refresh_live_chart_snapshot(a, snapshot)
 
+    # Start the always-on live chart refresh loop (app-scope; survives Stop Bot).
+    if not hasattr(app, "_lc_refresh_sec"):
+        app._lc_refresh_sec = 3.0
+    try:
+        app._safe_after_app("live_chart_refresh", 2000, _refresh_live_chart_tab, app, False)
+        print("[TAB-REFRESH] live_chart refresh loop scheduled", flush=True)
+    except Exception as exc:
+        print(f"[TAB-REFRESH][live_chart][ERROR] schedule failed: {exc}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Chart plugin mount (correct parent = chart_area)
+# ---------------------------------------------------------------------------
+
+def _mount_live_chart_plugin(app: Any, chart_area: tk.Frame) -> None:
+    """Create or recreate LiveChartPlugin with chart_area as the canvas parent."""
+    import os
+    from chart import LiveChartPlugin
+
+    underlying = (os.getenv("MSTOCK_UNDERLYING") or os.getenv("MSTOCK_SYMBOL") or "NIFTY").strip()
+    limit = int(getattr(app, "_candle_limit", 500) or 500)
+
+    old = getattr(app, "live_chart_plugin", None)
+    if old is not None:
+        try:
+            widget = old.canvas.get_tk_widget()
+            if widget.master is chart_area:
+                old.set_max_candles(limit)
+                return
+            widget.destroy()
+        except Exception:
+            pass
+        try:
+            import matplotlib.pyplot as plt
+            plt.close(old.fig)
+        except Exception:
+            pass
+
+    app.live_chart_plugin = LiveChartPlugin(chart_area, symbol=underlying, timeframe="1m")
+    app.live_chart_plugin.set_max_candles(limit)
+    try:
+        app.live_chart_plugin.set_lock_to_live(True)
+    except Exception:
+        pass
+    print(f"[CHART-MOUNT] plugin parent=chart_area symbol={underlying}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Tab construction
@@ -164,21 +212,34 @@ def _build_live_chart_tab(app: Any) -> None:
     right_cards = tk.Frame(main_pw, bg=BG_DARK)
     main_pw.add(right_cards, minsize=320, stretch="never")
 
-    # Build chart toolbar and re-pack the live_chart_plugin canvas into chart_area below toolbar
-    if hasattr(app, "live_chart_plugin") and app.live_chart_plugin:
-        toolbar_frame = tk.Frame(chart_area, bg=BG_CARD, bd=1, relief="solid")
-        toolbar_frame.pack(fill=tk.X, side=tk.TOP, padx=2, pady=2)
-        
-        _build_chart_toolbar(app, toolbar_frame, main_pw, right_cards, bottom_notebook)
-        
-        canvas = app.live_chart_plugin.canvas.get_tk_widget()
-        canvas.configure(bg=BG_DARK)
-        canvas.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
-        
-        # Click binding
-        canvas.bind("<Button-1>", lambda event: _on_chart_canvas_click(app, event))
+    # Toolbar + chart canvas (plugin MUST be parented to chart_area)
+    toolbar_frame = tk.Frame(chart_area, bg=BG_CARD, bd=1, relief="solid")
+    toolbar_frame.pack(fill=tk.X, side=tk.TOP, padx=2, pady=2)
+    _build_chart_toolbar(app, toolbar_frame, main_pw, right_cards, bottom_notebook)
 
-        # Keyboard shortcuts — require focus on canvas
+    _mount_live_chart_plugin(app, chart_area)
+
+    if getattr(app, "live_chart_plugin", None):
+        canvas = app.live_chart_plugin.canvas.get_tk_widget()
+        canvas.configure(bg=BG_DARK, highlightthickness=0)
+
+        # Paint immediately; otherwise Tk can show a white canvas until the
+        # next data refresh, which looks like the chart failed to mount.
+        try:
+            cached = getattr(app, "_chart_candles", None) or getattr(app, "_latest_candles", None) or []
+            if cached:
+                app.live_chart_plugin.push_candles(list(cached))
+            else:
+                app.live_chart_plugin._dirty = True
+                app.live_chart_plugin._render_on_ui_thread()
+        except Exception:
+            try:
+                app.live_chart_plugin._dirty = True
+                app.live_chart_plugin._render_on_ui_thread()
+            except Exception:
+                pass
+
+        canvas.bind("<Button-1>", lambda event: _on_chart_canvas_click(app, event))
         canvas.bind("<Key-R>", lambda e: _on_key_reset_view(app))
         canvas.bind("<Key-r>", lambda e: _on_key_reset_view(app))
         canvas.bind("<Key-L>", lambda e: _on_key_toggle_lock(app))
@@ -189,9 +250,7 @@ def _build_live_chart_tab(app: Any) -> None:
         canvas.bind("<Key-f>", lambda e: _on_key_focus_signal(app))
         canvas.focus_set()
 
-        # Crosshair overlay — suppress built-in Matplotlib crosshair
-        if hasattr(app, "live_chart_plugin"):
-            app.live_chart_plugin.disable_crosshair()
+        app.live_chart_plugin.disable_crosshair()
         app._lc_crosshair = _CrosshairOverlay(app, canvas)
 
     # Right panel: single scrollable Market Intelligence column
@@ -597,6 +656,11 @@ def _build_current_prediction_card(app: Any, parent: tk.Frame) -> tk.LabelFrame:
 # ---------------------------------------------------------------------------
 # SHADOW METRICS CARD (horizontal layout in Bottom Notebook)
 # ---------------------------------------------------------------------------
+
+def _build_shadow_metrics_card(app: Any, parent: tk.Frame) -> None:
+    """Alias kept for import/tests — builds shadow metrics in parent."""
+    _build_shadow_performance_tab(app, parent)
+
 
 def _build_shadow_performance_tab(app: Any, parent: tk.Frame) -> None:
     """Premium Shadow Performance tab: metrics cards + mini equity curve."""
@@ -1296,6 +1360,8 @@ def refresh_live_chart_snapshot(app: Any, snapshot: LiveChartSnapshot) -> None:
                 trade_events = getattr(snapshot, "trade_events", None)
                 oc_sum = getattr(snapshot, "option_chain_summary", None)
                 plugin.update_from_snapshot(
+                    # Preserve the last good render when this refresh cycle has
+                    # metadata only and no fresh candle payload yet.
                     candles=snapshot.candles if has_candles else None,
                     spot=snapshot.spot_price,
                     futures=snapshot.futures_price,
@@ -1314,14 +1380,8 @@ def refresh_live_chart_snapshot(app: Any, snapshot: LiveChartSnapshot) -> None:
             except Exception as e:
                 logger.debug("Failed to refresh chart plugin variables: %s", e)
 
-        # 1b. Empty state — show overlay when no candles, hide when data arrives
-        if has_candles:
-            _hide_empty_state(app)
-        else:
-            _show_empty_state(app)
-            return  # Skip remaining card updates when waiting for data
-
-        # 2. Update Status Bar
+        # 1b. Clear any legacy Tk overlay — chart empty state is drawn on matplotlib axes.
+        _hide_empty_state(app)
 
         # 2. Update Status Bar
         try:
@@ -1356,6 +1416,36 @@ def refresh_live_chart_snapshot(app: Any, snapshot: LiveChartSnapshot) -> None:
             # Backwards compatibility fields
             sig = snapshot.current_signal or "NO_TRADE"
             app._lc_signal_var.set(f"Signal: {sig}")
+
+            # TASK: Feed paper-forward multi engine from live snapshot (even if candles=0, use oc data)
+            # Use gated publish + runtime merge; no direct engine call with poor data
+            if hasattr(app, "pf_engine") and getattr(app, "pf_engine", None):
+                mkt = {
+                    "timestamp": snapshot.timestamp.isoformat() if getattr(snapshot, "timestamp", None) else datetime.now(timezone.utc).isoformat(),
+                    "price": getattr(snapshot, "spot_price", None) or (snapshot.candles[-1].close if getattr(snapshot, "candles", None) else None),
+                    "regime": getattr(snapshot, "regime_label", "UNKNOWN"),
+                    "market_regime": getattr(snapshot, "regime_label", "UNKNOWN"),
+                }
+                oc = getattr(snapshot, "option_chain_summary", None)
+                chain = None
+                if oc:
+                    chain = {
+                        "ltp": getattr(oc, "ce_ltp", None) or getattr(oc, "pe_ltp", None) or getattr(snapshot, "spot_price", None),
+                        "best_bid": getattr(oc, "ce_bid", None) or getattr(oc, "pe_bid", None),
+                        "best_ask": getattr(oc, "ce_ask", None) or getattr(oc, "pe_ask", None),
+                        "volume": getattr(oc, "total_oi", None) or getattr(oc, "volume", None),
+                    }
+                try:
+                    if hasattr(app, "_pf_runtime") and app._pf_runtime:
+                        rt = app._pf_runtime
+                        if mkt.get("price"):
+                            rt.spot = mkt.get("price")
+                        if hasattr(app, "_publish_market_snapshot_to_paper_forward"):
+                            app._publish_market_snapshot_to_paper_forward(mkt, chain if chain else None, source="live_chart_candles_only_update")
+                    if hasattr(app, "_pf_refresh_monitor_ui") and hasattr(app, "pf_engine") and app.pf_engine:
+                        app._pf_refresh_monitor_ui(source="live_chart_snapshot")
+                except Exception as _e_pf:
+                    logger.debug("[PF-FEED] %s", _e_pf)
 
             pcr_val = snapshot.option_chain_summary.pcr if snapshot.option_chain_summary else None
             pcr_str = f"PCR: {pcr_val:.2f}" if pcr_val is not None else "PCR: --"
@@ -1402,11 +1492,13 @@ def refresh_live_chart_snapshot(app: Any, snapshot: LiveChartSnapshot) -> None:
         except Exception as e:
             logger.debug("Failed status bar refresh: %s", e)
 
-        # 3. Update current prediction card
+        # 3. Update current prediction card / ML status
         try:
+            print("[ML-STATUS] refreshing prediction card", flush=True)
             _refresh_current_prediction_card(app, snapshot)
-        except Exception:
-            pass
+        except Exception as e_ml:
+            print(f"[ML-STATUS][ERROR] {type(e_ml).__name__}: {e_ml}", flush=True)
+            traceback.print_exc()
 
         # 4. Update shadow performance tab
         try:
@@ -1424,9 +1516,14 @@ def refresh_live_chart_snapshot(app: Any, snapshot: LiveChartSnapshot) -> None:
 
         # 5. Update option chain card
         try:
+            print(
+                f"[OPTION-CHAIN] refresh has_data={snapshot.option_chain_summary is not None}",
+                flush=True,
+            )
             _refresh_option_chain_card(app, snapshot)
-        except Exception:
-            pass
+        except Exception as e_oc:
+            print(f"[OPTION-CHAIN][ERROR] {type(e_oc).__name__}: {e_oc}", flush=True)
+            traceback.print_exc()
 
         # 6. Update data health card
         try:
@@ -1471,35 +1568,74 @@ def refresh_live_chart_snapshot(app: Any, snapshot: LiveChartSnapshot) -> None:
 # ---------------------------------------------------------------------------
 
 def _refresh_live_chart_tab(app: Any, force: bool = False) -> None:
-    """Main refresh dispatcher — called every ~3s via _safe_after."""
+    """Main refresh dispatcher — called every ~3s via _safe_after_app."""
+    if getattr(app, "_ui_closing", False) or getattr(app, "_closing", False):
+        return
     _already_scheduled = False
     try:
         now_ts = time.time()
         last_ts = float(getattr(app, "_lc_refresh_ts", 0.0) or 0.0)
         refresh_sec = float(getattr(app, "_lc_refresh_sec", 3.0) or 3.0)
         if not force and (now_ts - last_ts) < refresh_sec:
-            # [UI-STABILITY] Throttled: schedule next tick and exit.
-            # The finally block below must skip rescheduling to avoid
-            # stacking duplicate after jobs (root cause of long-hour hangs).
-            app._safe_after(int(refresh_sec * 1000), _refresh_live_chart_tab, app, False)
+            app._safe_after_app(
+                "live_chart_refresh",
+                int(refresh_sec * 1000),
+                _refresh_live_chart_tab,
+                app,
+                False,
+            )
             _already_scheduled = True
             return
 
-        # Build the snapshot
+        print("[TAB-REFRESH] live_chart building snapshot", flush=True)
         snapshot = _build_snapshot(app)
+        candle_cnt = len(snapshot.candles or [])
+        draw_reason = "ok" if candle_cnt > 0 else "no_candles"
+        print(
+            f"[LIVE-CHART] candles={candle_cnt} draw_attempted=true reason={draw_reason}",
+            flush=True,
+        )
 
-        # Delegate refresh to the public API method
-        refresh_live_chart_snapshot(app, snapshot)
+        if not snapshot.candles and hasattr(app, "_fetch_and_push_initial_candles"):
+            last_fetch = float(getattr(app, "_lc_candle_fetch_ts", 0.0) or 0.0)
+            if (now_ts - last_fetch) >= 30.0 and not getattr(app, "_initial_candles_inflight", False):
+                app._lc_candle_fetch_ts = now_ts
+                try:
+                    app._fetch_and_push_initial_candles()
+                except Exception as e_fetch:
+                    print(f"[CANDLES-FETCH][ERROR] background refresh: {e_fetch}", flush=True)
+
+        refresh_tasks = [
+            ("chart_snapshot", lambda: refresh_live_chart_snapshot(app, snapshot)),
+        ]
+        drew = False
+        for name, fn in refresh_tasks:
+            try:
+                fn()
+                drew = True
+            except Exception as e:
+                print(f"[TAB-REFRESH][{name}][ERROR] {type(e).__name__}: {e}", flush=True)
+                traceback.print_exc()
+        if drew:
+            print(
+                f"[LIVE-CHART] candles={candle_cnt} draw_attempted=true reason=render_complete",
+                flush=True,
+            )
 
         app._lc_refresh_ts = now_ts
 
     except Exception as e:
-        logger.debug("Error in _refresh_live_chart_tab: %s", e)
+        print(f"[TAB-REFRESH][live_chart][ERROR] {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
     finally:
-        # [UI-STABILITY] Reschedule only if we did NOT already schedule
-        # during the throttled early-return path above.
-        if not _already_scheduled:
-            app._safe_after(3000, _refresh_live_chart_tab, app, False)
+        if not getattr(app, "_ui_closing", False) and not getattr(app, "_closing", False) and not _already_scheduled:
+            app._safe_after_app(
+                "live_chart_refresh",
+                int(float(getattr(app, "_lc_refresh_sec", 3.0) or 3.0) * 1000),
+                _refresh_live_chart_tab,
+                app,
+                False,
+            )
 
 
 def _build_snapshot(app: Any) -> LiveChartSnapshot:
@@ -1565,57 +1701,52 @@ def _build_snapshot(app: Any) -> LiveChartSnapshot:
             option_chain_payload = getattr(scalper, "_option_chain_cache", None)
             oc_source = "scalper._option_chain_cache"
 
-        # Candles — multi-source fallback priority (commit bf351fb / 57d00c5)
+        # Candles — multi-source fallback (prefer raw feed before resampled cache)
         raw_candles = None
         candle_source = "none"
-        if hasattr(app, "live_chart_plugin") and getattr(app.live_chart_plugin, "_candles", None):
-            raw_candles = app.live_chart_plugin._candles
-            candle_source = "live_chart_plugin"
+        plugin = getattr(app, "live_chart_plugin", None)
+        if plugin is not None and getattr(plugin, "_raw_candles", None):
+            raw_candles = plugin._raw_candles
+            candle_source = "live_chart_plugin._raw_candles"
         elif hasattr(app, "_latest_candles") and app._latest_candles:
             raw_candles = app._latest_candles
             candle_source = "app._latest_candles"
+        elif hasattr(app, "_chart_candles") and app._chart_candles:
+            raw_candles = app._chart_candles
+            candle_source = "app._chart_candles"
+        elif plugin is not None and getattr(plugin, "_candles", None):
+            raw_candles = plugin._candles
+            candle_source = "live_chart_plugin._candles"
         elif hasattr(app, "_candles") and app._candles:
             raw_candles = app._candles
             candle_source = "app._candles"
-        elif scalper is not None and getattr(scalper, "_candles", None):
-            raw_candles = scalper._candles
-            candle_source = "scalper._candles"
         elif scalper is not None and getattr(scalper, "_spot_candles", None):
             raw_candles = scalper._spot_candles
             candle_source = "scalper._spot_candles"
+        elif scalper is not None and getattr(scalper, "_candles", None):
+            raw_candles = scalper._candles
+            candle_source = "scalper._candles"
 
-        # Normalize: resolve time/timestamp mismatch, sort, dedupe (inline, cf. normalize_live_chart_candles)
-        normalized = []
+        normalized: list[Any] = []
         if raw_candles:
             try:
-                from pandas import to_datetime as _pd_tt  # noqa: N811
-                # Normalize each candle to a sortable time field
-                norm_candles = []
-                for c in raw_candles:
-                    t_raw = c.time if hasattr(c, "time") else (getattr(c, "timestamp", None) if hasattr(c, "timestamp") else None)
-                    if t_raw is None:
-                        continue
-                    # Ensure comparable datetime
-                    if isinstance(t_raw, (int, float)):
-                        t_norm = _pd_tt(t_raw, unit="s", utc=True).tz_localize(None).to_pydatetime()
-                    elif isinstance(t_raw, str):
-                        t_norm = _pd_tt(t_raw).to_pydatetime()
-                    else:
-                        t_norm = t_raw  # already datetime-like
-                    norm_candles.append((t_norm, c))
-
-                # Sort by normalized time
-                norm_candles.sort(key=lambda x: x[0])
-
-                # Deduplicate by time
-                seen_times = set()
-                for t_norm, c in norm_candles:
-                    if t_norm not in seen_times:
-                        seen_times.add(t_norm)
-                        normalized.append(c)
+                normalized = normalize_live_chart_candles(raw_candles)
             except Exception as e_norm:
                 logger.warning("[LIVE_CHART] candle normalization failed: %s", e_norm)
                 normalized = list(raw_candles) if raw_candles else []
+            print(
+                f"[CANDLES-NORMALIZE] source={candle_source} raw={len(raw_candles)} "
+                f"normalized={len(normalized)}",
+                flush=True,
+            )
+            if normalized:
+                try:
+                    app._chart_candles = list(normalized)
+                    app.candles = list(normalized)
+                    if getattr(app, "_dash_candles_var", None) is not None:
+                        app._dash_candles_var.set(str(len(normalized)))
+                except Exception:
+                    pass
 
         # Push normalized candles back into plugin so it stays in sync
         if hasattr(app, "live_chart_plugin") and normalized:
@@ -1677,7 +1808,7 @@ def _build_snapshot(app: Any) -> LiveChartSnapshot:
         if candles:
             try:
                 c = candles[-1]
-                t = c.time if hasattr(c, "time") else None
+                t = getattr(c, "time", None) or getattr(c, "timestamp", None)
                 if t is not None:
                     last_candle_ts = float(t) if not isinstance(t, datetime) else t.timestamp()
             except Exception:
@@ -1744,13 +1875,163 @@ def _refresh_status_bar(app: Any, snap: LiveChartSnapshot) -> None:
     pass
 
 
+def _load_active_candidate_status() -> dict:
+    """Best-effort load of active candidate profile for GUI/shadow display."""
+    import os
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    active_id = (os.getenv("MSTOCK_ACTIVE_CANDIDATE_ID") or "").strip()
+    search_dirs = [
+        root / "artifacts" / "candidates",
+        root / "models" / "candidates",
+    ]
+    if active_id:
+        for base in search_dirs:
+            cand = base / active_id
+            prof = cand / "candidate_profile.json"
+            if prof.exists():
+                try:
+                    return json.loads(prof.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+    for base in search_dirs:
+        if not base.is_dir():
+            continue
+        for prof in sorted(base.glob("*/candidate_profile.json"), reverse=True):
+            try:
+                data = json.loads(prof.read_text(encoding="utf-8"))
+                meta = data.get("shadow_mode_metadata") or {}
+                if meta.get("shadow_ready"):
+                    return data
+            except Exception:
+                continue
+    return {}
+
+
+def _get_runtime_router_decision() -> dict:
+    """Pull latest runtime decision from candidate_router (populated by strategy/shadow/paper)."""
+    try:
+        from candidate_router import get_last_router_decision
+        dec = get_last_router_decision()
+        return dec or {}
+    except Exception:
+        return {}
+
+
 def _refresh_current_prediction_card(app: Any, snap: LiveChartSnapshot) -> None:
     try:
+        cand = _load_active_candidate_status()
+        runtime = _get_runtime_router_decision()
+
+        # Static artifact metadata (best effort)
+        if cand:
+            preset_family = cand.get("preset_family", "--")
+            side = cand.get("side_policy", "--")
+            model = cand.get("model_name", "--")
+            gates = cand.get("gate_results") or {}
+            shadow_ready = (cand.get("shadow_mode_metadata") or {}).get("shadow_ready", False)
+            print(
+                f"[ML-STATUS] candidate_id={cand.get('candidate_id')} model={model} "
+                f"preset_family={preset_family} side={side} shadow_ready={shadow_ready} "
+                f"gates={gates.get('gate_pass_count', 0)}/{gates.get('gate_pass_count', 0) + gates.get('gate_fail_count', 0)}",
+                flush=True,
+            )
+            if hasattr(app, "_lc_pred_model_var"):
+                app._lc_pred_model_var.set(f"Model: {model} ({preset_family})")
+            if hasattr(app, "_lc_model_var"):
+                app._lc_model_var.set(f"Model: {model} | Side: {side}")
+
+        # --- PHASE 7: Runtime decision display (actual router output, not just artifact) ---
+        if runtime:
+            # Prefer runtime values (these are what actually drove the last decision)
+            rt_cid = runtime.get("candidate_id") or (cand.get("candidate_id") if cand else "--")
+            rt_model = runtime.get("model_name") or (cand.get("model_name") if cand else "--")
+            rt_pf = runtime.get("preset_family") or (cand.get("preset_family") if cand else "--")
+            rt_preset = runtime.get("selected_preset") or "N/A"
+            rt_side_pol = runtime.get("side_policy", "--")
+            rt_side_dec = runtime.get("side_decision", "--")
+            rt_conf = runtime.get("confidence", 0.0)
+            rt_thr = runtime.get("threshold", 0.0)
+            rt_reg = runtime.get("market_regime", "unknown")
+            rt_liq = runtime.get("liquidity_state", "unknown")
+            rt_cost = "PASS" if runtime.get("allowed_by_cost") else ("FAIL" if runtime.get("no_trade_reason") else "N/A")
+            rt_risk = "PASS" if runtime.get("allowed_by_risk") else "N/A"
+            rt_final = runtime.get("final_signal", "NO_TRADE")
+            rt_reason = runtime.get("no_trade_reason", "")
+            rt_ts = runtime.get("timestamp", "--")
+
+            # Print full runtime decision for logs/audit
+            rt_artifact_id = runtime.get("artifact_id") or (cand.get("artifact_id") if cand else "--")
+            print(
+                f"[RUNTIME-DECISION] cid={rt_cid} artifact_id={rt_artifact_id} model={rt_model} preset={rt_preset} "
+                f"side_pol={rt_side_pol} side={rt_side_dec} conf={rt_conf:.4f} thr={rt_thr:.4f} "
+                f"regime={rt_reg} liq={rt_liq} cost={rt_cost} risk={rt_risk} final={rt_final} "
+                f"reason={rt_reason} ts={rt_ts}",
+                flush=True,
+            )
+
+            # Update UI vars where they exist (non-crashing)
+            if hasattr(app, "_lc_pred_model_var"):
+                app._lc_pred_model_var.set(f"Model: {rt_model} ({rt_pf}) | Preset: {rt_preset}")
+            if hasattr(app, "_lc_model_var"):
+                app._lc_model_var.set(f"Model: {rt_model} | SidePolicy: {rt_side_pol} | Side: {rt_side_dec}")
+            # Extend common prediction card fields if present on app
+            if hasattr(app, "_lc_pred_direction_var"):
+                app._lc_pred_direction_var.set(f"Final: {rt_final} (side:{rt_side_dec})")
+            if hasattr(app, "_lc_pred_probability_var"):
+                app._lc_pred_probability_var.set(f"Conf: {rt_conf*100:.1f}% (thr {rt_thr:.2f})")
+            if hasattr(app, "_lc_pred_confidence_var"):
+                app._lc_pred_confidence_var.set(f"Regime: {rt_reg} | Liq: {rt_liq}")
+            if hasattr(app, "_lc_pred_threshold_var"):
+                app._lc_pred_threshold_var.set(f"CostGate: {rt_cost} | Risk: {rt_risk}")
+            if hasattr(app, "_lc_pred_time_var"):
+                app._lc_pred_time_var.set(f"Last: {str(rt_ts)[-8:]}")
+            if hasattr(app, "_lc_pred_regime_var"):
+                app._lc_pred_regime_var.set(f"Signal: {rt_final} reason={rt_reason or 'ok'}")
+            if hasattr(app, "_lc_pred_edge_var"):
+                app._lc_pred_edge_var.set(f"ShadowReady: {runtime.get('shadow_ready', False)} Forced: {runtime.get('forced_eval', False)}")
+        else:
+            # No runtime decision yet - provide exact reason (TASK)
+            reason = "no active candidate configured"
+            try:
+                if hasattr(app, "pf_engine") and getattr(app, "pf_engine", None):
+                    reason = "paper multi running (see Paper Forward Monitor tab)"
+                elif not os.path.exists("config/paper_forward_candidates.json"):
+                    reason = "candidate file missing (config/paper_forward_candidates.json)"
+                elif os.getenv("MSTOCK_ENABLE_LIVE_ORDERS", "false").lower() in ("1","true","yes"):
+                    reason = "live orders enabled (blocked for paper)"
+                else:
+                    act = os.getenv("MSTOCK_ACTIVE_CANDIDATE_ID") or os.getenv("MSTOCK_ACTIVE_CANDIDATE_IDS")
+                    if hasattr(app, "pf_engine") and getattr(app, "pf_engine", None):
+                        try:
+                            cands = getattr(app.pf_engine, "candidates", []) or []
+                            n_total = len(cands)
+                            n_valid = sum(1 for c in cands if c.get("enabled", True) and not c.get("disabled_reason"))
+                            reason = f"paper_forward_multi running: valid={n_valid} invalid={n_total-n_valid}; see Paper Forward Monitor tab"
+                            print(f"[ML-STATUS] paper_multi=true valid_candidates={n_valid} invalid_candidates={n_total-n_valid} latest_snapshot_status=ok", flush=True)
+                        except Exception:
+                            reason = "paper multi running (see Paper Forward Monitor tab)"
+                    elif not act:
+                        if os.path.exists("config/paper_forward_candidates.json"):
+                            reason = "paper_forward_multi (candidates loaded from file; no single MSTOCK_ACTIVE_CANDIDATE_ID needed)"
+                        else:
+                            reason = "no active candidate (set MSTOCK_ACTIVE_CANDIDATE_ID or use paper_forward_multi)"
+                    else:
+                        reason = f"router not run yet for {act} (waiting for snapshot)"
+            except Exception:
+                pass
+            if hasattr(app, "_lc_pred_regime_var"):
+                app._lc_pred_regime_var.set(f"No candidate decision yet: {reason}")
+            print(f"[RUNTIME-DECISION] No candidate decision yet: {reason} (router has not run or no active candidate)", flush=True)
+
         pred = snap.latest_prediction
         if pred is None:
             _set_prediction_card_collecting(app)
             return
 
+        # Legacy snapshot prediction still shown as supplemental
         app._lc_pred_direction_var.set(f"Direction: {pred.side} {pred.instrument}")
 
         prob_pct = f"{pred.probability * 100:.1f}%" if pred.probability else "--"
@@ -2051,9 +2332,6 @@ def _refresh_timeline_from_rows(app: Any, rows: list[dict[str, Any]]) -> None:
         if tree is None:
             return
 
-        for iid in tree.get_children():
-            tree.delete(iid)
-
         # Sort if active
         sort_col = getattr(app, "_lc_tape_sort_col", None)
         sort_rev = getattr(app, "_lc_tape_sort_rev", False)
@@ -2068,6 +2346,7 @@ def _refresh_timeline_from_rows(app: Any, rows: list[dict[str, Any]]) -> None:
 
         filter_mode = app._lc_timeline_filter_var.get()
         count = 0
+        tape_rows: list[dict[str, Any]] = []
 
         for row in rows[:50]:
             try:
@@ -2115,13 +2394,31 @@ def _refresh_timeline_from_rows(app: Any, rows: list[dict[str, Any]]) -> None:
                 pnl = row.get("pnl")
                 pnl_str = f"{pnl:+.2f}" if pnl is not None else "--"
 
-                tree.insert("", tk.END,
-                           values=(ts_str, side, cp, strike, prob_str, edge_str,
-                                   status, reason[:50], pnl_str),
-                           tags=(tag,))
+                row_id = str(row.get("id") or row.get("prediction_id") or f"{ts_val}|{side}|{cp}|{strike}")
+                tape_rows.append({
+                    "iid": row_id,
+                    "values": (ts_str, side, cp, strike, prob_str, edge_str, status, reason[:50], pnl_str),
+                    "tags": (tag,),
+                })
                 count += 1
             except Exception:
                 continue
+
+        upsert = getattr(app, "_upsert_tree_rows", None)
+        if callable(upsert):
+            iid_map = getattr(app, "_lc_timeline_iid_map", {}) or {}
+            app._lc_timeline_iid_map = upsert(
+                tree,
+                tape_rows,
+                key_field="iid",
+                iid_map=iid_map,
+                tab="live_chart_timeline",
+            )
+        else:
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for payload in tape_rows:
+                tree.insert("", tk.END, iid=payload["iid"], values=payload["values"], tags=payload.get("tags") or ())
 
         app._lc_tape_count_var.set(f"{count} signals")
 

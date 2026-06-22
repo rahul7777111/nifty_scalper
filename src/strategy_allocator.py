@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional
 
+from capital_allocator import allocate_capital_across_sleeves, build_sleeve_scores
+
 def detect_regime(
     atr_values: Iterable[float], adx_values: Iterable[float], rsi_values: Iterable[float]
 ) -> str:
@@ -45,8 +47,8 @@ def detect_regime(
 _REGIME_TO_STRATEGY: Dict[str, str] = {
     "trending": "bull_call_spread",
     "volatile": "long_straddle",
-    "mean_reverting": "iron_condor",
-    "quiet": "short_strangle",
+    "mean_reverting": "mean_reversion",
+    "quiet": "stat_arb",
 }
 
 _REGIME_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -63,12 +65,12 @@ _REGIME_TUNING_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "mean_reverting": {
         "trend_mult": 0.75,
         "ml_threshold": 0.55,
-        "preferred": ["iron_condor", "iron_fly", "short_straddle"],
+        "preferred": ["mean_reversion", "iron_condor", "iron_fly", "short_straddle"],
     },
     "quiet": {
         "trend_mult": 0.65,
         "ml_threshold": 0.57,
-        "preferred": ["short_strangle", "iron_condor", "short_straddle"],
+        "preferred": ["stat_arb", "short_strangle", "iron_condor", "short_straddle"],
     },
 }
 
@@ -106,3 +108,44 @@ def select_strategy_for_regime(regime: str, cfg: Optional[Any] = None) -> str:
     if preferred:
         return str(preferred[0])
     return _REGIME_TO_STRATEGY.get(key, "directional")
+
+
+def allocate_sleeves_for_regime(
+    regime: str,
+    *,
+    account_capital: float,
+    trend_score: float,
+    mean_reversion_score: float,
+    stat_arb_score: float,
+    max_single_sleeve_weight: float = 0.50,
+    reserve_cash_weight: float = 0.10,
+    drawdown_throttle: float = 1.0,
+) -> Dict[str, Any]:
+    scores = build_sleeve_scores(
+        regime=str(regime or ""),
+        trend_score=float(trend_score),
+        mean_reversion_score=float(mean_reversion_score),
+        stat_arb_score=float(stat_arb_score),
+    )
+    allocations = allocate_capital_across_sleeves(
+        account_capital=float(account_capital),
+        sleeve_scores=scores,
+        max_single_sleeve_weight=float(max_single_sleeve_weight),
+        reserve_cash_weight=float(reserve_cash_weight),
+        drawdown_throttle=float(drawdown_throttle),
+    )
+    selected = "directional"
+    if allocations:
+        selected = max(allocations.values(), key=lambda row: float(getattr(row, "weight", 0.0))).sleeve
+    strategy_map = {
+        "trend": "directional",
+        "mean_reversion": "mean_reversion",
+        "stat_arb": "stat_arb",
+    }
+    return {
+        "regime": str(regime or "").strip().lower() or "quiet",
+        "scores": scores,
+        "allocations": allocations,
+        "selected_sleeve": selected,
+        "selected_strategy": strategy_map.get(selected, select_strategy_for_regime(regime, None)),
+    }

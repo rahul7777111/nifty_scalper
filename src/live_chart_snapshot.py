@@ -219,7 +219,7 @@ def _normalize_single_candle(row: Any, idx: int) -> Optional[Candle]:
 def _normalize_dict_candle(d: dict[str, Any]) -> Optional[Candle]:
     """Normalize a dict with time/timestamp/ts/date keys."""
     # Find the time value using multiple possible keys
-    t_raw = d.get("time") or d.get("timestamp") or d.get("ts") or d.get("date")
+    t_raw = d.get("timestamp") or d.get("time") or d.get("ts") or d.get("date")
     if t_raw is None:
         return None
 
@@ -245,7 +245,7 @@ def _normalize_dict_candle(d: dict[str, Any]) -> Optional[Candle]:
 
 def _normalize_object_candle(obj: Any) -> Optional[Candle]:
     """Normalize an object with time or timestamp attribute."""
-    t_raw = getattr(obj, "time", None) or getattr(obj, "timestamp", None)
+    t_raw = getattr(obj, "timestamp", None) or getattr(obj, "time", None)
     if t_raw is None:
         return None
 

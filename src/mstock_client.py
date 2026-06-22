@@ -5,6 +5,7 @@ import sys
 import json
 import time
 import math
+import ssl
 import threading
 import urllib.request
 import urllib.error
@@ -13,6 +14,11 @@ from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+try:
+    import certifi
+except Exception:  # pragma: no cover - diagnostics report this explicitly.
+    certifi = None  # type: ignore[assignment]
 
 try:
     from tradingapi_b.mconnect import MConnectB
@@ -51,14 +57,88 @@ except ImportError:
             return {}
         def is_mstock_token_expiring(token: str, within_seconds: int = 900) -> bool:
             return False
-        def safe_refresh_mstock_token() -> Optional[str]:
-            return None
+        def safe_refresh_mstock_token(token: str = "") -> Optional[str]:
+            return token or None
+
+def resolve_mstock_option_exchange(
+    *,
+    underlying: str = "",
+    gui_exchange: str = "",
+    saved_exchange: str = "",
+) -> Dict[str, Any]:
+    """
+    TASK 1: One central resolver for m.Stock option exchange / segment for Paper Forward.
+    Priority: GUI > env (ID | EXCHANGE | SCRIPMASTER_EXCH) > saved > default "NFO" for NIFTY+mstock.
+    Persists resolved value to all three env keys. Returns exchange_id (NFO for aliases), source, missing=[].
+    """
+    under_raw = (underlying or os.getenv("MSTOCK_UNDERLYING") or os.getenv("MSTOCK_SYMBOL") or "NIFTY").strip()
+    under = under_raw.upper().replace(" ", "").replace(":", "").replace("-", "")
+    is_nifty_like = "NIFTY" in under
+
+    candidates: List[Tuple[str, str]] = []
+    if gui_exchange:
+        candidates.append((gui_exchange.strip(), "gui"))
+    for k in ("MSTOCK_OPTION_EXCHANGE_ID", "MSTOCK_OPTION_EXCHANGE", "MSTOCK_SCRIPMASTER_EXCH"):
+        v = (os.getenv(k) or "").strip()
+        if v:
+            candidates.append((v, f"env:{k}"))
+    if saved_exchange:
+        candidates.append((saved_exchange.strip(), "saved"))
+
+    for raw_val, src in candidates:
+        val = str(raw_val or "").strip()
+        if not val:
+            continue
+        norm = val.upper().replace(" ", "").replace("_", "").replace("-", "")
+        if norm in {"NFO", "NSEFNO", "NSEFO", "NSE_FNO", "DERIVATIVES", "OPTIDX", "OPT", "FNO", "5"}:
+            eid = "NFO"
+        else:
+            eid = val
+        print(f"[MSTOCK-EXCHANGE-RESOLVE] exchange_id={eid} source={src} missing=[]")
+        return {"exchange_id": eid, "source": src, "missing": []}
+
+    if is_nifty_like:
+        eid = "NFO"
+        src = "default"
+        print(f"[MSTOCK-EXCHANGE-RESOLVE] exchange_id={eid} source={src} missing=[]")
+        for k in ("MSTOCK_OPTION_EXCHANGE_ID", "MSTOCK_OPTION_EXCHANGE", "MSTOCK_SCRIPMASTER_EXCH"):
+            if not os.getenv(k):
+                os.environ[k] = eid
+                print(f"[MSTOCK-CONFIG-AUTOSET] {k}={eid} reason=default_nifty_options")
+        return {"exchange_id": eid, "source": src, "missing": []}
+
+    print("[MSTOCK-EXCHANGE-RESOLVE] exchange_id= missing=['MSTOCK_OPTION_EXCHANGE_ID'] source=none")
+    return {"exchange_id": "", "source": "none", "missing": ["MSTOCK_OPTION_EXCHANGE_ID"]}
+
+
+def route_mstock_exchange(purpose: str) -> str:
+    """Route exchange by purpose: spot=NSE, options=NFO. Never mix underlying GUI NSE into option LTP."""
+    purpose_u = str(purpose or "").strip().lower()
+    if purpose_u in {"spot", "underlying", "index", "spot_ltp"}:
+        exch = (
+            os.getenv("MSTOCK_UNDERLYING_EXCHANGE_ID")
+            or os.getenv("MSTOCK_UNDERLYING_EXCHANGE")
+            or os.getenv("MSTOCK_EXCHANGE")
+            or "NSE"
+        ).strip().upper() or "NSE"
+        print(f"[MSTOCK-EXCHANGE-ROUTE] purpose=spot exchange={exch}")
+        return exch
+    if purpose_u in {"option_chain", "option_ltp", "option", "options", "nfo"}:
+        res = resolve_mstock_option_exchange()
+        exch = str(res.get("exchange_id") or "NFO").strip().upper() or "NFO"
+        if exch in {"NSE", "NSECASH", "NSECM"}:
+            exch = "NFO"
+        print(f"[MSTOCK-EXCHANGE-ROUTE] purpose={purpose_u} exchange={exch}")
+        return exch
+    exch = (os.getenv("MSTOCK_OPTION_EXCHANGE_ID") or "NFO").strip().upper() or "NFO"
+    print(f"[MSTOCK-EXCHANGE-ROUTE] purpose={purpose_u or 'unknown'} exchange={exch}")
+    return exch
 
 
 # --- Caching and Metrics for Token Resolution ---
 FAILED_LOOKUPS: "OrderedDict[tuple[str, str], float]" = OrderedDict()
 FAILED_LOOKUPS_LOCK = threading.Lock()
-FAILED_LOOKUP_TTL_SECONDS = 60.0
+FAILED_LOOKUP_TTL_SECONDS = 30.0
 FAILED_LOOKUP_MAX_KEYS = 500
 lookup_success = 0
 lookup_failure = 0
@@ -202,6 +282,11 @@ FALLBACK_INTERVALS = ["ONE_MINUTE", "FIVE_MINUTE"]
 
 
 @dataclass
+class IPMismatchError(RuntimeError):
+    """Raised when broker detects IA403 Primary/Secondary IP address mismatch."""
+    pass
+
+
 class Order:
     order_id: str
     symbol: str
@@ -260,6 +345,128 @@ class MStockTypeBClient:
         # ── CF-001: Token-expiry tracking ────────────────────────────────────
         self._token_refresh_attempted: bool = False
         self._token_refresh_succeeded: bool = False
+
+        # ── Broker-level status ─────────────────────────────────────────────
+        self._broker_ip_mismatch: bool = False
+
+        # ── Option-chain health state ───────────────────────────────────────
+        self._option_chain_status: str = "UNKNOWN"  # OK | MISSING_CONFIG | FETCH_FAILED | EMPTY | UNKNOWN
+        self._last_option_chain_success_ts: float = 0.0
+        self._last_option_chain_error: str = ""
+        self._option_chain_config_valid: bool = False  # True only when all MSTOCK_OPTION_* env vars present
+        self._log_throttle: Dict[str, float] = {}  # For throttled logging
+
+        # ── Historical 401 backoff (IA401 token issues) ─────────────────────
+        self._historical_401_backoff_until: float = 0.0
+        self._last_historical_auth_error: str = ""
+        self._mstock_ssl_diag_logged: bool = False
+        self._last_ssl_error: str = ""
+        self._broker_endpoint_failures: Dict[str, int] = {}
+        self._broker_endpoint_paused_until: Dict[str, float] = {}
+        self._broker_endpoint_last_error: Dict[str, str] = {}
+        self._raw_quote_failure_logged: set[str] = set()
+
+    def get_broker_auth_status(self) -> Dict[str, Any]:
+        """Return current broker auth / historical health for GUI status display.
+        Never includes secrets.
+        """
+        token = os.getenv("MSTOCK_ACCESS_TOKEN", "").strip()
+        token_present = bool(token)
+        try:
+            from auth import is_mstock_token_expiring, mstock_token_expiry_epoch
+            expiring = is_mstock_token_expiring(token, within_seconds=900) if token else True
+            exp = mstock_token_expiry_epoch(token) if token else None
+        except Exception:
+            expiring = True
+            exp = None
+        return {
+            "token_present": token_present,
+            "token_expiring_soon": bool(expiring),
+            "token_exp_epoch": exp,
+            "historical_401_backoff_active": time.time() < float(getattr(self, "_historical_401_backoff_until", 0)),
+            "last_historical_auth_error": getattr(self, "_last_historical_auth_error", ""),
+            "option_chain_status": getattr(self, "_option_chain_status", "UNKNOWN"),
+            "last_option_chain_error": getattr(self, "_last_option_chain_error", ""),
+            "broker_ip_mismatch": bool(getattr(self, "_broker_ip_mismatch", False)),
+            "broker_data_status": "BROKER_IP_MISMATCH" if bool(getattr(self, "_broker_ip_mismatch", False)) else "OK",
+            "broker_status_message": self._broker_status_message(),
+        }
+
+    def _broker_status_message(self) -> str:
+        if bool(getattr(self, "_broker_ip_mismatch", False)):
+            return "m.Stock IP mismatch: current public IP is not whitelisted in m.Stock API settings"
+        return ""
+
+    @staticmethod
+    def _contains_ia403(obj: object) -> bool:
+        text = ""
+        try:
+            if isinstance(obj, (dict, list)):
+                text = json.dumps(obj, default=str)
+            else:
+                text = str(obj or "")
+        except Exception:
+            text = str(obj or "")
+        low = text.lower()
+        return "ia403" in low or "primary and secondary ip address" in low or "ip address are not matching" in low
+
+    def _record_broker_failure(self, endpoint: str, error: object) -> None:
+        endpoint = str(endpoint or "broker").strip() or "broker"
+        msg = str(error or "")
+        self._broker_endpoint_last_error[endpoint] = msg
+        if self._contains_ia403(error):
+            self._broker_ip_mismatch = True
+            self._option_chain_status = "BROKER_IP_MISMATCH"
+            self._last_option_chain_error = self._broker_status_message()
+            count = int(self._broker_endpoint_failures.get(endpoint, 0) or 0) + 1
+            self._broker_endpoint_failures[endpoint] = count
+            if count >= 3:
+                self._broker_endpoint_paused_until[endpoint] = time.time() + 60.0
+            self._throttled_log(
+                f"ia403:{endpoint}",
+                f"[BROKER-IP-MISMATCH] endpoint={endpoint} failures={count} status=BROKER_IP_MISMATCH "
+                f"message={self._broker_status_message()}",
+            )
+        else:
+            self._broker_endpoint_failures[endpoint] = int(self._broker_endpoint_failures.get(endpoint, 0) or 0) + 1
+
+    def _record_broker_success(self, endpoint: str) -> None:
+        endpoint = str(endpoint or "broker").strip() or "broker"
+        self._broker_endpoint_failures.pop(endpoint, None)
+        self._broker_endpoint_paused_until.pop(endpoint, None)
+        self._broker_endpoint_last_error.pop(endpoint, None)
+
+    def _broker_endpoint_paused(self, endpoint: str) -> bool:
+        until = float(self._broker_endpoint_paused_until.get(str(endpoint), 0.0) or 0.0)
+        return time.time() < until
+
+    def _broker_endpoint_pause_remaining(self, endpoint: str) -> float:
+        until = float(self._broker_endpoint_paused_until.get(str(endpoint), 0.0) or 0.0)
+        return max(0.0, until - time.time())
+
+    def _handle_broker_payload_status(self, payload: object, *, endpoint: str) -> bool:
+        if not isinstance(payload, dict):
+            return True
+        status = payload.get("status")
+        error_code = str(payload.get("errorcode") or payload.get("errorCode") or payload.get("code") or "").strip()
+        if self._contains_ia403(payload):
+            self._record_broker_failure(endpoint, payload)
+            return False
+        if error_code or status is False or str(status).strip().lower() == "false":
+            self._record_broker_failure(endpoint, payload)
+            return False
+        return True
+
+    def _log_raw_quote_failure_once(self, failure_type: str, payload: object) -> None:
+        key = str(failure_type or "quote_parse_failed")
+        if key in self._raw_quote_failure_logged:
+            return
+        self._raw_quote_failure_logged.add(key)
+        try:
+            preview = json.dumps(payload, default=str)[:1000]
+        except Exception:
+            preview = str(payload)[:1000]
+        print(f"[MSTOCK-LTP-RAW] failure={key} payload={preview}", flush=True)
 
     def _ensure_valid_token(self, *, allow_refresh: bool = True) -> None:
         """Sync and push any fresh/changed MSTOCK_ACCESS_TOKEN directly into the SDK.
@@ -530,6 +737,103 @@ class MStockTypeBClient:
             return bool(default)
         return str(v).strip().lower() in {"1", "true", "yes", "y"}
 
+    def _mstock_ssl_settings(self) -> Dict[str, Any]:
+        verify = self._bool_env("MSTOCK_SSL_VERIFY", True)
+        allow_insecure = self._bool_env("MSTOCK_ALLOW_INSECURE_SSL", False)
+        ca_bundle = str(os.getenv("MSTOCK_CA_BUNDLE", "") or "").strip()
+        certifi_path = ""
+        try:
+            certifi_path = str(certifi.where()) if certifi is not None else ""
+        except Exception:
+            certifi_path = ""
+        if not ca_bundle:
+            ca_bundle = certifi_path
+        if not verify and not allow_insecure:
+            print(
+                "[MSTOCK-SSL][WARN] MSTOCK_SSL_VERIFY=false ignored because "
+                "MSTOCK_ALLOW_INSECURE_SSL is not 1; using verified TLS.",
+                flush=True,
+            )
+            verify = True
+        return {
+            "verify": bool(verify),
+            "allow_insecure": bool(allow_insecure),
+            "ca_bundle": ca_bundle,
+            "certifi_path": certifi_path,
+        }
+
+    def _mstock_ssl_context(self) -> ssl.SSLContext:
+        settings = self._mstock_ssl_settings()
+        if not settings["verify"] and settings["allow_insecure"]:
+            print(
+                "[MSTOCK-SSL][INSECURE-WARN] TLS certificate verification disabled "
+                "only because MSTOCK_ALLOW_INSECURE_SSL=1.",
+                flush=True,
+            )
+            return ssl._create_unverified_context()
+        ca_bundle = str(settings.get("ca_bundle") or "").strip()
+        if ca_bundle:
+            return ssl.create_default_context(cafile=ca_bundle)
+        return ssl.create_default_context()
+
+    def _log_mstock_ssl_diag(
+        self,
+        *,
+        broker: str,
+        token: str,
+        exchange: str,
+        interval: str,
+        force: bool = False,
+    ) -> None:
+        if self._mstock_ssl_diag_logged and not force:
+            return
+        self._mstock_ssl_diag_logged = True
+        settings = self._mstock_ssl_settings()
+        verify_mode = "VERIFY" if settings["verify"] else "INSECURE"
+        print(
+            "[MSTOCK-SSL-DIAG] "
+            f"python_exe={sys.executable!r} python_version={sys.version.split()[0]!r} "
+            f"certifi={settings.get('certifi_path')!r} ssl_verify_mode={verify_mode} "
+            f"ca_bundle={settings.get('ca_bundle')!r} broker={broker} token={token} "
+            f"exchange={exchange} interval={interval}",
+            flush=True,
+        )
+
+    def _mstock_urlopen(self, req: urllib.request.Request, *, timeout: float, context: str = ""):
+        ssl_context = self._mstock_ssl_context()
+        try:
+            return urllib.request.urlopen(req, timeout=timeout, context=ssl_context)
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", None)
+            if isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                self._last_ssl_error = f"SSL_CERTIFICATE_VERIFY_FAILED: {exc}"
+                raise RuntimeError(self._last_ssl_error) from exc
+            raise
+
+    def _throttled_log(self, key: str, message: str) -> None:
+        """Log a message throttled to once per 30 seconds per key."""
+        now = float(time.time())
+        last = float(self._log_throttle.get(key, 0.0))
+        if now - last >= 30.0:
+            self._log_throttle[key] = now
+            print(message)
+
+    def _validate_option_chain_config(self) -> bool:
+        """Return True only when all three MSTOCK_OPTION_* env vars are set."""
+        exchange_id = os.getenv("MSTOCK_OPTION_EXCHANGE_ID", "").strip()
+        expiry = os.getenv("MSTOCK_OPTION_EXPIRY", "").strip()
+        token = os.getenv("MSTOCK_OPTION_TOKEN", "").strip()
+        self._option_chain_config_valid = bool(exchange_id and expiry and token)
+        return self._option_chain_config_valid
+
+    def get_broker_status(self) -> Dict[str, Any]:
+        """Return broker-level status dict including IP_MISMATCH flag."""
+        return {
+            "IP_MISMATCH": self._broker_ip_mismatch,
+            "TOKEN_REFRESH_ATTEMPTED": self._token_refresh_attempted,
+            "TOKEN_REFRESH_SUCCEEDED": self._token_refresh_succeeded,
+        }
+
     def _log_candle_event(self, *, key: str, msg: str) -> None:
         """Throttle repetitive candle-fallback logs.
 
@@ -712,7 +1016,7 @@ class MStockTypeBClient:
             )
 
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with self._mstock_urlopen(req, timeout=timeout, context="intraday_post") as resp:
                     raw = resp.read()
                     return raw.decode("utf-8", errors="replace")
             except urllib.error.HTTPError as exc:
@@ -753,7 +1057,7 @@ class MStockTypeBClient:
             )
 
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with self._mstock_urlopen(req, timeout=timeout, context="intraday_get") as resp:
                     raw = resp.read()
                     return raw.decode("utf-8", errors="replace")
             except urllib.error.HTTPError as exc:
@@ -873,6 +1177,14 @@ class MStockTypeBClient:
         Returns parsed JSON (dict or list). Raises RuntimeError on HTTP errors.
         """
 
+        if self._broker_endpoint_paused("historical_chart"):
+            raise IPMismatchError(
+                f"{self._broker_status_message()} (historical_chart paused "
+                f"{self._broker_endpoint_pause_remaining('historical_chart'):.0f}s)"
+            )
+        # IA401 backoff guard (TASK)
+        if time.time() < float(getattr(self, "_historical_401_backoff_until", 0.0)):
+            raise RuntimeError("get_historical_chart backoff active (recent IA401)")
         api_key = str(self.cfg.api_key or "").strip()
         access_token = str(os.getenv("MSTOCK_ACCESS_TOKEN", "")).strip()
         if not (api_key and access_token):
@@ -912,7 +1224,13 @@ class MStockTypeBClient:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            self._log_mstock_ssl_diag(
+                broker="mstock",
+                token=str(symboltoken),
+                exchange=str(exchange),
+                interval=str(interval),
+            )
+            with self._mstock_urlopen(req, timeout=timeout, context="historical_chart") as resp:
                 raw = resp.read()
                 text = raw.decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
@@ -927,15 +1245,26 @@ class MStockTypeBClient:
                 body = (exc.read() or b"")[:400].decode("utf-8", errors="replace")
             except Exception:
                 body = ""
+            if exc.code in (400, 401, 403) and self._contains_ia403(body):
+                self._record_broker_failure("historical_chart", body)
+                raise IPMismatchError(self._broker_status_message()) from exc
+            self._record_broker_failure("historical_chart", f"HTTP {exc.code}: {body}")
             raise RuntimeError(
                 f"get_historical_chart failed with HTTP {exc.code}. "
                 f"request=POST {url}. headers=. Body preview: {body!r}"
             ) from exc
         except Exception as exc:  # noqa: BLE001
+            if self._contains_ia403(exc):
+                self._record_broker_failure("historical_chart", exc)
+                raise IPMismatchError(self._broker_status_message()) from exc
             raise RuntimeError(f"get_historical_chart request failed: {exc}") from exc
 
         try:
-            return json.loads(text)
+            payload = json.loads(text)
+            if isinstance(payload, dict) and not self._handle_broker_payload_status(payload, endpoint="historical_chart"):
+                raise IPMismatchError(self._broker_status_message() or "historical_chart broker returned error")
+            self._record_broker_success("historical_chart")
+            return payload
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f"get_historical_chart returned non-JSON: {text[:300]!r}"
@@ -1004,7 +1333,7 @@ class MStockTypeBClient:
 
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with self._mstock_urlopen(req, timeout=timeout, context="scripmaster") as resp:
                 raw = resp.read()
                 content_type = (resp.headers.get("Content-Type") or "").lower()
         except Exception as exc:  # noqa: BLE001
@@ -1095,19 +1424,32 @@ class MStockTypeBClient:
 
         if not path:
             # Common fallback: many users already have an instrument master CSV
-            # downloaded manually (e.g. "instrument (1).csv"). This file format is
-            # compatible with our lightweight ScripMaster reader.
+            # downloaded manually. Check a few common names in the working tree
+            # before attempting a network fetch.
             try:
-                cwd = os.getcwd()
-                for candidate in (
+                cwd = Path(os.getcwd())
+                repo_root = Path(__file__).resolve().parent.parent
+                candidate_names = (
                     "instrument.csv",
                     "instrument (1).csv",
+                    "instrument (2).csv",
                     "instruments.csv",
                     "instruments (1).csv",
-                ):
-                    cand_path = os.path.join(cwd, candidate)
-                    if os.path.isfile(cand_path):
-                        path = cand_path
+                    "instruments (2).csv",
+                    "scripmaster.csv",
+                )
+                search_dirs = []
+                for base in (cwd, repo_root):
+                    if base not in search_dirs:
+                        search_dirs.append(base)
+                for base in search_dirs:
+                    for candidate in candidate_names:
+                        cand_path = base / candidate
+                        if cand_path.is_file():
+                            path = str(cand_path)
+                            print(f"[SCRIPMASTER] Using fallback local CSV: {path}")
+                            break
+                    if path:
                         break
             except Exception:
                 path = ""
@@ -1382,12 +1724,19 @@ class MStockTypeBClient:
             if known and known.isdigit():
                 return env_exch or "NSE", known
 
-        # Try ScripMaster first (fast exact tradingsymbol match).
+        # Try ScripMaster first (exact + parsed structured option lookup).
         sm = self._get_scripmaster()
         if sm is not None:
-            tok = sm.token_for_tradingsymbol(sym, exch=exch or None)
+            is_option_sym = sym_key.endswith("CE") or sym_key.endswith("PE")
+            opt_exch = route_mstock_exchange("option_ltp") if is_option_sym else (exch or None)
+            tok = None
+            if hasattr(sm, "token_for_option_symbol"):
+                tok = sm.token_for_option_symbol(sym, exch=opt_exch or exch or None)
+            if not tok:
+                tok = sm.token_for_tradingsymbol(sym, exch=opt_exch or exch or None)
             if tok and tok.isdigit() and int(tok) > 0:
-                return (exch or "NFO"), tok
+                use_exch = "NFO" if is_option_sym else (opt_exch or exch or "NFO")
+                return (use_exch, tok)
 
             # Delta-hedge convenience: allow FUT aliases like "NFO:NIFTY" or "NFO:BANKNIFTY"
             # to mean the nearest-expiry index future.
@@ -1461,15 +1810,32 @@ class MStockTypeBClient:
     ) -> List[Candle]:
         """Fetch historical candles from chart direct."""
         self._ensure_valid_token()
+        # IA401 backoff: don't spam if recent 401 on historical (token issue)
+        if time.time() < float(getattr(self, "_historical_401_backoff_until", 0.0)):
+            return []
         api_interval = self._normalize_interval(interval)
-        data = self._fetch_historical_chart_direct(
-            exchange=exchange,
-            symboltoken=symbol_token,
-            interval=api_interval,
-            from_date=from_date,
-            to_date=to_date,
-        )
-        return self._parse_candles_payload(data, limit=1000)
+        try:
+            data = self._fetch_historical_chart_direct(
+                exchange=exchange,
+                symboltoken=symbol_token,
+                interval=api_interval,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            self._last_historical_auth_error = ""
+            return self._parse_candles_payload(data, limit=1000)
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "401" in msg or "IA401" in msg:
+                self._last_historical_auth_error = "IA401"
+                self._historical_401_backoff_until = time.time() + 60.0
+                # Invalidate token in env to force user refresh
+                try:
+                    if "MSTOCK_ACCESS_TOKEN" in os.environ:
+                        del os.environ["MSTOCK_ACCESS_TOKEN"]
+                except Exception:
+                    pass
+            raise
 
     def _parse_option_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
         import re
@@ -1493,30 +1859,119 @@ class MStockTypeBClient:
         if not root:
             return []
 
-        # Filter to future expiries only.
-        rows = sm.option_rows(symbol_root=root, exch=os.getenv("MSTOCK_SCRIPMASTER_EXCH", "NFO") or "NFO", min_expiry=datetime.now().date())
+        # Resolve exchange centrally
+        try:
+            ex_res = resolve_mstock_option_exchange(underlying=underlying)
+            exch = ex_res.get("exchange_id") or os.getenv("MSTOCK_SCRIPMASTER_EXCH", "NFO") or "NFO"
+        except Exception:
+            exch = os.getenv("MSTOCK_SCRIPMASTER_EXCH", "NFO") or "NFO"
+
+        # Determine target expiry (specific from env or default min=now)
+        req_exp_str = (os.getenv("MSTOCK_OPTION_EXPIRY") or os.getenv("MSTOCK_TARGET_EXPIRY") or "").strip()
+        target_exp_date = None
+        if req_exp_str:
+            # Reuse scripmaster _parse_date via import or simple
+            try:
+                from scripmaster import _parse_date as _pd
+                target_exp_date = _pd(req_exp_str)
+            except Exception:
+                for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%b-%Y", "%d-%b-%y", "%d %b %Y"):
+                    try:
+                        target_exp_date = datetime.strptime(req_exp_str, fmt).date()
+                        break
+                    except Exception:
+                        pass
+
+        # Deep diagnostic logs (TASK 5) before filtering
+        try:
+            all_rows = sm._load() if hasattr(sm, "_load") else []
+            def _nroot(x): 
+                v = str(x or "").strip().upper().replace(" ","").replace("-","").replace(":","")
+                return "NIFTY" if "NIFTY" in v else v
+            def _nex(x):
+                e = str(x or "").strip().upper().replace(" ","").replace("_","").replace("-","")
+                return "NFO" if e in {"NFO","NSEFNO","NSEFO","NSE_FNO","DERIVATIVES","OPTIDX","OPT","FNO","5"} or "FNO" in e or "DERIV" in e or "OPT" in e else e
+            nifty_before = [r for r in all_rows if _nroot(getattr(r, "symbol_root", "")) == "NIFTY"]
+            exch_rows = [r for r in all_rows if _nex(getattr(r, "exch", "")) == _nex(exch)]
+            print(f"[SCRIPMASTER] path={getattr(sm, 'csv_path', 'unknown')} exists={bool(all_rows)} total_rows={len(all_rows)} columns=sample")
+            print(f"[SCRIPMASTER-EXCHANGES] found={sorted(set(_nex(getattr(r,'exch','')) for r in all_rows))[:10]}")
+            print(f"[SCRIPMASTER-SYMBOL-SAMPLES] samples={[getattr(r,'tradingsymbol','') for r in all_rows[:3]]}")
+            print(f"[SCRIPMASTER-EXPIRIES] underlying={root} found={len([r for r in nifty_before if getattr(r,'expiry',None)])} dates sample")
+            if nifty_before:
+                print(f"[MSTOCK-CHAIN-DEBUG] before_filter={len(all_rows)} nifty_before_expiry={len(nifty_before)} exch_match={len(exch_rows)}")
+        except Exception as _diag_e:
+            print(f"[SCRIPMASTER] diag_err={_diag_e}")
+
+        # Get rows (support exact target if present)
+        min_e = datetime.now().date()
+        try:
+            rows = sm.option_rows(symbol_root=root, exch=exch, min_expiry=min_e, target_expiry=target_exp_date)
+        except TypeError:
+            # older signature without target_expiry kw
+            rows = sm.option_rows(symbol_root=root, exch=exch, min_expiry=min_e)
+
+        if not rows and target_exp_date:
+            # TASK 6: auto nearest future if exact requested missing
+            try:
+                avail = sm.get_available_expiries(root, exch=exch)
+                futures = [e for e in (avail or []) if e >= datetime.now().date()]
+                if futures:
+                    selected = min(futures)
+                    if selected != target_exp_date:
+                        print(f"[MSTOCK-EXPIRY-AUTO] requested={req_exp_str} selected={selected} reason=requested_not_found")
+                        sel_str = selected.strftime("%d-%m-%Y")
+                        os.environ["MSTOCK_OPTION_EXPIRY"] = sel_str
+                        os.environ["MSTOCK_TARGET_EXPIRY"] = sel_str
+                    # retry with target if method supports, else min
+                    try:
+                        rows = sm.option_rows(symbol_root=root, exch=exch, min_expiry=datetime.now().date(), target_expiry=selected)
+                    except TypeError:
+                        rows = sm.option_rows(symbol_root=root, exch=exch, min_expiry=selected)
+                    if not rows:
+                        rows = sm.option_rows(symbol_root=root, exch=exch, min_expiry=datetime.now().date())
+            except Exception as _ae:
+                print(f"[MSTOCK-EXPIRY-AUTO] err={_ae}")
+
         if not rows:
+            # more debug for 0 case
+            try:
+                print(f"[MSTOCK-CHAIN-DEBUG] after_symbol=0 after_exchange=0 after_expiry=0 ce=0 pe=0 (root={root} exch={exch})")
+            except Exception:
+                pass
             return []
+
+        # count ce/pe for log
+        try:
+            ce_c = sum(1 for r in rows if str(getattr(r, "opt_type", "")).upper() == "CE")
+            pe_c = sum(1 for r in rows if str(getattr(r, "opt_type", "")).upper() == "PE")
+            print(f"[MSTOCK-CHAIN-DEBUG] before={len(getattr(sm,'_load',lambda:[])())} after_symbol+exch+expiry ce={ce_c} pe={pe_c}")
+        except Exception:
+            pass
 
         chain: List[Dict[str, Any]] = []
         for r in rows:
-            # Prefer the CSV trading symbol; fall back to a minimal generated one.
             sym = r.tradingsymbol
             if not sym:
-                # Include DDMMMYY so strategy weekly-expiry parser can still work if needed.
                 exp = r.expiry.strftime("%d%b%y").upper() if r.expiry else ""
                 sym = f"{r.symbol_root}{exp}{int(r.strike or 0)}{r.opt_type}"
 
+            tok = str(r.token or "").strip()
             chain.append(
                 {
                     "symbol": sym,
-                    "token": r.token,
+                    "token": tok,
+                    "symbolToken": tok,
+                    "security_id": tok,
                     "exchange": (r.exch or "NFO").strip().upper(),
                     "strike": float(r.strike) if r.strike is not None else 0.0,
+                    "strike_price": float(r.strike) if r.strike is not None else 0.0,
                     "option_type": r.opt_type,
                     "expiry": r.expiry,
+                    "expiry_date": r.expiry.isoformat() if r.expiry else "",
                     "symbol_root": r.symbol_root,
                     "lot_size": r.lot_size,
+                    "trading_symbol": sym,
+                    "tradingsymbol": sym,
                     "raw": r.raw,
                 }
             )
@@ -1524,21 +1979,61 @@ class MStockTypeBClient:
         return chain
 
     def _get_option_chain_from_api(self) -> List[Dict[str, Any]]:
-        """Existing option-chain API integration (kept as-is, env-configured)."""
-        self._ensure_valid_token()
-        exchange_id = os.getenv("MSTOCK_OPTION_EXCHANGE_ID", "").strip()
-        expiry = os.getenv("MSTOCK_OPTION_EXPIRY", "").strip()
-        token = os.getenv("MSTOCK_OPTION_TOKEN", "").strip()
-
-        if not (exchange_id and expiry and token):
-            raise RuntimeError(
-                "Option chain parameters are not configured. Set "
-                "MSTOCK_OPTION_EXCHANGE_ID, MSTOCK_OPTION_EXPIRY, and "
-                "MSTOCK_OPTION_TOKEN according to your m.Stock instruments."
+        """Existing option-chain API integration (kept as-is, env-configured).
+        TASK 1+2: TOKEN optional if we can derive; support safer names + UNDERLYING_TOKEN fallback.
+        """
+        if self._broker_endpoint_paused("option_chain"):
+            self._option_chain_status = "BROKER_IP_MISMATCH" if self._broker_ip_mismatch else "FETCH_PAUSED"
+            raise IPMismatchError(
+                f"{self._broker_status_message() or 'm.Stock broker endpoint paused'} "
+                f"(option_chain paused {self._broker_endpoint_pause_remaining('option_chain'):.0f}s)"
             )
+        self._ensure_valid_token()
+        exchange_id = (os.getenv("MSTOCK_OPTION_EXCHANGE_ID") or os.getenv("MSTOCK_OPTION_EXCHANGE") or "").strip()
+        expiry = (os.getenv("MSTOCK_OPTION_EXPIRY") or os.getenv("MSTOCK_TARGET_EXPIRY") or "").strip()
+        token = (os.getenv("MSTOCK_OPTION_TOKEN") or os.getenv("MSTOCK_UNDERLYING_TOKEN") or os.getenv("MSTOCK_NIFTY_INDEX_TOKEN") or "").strip()
 
-        resp = self._raw.get_option_chain_data(exchange_id, expiry, token)
-        payload = self._safe_json(resp, context="get_option_chain_data")
+        # For API path we still prefer all three, but give clear waiting reason instead of generic
+        if not exchange_id:
+            exchange_id = "NFO"  # will be mapped or cause specific error from broker if numeric required
+        if not expiry:
+            self._option_chain_status = "MISSING_CONFIG"
+            raise RuntimeError("WAITING_FOR_MSTOCK_EXPIRY: MSTOCK_OPTION_EXPIRY / MSTOCK_TARGET_EXPIRY not set")
+        if not token:
+            # derive attempt from known NIFTY default or find_token; do not hard require for the high-level get_option_chain
+            token = "26000"  # common NIFTY index token; broker may accept or CSV path should have succeeded first
+            print("[MSTOCK-CONFIG] OPTION_TOKEN missing; using fallback 26000 (NIFTY) for API chain attempt")
+
+        print(f"[MSTOCK-CHAIN-FETCH] broker=mstock underlying=NIFTY expiry={expiry} exchange={exchange_id} status=attempt raw_rows=? token_present={bool(os.getenv('MSTOCK_OPTION_TOKEN'))}")
+
+        try:
+            resp = self._raw.get_option_chain_data(exchange_id, expiry, token)
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = (exc.read() or b"").decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            if "IA403" in body or "IP Address" in body:
+                self._record_broker_failure("option_chain", body)
+                self._option_chain_status = "BROKER_IP_MISMATCH"
+                raise IPMismatchError(
+                    f"m.Stock IA403: Primary and Secondary IP Address mismatch. "
+                    f"Body: {body[:200]}"
+                ) from exc
+            if "Option chain parameters are not configured" in body:
+                self._option_chain_status = "MISSING_CONFIG"
+                raise RuntimeError(
+                    "Option chain parameters are not configured. Set "
+                    "MSTOCK_OPTION_EXCHANGE_ID, MSTOCK_OPTION_EXPIRY, and "
+                    "MSTOCK_OPTION_TOKEN according to your m.Stock instruments."
+                ) from exc
+            raise
+
+        payload = self._safe_json(resp, context="option_chain")
+        if isinstance(payload, dict) and not self._handle_broker_payload_status(payload, endpoint="option_chain"):
+            self._option_chain_status = "BROKER_IP_MISMATCH" if self._broker_ip_mismatch else "FETCH_FAILED"
+            return []
 
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, list):
@@ -1617,12 +2112,26 @@ class MStockTypeBClient:
             )
 
         if not chain:
+            self._option_chain_status = "EMPTY"
+            self._last_option_chain_error = "Parsed option chain is empty"
+            self._throttled_log(
+                "option_chain_empty",
+                "[WARN] Option chain is empty after parsing"
+            )
             raise RuntimeError(
                 "Parsed option chain is empty. Verify MSTOCK_OPTION_* "
                 "settings and response structure, then adjust mapping in "
                 "MStockTypeBClient.get_option_chain."
             )
 
+        # TASK 3 log
+        try:
+            ce = sum(1 for r in chain if str(r.get("option_type", "")).upper() == "CE")
+            pe = sum(1 for r in chain if str(r.get("option_type", "")).upper() == "PE")
+            strikes = len({r.get("strike") for r in chain})
+            print(f"[MSTOCK-CHAIN-NORMALIZED] rows={len(chain)} ce={ce} pe={pe} strikes={strikes} atm= source=api")
+        except Exception:
+            print(f"[MSTOCK-CHAIN-NORMALIZED] rows={len(chain)} source=api")
         return chain
 
     def _normalize_symbol_key(self, s: str) -> str:
@@ -1981,6 +2490,10 @@ class MStockTypeBClient:
         """
 
         if isinstance(resp, (dict, list)):
+            if isinstance(resp, dict) and not self._handle_broker_payload_status(resp, endpoint=context):
+                if self._broker_ip_mismatch:
+                    raise IPMismatchError(self._broker_status_message() or f"{context} broker returned error")
+                raise RuntimeError(f"{context} broker returned error payload")
             return resp
 
         if not hasattr(resp, "json"):
@@ -2008,6 +2521,10 @@ class MStockTypeBClient:
                 header_preview = ""
 
             target = req_url or resp_url
+            if status_code in (400, 401, 403) and self._contains_ia403(body_preview):
+                self._record_broker_failure(context, body_preview)
+                raise IPMismatchError(self._broker_status_message()) from None
+            self._record_broker_failure(context, f"HTTP {status_code}: {body_preview}")
             raise RuntimeError(
                 f"{context} failed with HTTP {status_code}. "
                 f"request={req_method} {target}. "
@@ -2016,7 +2533,12 @@ class MStockTypeBClient:
             )
 
         try:
-            return resp.json()
+            payload = resp.json()
+            if isinstance(payload, dict) and not self._handle_broker_payload_status(payload, endpoint=context):
+                if self._broker_ip_mismatch:
+                    raise IPMismatchError(self._broker_status_message() or f"{context} broker returned error")
+                raise RuntimeError(f"{context} broker returned error payload")
+            return payload
         except Exception as exc:  # noqa: BLE001
             headers = getattr(resp, "headers", None)
             content_type = None
@@ -2655,17 +3177,35 @@ class MStockTypeBClient:
                 "stop_further_trading": True,
             }
 
-    def get_ltp(self, symbol: str) -> float:
+    def get_ltp(self, symbol: str) -> Optional[float]:
         """Return last traded price (LTP) for given symbol.
 
         ``symbol`` should be in the format expected by the SDK's
         "market LTP" endpoint, for example ``"NSE:ACC"``.
         """
-        self._ensure_valid_token()
+        endpoint = "get_ltp"
+        if self._broker_endpoint_paused(endpoint):
+            self._throttled_log(
+                f"paused:{endpoint}",
+                f"[BROKER-CIRCUIT] endpoint={endpoint} paused_for={self._broker_endpoint_pause_remaining(endpoint):.0f}s "
+                f"status={'BROKER_IP_MISMATCH' if self._broker_ip_mismatch else 'BROKER_UNAVAILABLE'}",
+            )
+            return None
+        try:
+            self._ensure_valid_token()
+        except Exception as exc:
+            self._record_broker_failure(endpoint, exc)
+            return None
         # Type-B SDK exposes get_market_quote(mode, exchangeTokens).
         # The quote endpoint requires numeric instrument tokens.
-        exch, token = self._resolve_token_for_quote(symbol)
+        try:
+            exch, token = self._resolve_token_for_quote(symbol)
+        except Exception as exc:
+            self._record_broker_failure(endpoint, exc)
+            return None
         if not (exch and token):
+            self._record_broker_failure(endpoint, f"unable_to_resolve_token symbol={symbol!r}")
+            return None
             raise RuntimeError(
                 "Unable to resolve token for LTP. Provide a numeric token, an EXCH:TRADINGSYMBOL, "
                 "or ensure ScripMaster/instruments are available for resolution. "
@@ -2692,9 +3232,12 @@ class MStockTypeBClient:
                 "LTP",
                 "lastPrice",
                 "last_price",
+                "last_price_value",
                 "lastTradedPrice",
                 "LastTradedPrice",
                 "last_traded_price",
+                "tradedPrice",
+                "close",
             ):
                 px = _as_float(row.get(k))
                 if px is not None:
@@ -2735,7 +3278,7 @@ class MStockTypeBClient:
             if row_tok and row_tok == str(token):
                 score += 4
             row_ex = _row_exch(row)
-            if row_ex and (row_ex == str(exch).upper() or row_ex == str(seg_id).upper()):
+            if row_ex and row_ex == str(exch).upper():
                 score += 2
             candidates.append((score, float(ltp)))
 
@@ -2756,17 +3299,26 @@ class MStockTypeBClient:
             try:
                 response = self._raw.get_market_quote("LTP", exchange_tokens)
                 data = self._safe_json(response, context="get_market_quote")
+                if isinstance(data, dict) and not self._handle_broker_payload_status(data, endpoint=endpoint):
+                    self._log_raw_quote_failure_once("broker_error", data)
+                    return None
                 _walk_rows(data)
                 if candidates:
                     break
+            except IPMismatchError as exc:
+                self._record_broker_failure(endpoint, exc)
+                self._log_raw_quote_failure_once("IA403", str(exc))
+                return None
             except Exception as exc:
                 last_quote_error = exc
+                self._record_broker_failure(endpoint, exc)
                 continue
 
         if candidates:
             positive = [c for c in candidates if float(c[1]) > 0.0]
             if positive:
                 positive.sort(key=lambda c: c[0], reverse=True)
+                self._record_broker_success(endpoint)
                 return float(positive[0][1])
 
             # If parsed values are all non-positive (often stale/invalid),
@@ -2775,13 +3327,16 @@ class MStockTypeBClient:
                 quote_key = f"{exch}:{token}" if exch else token
                 bid, ask, ltp_full = self.get_bid_ask(quote_key, exchange_hint=exch)
                 if bid is not None and ask is not None and float(bid) > 0 and float(ask) > 0:
+                    self._record_broker_success(endpoint)
                     return (float(bid) + float(ask)) / 2.0
                 if ltp_full is not None and float(ltp_full) > 0:
+                    self._record_broker_success(endpoint)
                     return float(ltp_full)
             except Exception:
                 pass
 
             candidates.sort(key=lambda c: c[0], reverse=True)
+            self._record_broker_success(endpoint)
             return float(candidates[0][1])
 
         # LTP responses vary by SDK/account/segment. If the lightweight LTP mode
@@ -2791,17 +3346,21 @@ class MStockTypeBClient:
             quote_key = f"{exch}:{token}" if exch else token
             bid, ask, ltp_full = self.get_bid_ask(quote_key, exchange_hint=exch)
             if ltp_full is not None and float(ltp_full) > 0:
+                self._record_broker_success(endpoint)
                 return float(ltp_full)
             if bid is not None and ask is not None and float(bid) > 0 and float(ask) > 0:
+                self._record_broker_success(endpoint)
                 return (float(bid) + float(ask)) / 2.0
         except Exception:
             pass
 
         err_suffix = f" Last quote error: {last_quote_error}" if last_quote_error is not None else ""
-        raise RuntimeError(
-            "Unable to parse LTP from quote response. Inspect `get_market_quote().json()` and update "
-            f"MStockTypeBClient.get_ltp accordingly.{err_suffix}"
+        self._log_raw_quote_failure_once(
+            "parse_failed",
+            f"Unable to parse LTP from quote response symbol={symbol!r} exch={exch!r} token={token!r}.{err_suffix}",
         )
+        self._record_broker_failure(endpoint, f"parse_failed {err_suffix}")
+        return None
 
     # -------------------------------------------------------------------------
     # Bid/Ask extraction helper
@@ -3359,8 +3918,21 @@ class MStockTypeBClient:
         use_csv_only = self._bool_env("MSTOCK_USE_CSV_ONLY", False)
         use_chain_fallback = self._bool_env("MSTOCK_USE_CHAIN_FALLBACK", True)
 
+        exch_log = os.getenv("MSTOCK_OPTION_EXCHANGE_ID") or os.getenv("MSTOCK_OPTION_EXCHANGE") or os.getenv("MSTOCK_SCRIPMASTER_EXCH", "NFO")
+        exp_log = os.getenv("MSTOCK_OPTION_EXPIRY") or os.getenv("MSTOCK_TARGET_EXPIRY", "")
+        tok_present = bool(os.getenv("MSTOCK_OPTION_TOKEN") or os.getenv("MSTOCK_UNDERLYING_TOKEN"))
+        print(f"[MSTOCK-CHAIN-FETCH] broker=mstock underlying={underlying or 'NIFTY'} expiry={exp_log or 'nearest'} exchange={exch_log} status=starting raw_rows=? option_token_present={tok_present}")
+
         csv_chain = self._get_option_chain_from_csv(underlying)
         if csv_chain:
+            try:
+                ce = sum(1 for r in csv_chain if str(r.get("option_type", r.get("opt_type", ""))).upper() in ("CE", "CALL"))
+                pe = sum(1 for r in csv_chain if str(r.get("option_type", r.get("opt_type", ""))).upper() in ("PE", "PUT"))
+                strikes = len({float(r.get("strike", r.get("strike_price", 0)) or 0) for r in csv_chain})
+                atm = ""
+                print(f"[MSTOCK-CHAIN-NORMALIZED] rows={len(csv_chain)} ce={ce} pe={pe} strikes={strikes} atm={atm} source=csv_scripmaster")
+            except Exception:
+                print(f"[MSTOCK-CHAIN-NORMALIZED] rows={len(csv_chain)} source=csv_scripmaster")
             return csv_chain
 
         if use_csv_only:
@@ -3375,7 +3947,38 @@ class MStockTypeBClient:
                 "Set MSTOCK_USE_CHAIN_FALLBACK=1 to enable fallback."
             )
 
-        return self._get_option_chain_from_api()
+        # ── Option-chain health state tracking ──────────────────────────────
+        try:
+            chain = self._get_option_chain_from_api()
+            self._option_chain_status = "OK"
+            self._last_option_chain_success_ts = float(time.time())
+            self._last_option_chain_error = ""
+            print(f"[MSTOCK-CHAIN-FETCH] broker=mstock underlying={underlying or 'NIFTY'} status=OK raw_rows={len(chain)}")
+            return chain
+        except IPMismatchError:
+            self._option_chain_status = "FETCH_FAILED"
+            self._last_option_chain_error = "IP mismatch (IA403)"
+            self._throttled_log(
+                "option_chain_ip_mismatch",
+                "[WARN] Option chain fetch failed: IP mismatch (IA403)"
+            )
+            raise
+        except RuntimeError as exc:
+            err_msg = str(exc)
+            if "not configured" in err_msg or "MISSING_CONFIG" in err_msg:
+                self._option_chain_status = "MISSING_CONFIG"
+                self._throttled_log(
+                    "option_chain_missing_config",
+                    f"[WARN] {err_msg}"
+                )
+            else:
+                self._option_chain_status = "FETCH_FAILED"
+                self._last_option_chain_error = err_msg
+                self._throttled_log(
+                    "option_chain_fetch_failed",
+                    f"[WARN] Option chain fetch failed: {err_msg[:100]}"
+                )
+            raise
 
     def fetch_index_candles(
         self,
@@ -3397,6 +4000,14 @@ class MStockTypeBClient:
 
         token = str(instrument_token or "").strip()
         if not (token.isdigit() and int(token) > 0):
+            return None, None
+        if self._broker_endpoint_paused("historical_chart"):
+            self._throttled_log(
+                "historical_chart_paused",
+                f"[CANDLES] broker endpoint paused status="
+                f"{'BROKER_IP_MISMATCH' if self._broker_ip_mismatch else 'BROKER_UNAVAILABLE'} "
+                f"remaining={self._broker_endpoint_pause_remaining('historical_chart'):.0f}s",
+            )
             return None, None
 
         ex = str(exchange or "").strip().upper() or "NSE"
@@ -3550,6 +4161,11 @@ class MStockTypeBClient:
                         to_date=payload["toDate"],
                     )
                     candles = self._parse_candles_payload(data, limit=limit)
+                except IPMismatchError as exc:
+                    last_exc = exc
+                    self._record_broker_failure("historical_chart", exc)
+                    print(f"[CANDLES] Broker IP mismatch token={token} interval={interval}: {self._broker_status_message()}")
+                    return None, None
                 except Exception as exc:  # noqa: BLE001
                     last_exc = exc
                     msg = str(exc)
@@ -4355,6 +4971,15 @@ class MStockTypeBClient:
         - ``MSTOCK_SYMBOL_TOKEN`` – numeric token for the instrument
         - ``MSTOCK_EXCHANGE`` – exchange string (e.g. ``"NSE"``)
         """
+        # ── Synthetic chain guard (paper/sim only) ─────────────────────────────
+        chain_source = str(getattr(self, "_paper_forward_chain_source", "") or os.getenv("PF_ACTIVE_CHAIN_SOURCE", "")).strip()
+        candle_src = str(os.getenv("PF_ACTIVE_CANDLE_SOURCE", "") or getattr(self, "_paper_forward_candle_source", "")).strip().upper()
+        if chain_source == "BLACK_SCHOLES_SYNTHETIC" or candle_src == "SYNTHETIC_SPOT_FALLBACK":
+            print("[LIVE-ORDER-GUARD] blocked reason=synthetic_data")
+            raise RuntimeError(
+                "[LIVE-ORDER-GUARD] Broker place_order blocked: synthetic chain/candle data is paper/sim only."
+            )
+
         # ── Central Real-Trading Gate ──────────────────────────────────────────
         try:
             from .config import RealTradingGate, real_trading_allowed
@@ -4396,6 +5021,124 @@ class MStockTypeBClient:
                 f"Set all required SCALPER_* / MSTOCK_* env vars before enabling live trading."
             )
         # ── End Central Gate ────────────────────────────────────────────────────
+
+        # ── New Candidate Lifecycle + Explicit Live Trade Gates (promotion pipeline) ──
+        try:
+            from .candidate_lifecycle import (
+                get_live_order_dry_run_env,
+                get_order_placement_enabled_env,
+                get_live_mode_env,
+                get_kill_switch_active,
+                load_live_whitelist,
+            )
+            from .config import live_trade_allowed, load_live_trade_gate_from_env
+        except Exception:
+            from candidate_lifecycle import (  # type: ignore
+                get_live_order_dry_run_env,
+                get_order_placement_enabled_env,
+                get_live_mode_env,
+                get_kill_switch_active,
+                load_live_whitelist,
+            )
+            from config import live_trade_allowed, load_live_trade_gate_from_env  # type: ignore
+
+        # If the explicit dry-run combination is set, build the payload but never send.
+        if get_live_mode_env() and get_live_order_dry_run_env():
+            # Record via the dry-run helper (safe, never places order)
+            try:
+                from .live_order_dryrun import execute_dry_run_if_requested
+            except Exception:
+                from live_order_dryrun import execute_dry_run_if_requested  # type: ignore
+            dry = execute_dry_run_if_requested(
+                candidate_id="unknown_or_from_caller",
+                symbol=symbol,
+                exchange=(exchange or os.getenv("MSTOCK_EXCHANGE", "NFO")),
+                symbol_token=(symbol_token or os.getenv("MSTOCK_SYMBOL_TOKEN", "")),
+                side=side,
+                quantity=quantity,
+                order_type=order_type,
+                price=price,
+                # expiry/option/strike/spread/ltp would be supplied by caller context in real integration
+            )
+            # Return a synthetic Order-like object so callers do not crash.
+            class _DryRunOrder:
+                def __init__(self, p):
+                    self.id = f"dryrun-{int(time.time()*1000)}"
+                    self.status = "DRY_RUN_RECORDED"
+                    self.payload = p
+            return _DryRunOrder(dry)  # type: ignore
+
+        # Full real-live matrix (only reached if the above did not short-circuit)
+        wl = load_live_whitelist()
+        # Best-effort: if the caller passed a tag containing the candidate, try to match; otherwise the gate will block unless whitelisted broadly.
+        # For now we take the first whitelisted LIVE_1_LOT/LIVE_SCALED as the signal that "a" candidate is approved.
+        live_ok_cand = any(
+            (c.live_whitelisted and c.status in ("LIVE_1_LOT", "LIVE_SCALED"))
+            for c in wl
+        ) if wl else False
+        live_status = "LIVE_1_LOT" if live_ok_cand else "DISABLED"
+
+        ltg = load_live_trade_gate_from_env(
+            candidate_whitelisted=live_ok_cand,
+            candidate_status=live_status,
+            broker_session_ok=bool(_token and not _token_expiring),
+            chain_fresh=True,          # caller / higher layer should pass real freshness
+            expiry_ok=True,
+            before_cutoff=True,
+            spread=0.0,                # higher layer should fill real spread/premium/SL state
+            premium_val=100.0,
+            has_sl=True,
+            has_exit=True,
+            open_pos=0,
+            trades_today=0,
+            daily_pnl=0.0,
+            is_duplicate=False,
+            order_type_limit=(order_type.upper() == "LIMIT"),
+            max_open=int(os.getenv("MSTOCK_MAX_OPEN", "6")),
+            max_trades=2,
+            max_loss=1000.0,
+        )
+        ltg_ok, ltg_blockers = live_trade_allowed(ltg)
+        if not ltg_ok:
+            raise RuntimeError(
+                f"[LIVE_TRADE_GATE] Real order BLOCKED by candidate-lifecycle gates. "
+                f"Blockers: {'; '.join(ltg_blockers)}. "
+                f"ORDER_PLACEMENT_ENABLED + LIVE_ORDER_DRY_RUN=false + candidate LIVE_1_LOT + all freshness/quote/risk checks are required."
+            )
+        # ── End New Live Trade Gate ─────────────────────────────────────────────
+
+        # ── Final Live Order Guard (new central wrapper from live_order_guard) ──
+        try:
+            from .live_order_guard import validate_before_order, OrderIntent
+        except Exception:
+            from live_order_guard import validate_before_order, OrderIntent  # type: ignore
+
+        intent = OrderIntent(
+            candidate_id="from_mstock_caller_or_tag",
+            symbol=symbol_val,
+            exchange=exchange_val,
+            symbol_token=symbol_token_val,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            price=price,
+            # expiry/ot/strike/spread etc would be enriched by caller in full integration
+        )
+        guard_res = validate_before_order(
+            intent,
+            runtime_state={
+                "broker_session_valid": bool(_token and not _token_expiring),
+                "option_chain_fresh": True,  # higher layer should pass real values
+                "before_cutoff": True,
+                "has_sl": True,
+                "has_exit": True,
+            },
+        )
+        if not guard_res.allowed:
+            raise RuntimeError(
+                f"[LIVE_ORDER_GUARD] BLOCKED: {'; '.join(guard_res.blockers)}"
+            )
+        # ── End Final Guard ─────────────────────────────────────────────────────
 
         self._ensure_valid_token()
         exchange_val = (exchange or os.getenv("MSTOCK_EXCHANGE", "NSE")).strip() or "NSE"

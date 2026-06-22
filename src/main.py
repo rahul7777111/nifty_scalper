@@ -1,6 +1,7 @@
 from __future__ import annotations
-import sys
+
 import os
+import sys
 from pathlib import Path
 
 # Load .env file explicitly so environment variables are available
@@ -16,21 +17,31 @@ try:
 except ImportError:
     print("[main] python-dotenv not installed, using existing environment")
 
-sys.path.append(os.path.abspath("pytradingapi-typeB-main"))
+_SRC_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SRC_DIR.parent
+_SDK_DIR = _REPO_ROOT / "pytradingapi-typeB-main"
 
-from config import load_api_config, load_strategy_config
-from mstock_client import MStockTypeBClient
-from strategy import NiftyScalper
-import gpt
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+if _SDK_DIR.exists() and str(_SDK_DIR) not in sys.path:
+    sys.path.insert(0, str(_SDK_DIR))
+
+from src.config import load_api_config, load_strategy_config
+from src.dhan_client import DhanClient
+from src.mstock_client import MStockTypeBClient
+from src.strategy import NiftyScalper
+from src import gpt
 
 
 def main() -> None:
     api_cfg = load_api_config()
     strat_cfg = load_strategy_config()
+    broker = str(os.getenv("SCALPER_BROKER", "mstock") or "mstock").strip().lower()
+    client = DhanClient(strat_cfg) if broker == "dhan" else MStockTypeBClient(api_cfg)
 
-    client = MStockTypeBClient(api_cfg)
-
-    print("Logging in to m.Stock (Type B API)...")
+    print(f"Logging in to {broker}...")
     try:
         client.login(interactive=False)
     except Exception as exc:  # noqa: BLE001

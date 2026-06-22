@@ -23,8 +23,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Pattern, Sequence, Set, Tuple
 
 # Contract version - must match between training and inference
-CONTRACT_VERSION = "1.0.0"
-CONTRACT_EPOCH = datetime(2026, 6, 9, 0, 0, 0, tzinfo=timezone.utc)
+CONTRACT_VERSION = "1.2.0"
+CONTRACT_EPOCH = datetime(2026, 6, 19, 0, 0, 0, tzinfo=timezone.utc)
 
 
 # ============================================================================
@@ -122,29 +122,33 @@ LEGACY_FORBIDDEN_COLUMN_TOKENS = (
 # ============================================================================
 
 # Base features required from candles (OHLCV + derived)
+# NOTE: These must match what build_market_feature_vector() ACTUALLY produces.
+# Features excluded by EXCLUDED_MODEL_FEATURES in ml_pipeline.py are NOT included here:
+# - ret_1, range_pct, roc_14, supertrend_gap_pct are EXCLUDED by ml_pipeline.py
+# - ctx_time_sin, ctx_time_cos, price_to_spot_pct are also EXCLUDED
 REQUIRED_CANDLE_FEATURES: Set[str] = {
-    # Price data
+    # Price data (last_* prefixed variants produced by build_market_feature_vector)
     "last_open", "last_high", "last_low", "last_close", "last_volume",
-    "open", "high", "low", "close", "volume",
     
     # Candlestick patterns
     "bullish_engulfing", "bearish_engulfing", "doji", "hammer", "shooting_star",
     
-    # Returns
-    "ret_1", "ret_3", "ret_5", "ret_10", "ret_mean", "ret_std", "ret_min", "ret_max",
+    # Returns (ret_1, ret_3, ret_5, ret_10 produced but ret_1 is EXCLUDED by pipeline)
+    # ret_mean/std/min/max from rolling_stats
+    "ret_3", "ret_5", "ret_10", "ret_mean", "ret_std", "ret_min", "ret_max",
     
-    # Technical indicators
+    # Technical indicators (roc_14, supertrend_gap_pct are EXCLUDED by pipeline)
     "ema_fast", "ema_slow", "ema_diff_pct", "rsi_14", "atr_14", "atr_pct",
-    "adx_14", "roc_14", "choppiness_14", "supertrend_dir", "supertrend_gap_pct",
+    "adx_14", "choppiness_14", "supertrend_dir",
     
     # Pivot levels
     "pivot_pp_dist_pct", "pivot_r1_dist_pct", "pivot_s1_dist_pct",
     
-    # Price action
+    # Price action (range_pct is EXCLUDED by pipeline)
     "close_vs_open_pct", "range_to_atr", "momentum_lookback_pct",
     
-    # Candlestick structure
-    "body_pct", "range_pct", "gap_pct", "upper_wick_pct", "lower_wick_pct",
+    # Candlestick structure (range_pct is EXCLUDED by pipeline)
+    "body_pct", "gap_pct", "upper_wick_pct", "lower_wick_pct",
     "close_location_pct",
 }
 
@@ -199,6 +203,48 @@ TIME_FEATURES: Set[str] = {
     "is_opening_session", "is_closing_session", "is_midday_lull",
 }
 
+# Live-computable context / option metadata features
+LIVE_CONTEXT_FEATURES: Set[str] = {
+    "weekday", "month", "weekly", "dte_days", "is_weekly",
+    "option_type_ce", "option_type_pe",
+    "ctx_dte_norm", "ctx_volume_sma",
+    "is_expiry_day", "is_near_expiry",
+    "hl_change_pct", "oc_change_pct",
+    "ctx_adx", "ctx_choppiness", "ctx_iv_change_pct", "ctx_iv_percentile",
+    "ctx_spot", "ctx_time_cos", "ctx_time_sin", "ctx_trend_strength",
+    "option_to_spot_pct", "theta_to_vega_ratio", "gamma_to_theta_ratio",
+}
+
+# Candle-derived optional features that are valid for live inference
+OPTIONAL_CANDLE_FEATURES: Set[str] = {
+    "range_pct", "ret_1", "roc_14", "supertrend_gap_pct",
+}
+
+# Rolling-history features available when enough live history exists
+ROLLING_HISTORY_OPTIONAL_FEATURES: Set[str] = {
+    "oi_z_5", "volume_z_5",
+}
+
+SPOT_CONTEXT_FEATURES: Set[str] = {
+    "open_spot", "high_spot", "low_spot", "close_spot",
+    "spot_close", "spot_range_pct", "spot_atr", "spot_rsi", "spot_vwap",
+    "volume_spot", "weekday_spot",
+}
+
+# Strategy features computable from current/live history only
+DIRECT_STRATEGY_FEATURES: Set[str] = {
+    "trend_following_strength", "trend_following_confidence",
+    "trend_following_ema_gap_pct", "trend_following_momentum_pct",
+    "trend_following_breakout_score", "trend_following_pullback_score",
+    "trend_following_buy_call", "trend_following_buy_put",
+    "mean_reversion_zscore", "mean_reversion_entry_score",
+    "mean_reversion_expected_reversion_pct", "mean_reversion_half_life_bars",
+    "mean_reversion_buy_call", "mean_reversion_buy_put",
+    "stat_arb_zscore", "stat_arb_confidence",
+    "stat_arb_spread_pct", "stat_arb_hedge_ratio",
+    "stat_arb_long_spread", "stat_arb_short_spread",
+}
+
 # Opening range features
 OPENING_RANGE_FEATURES: Set[str] = {
     "dist_from_opening_high_pct", "dist_from_opening_low_pct",
@@ -220,6 +266,11 @@ REQUIRED_FEATURE_SCHEMA: Dict[str, str] = {
     **{f: "float" for f in BS_FEATURES},
     **{f: "float" for f in BS_FLAG_FEATURES},
     **{f: "float" for f in TIME_FEATURES},
+    **{f: "float" for f in LIVE_CONTEXT_FEATURES},
+    **{f: "float" for f in OPTIONAL_CANDLE_FEATURES},
+    **{f: "float" for f in ROLLING_HISTORY_OPTIONAL_FEATURES},
+    **{f: "float" for f in DIRECT_STRATEGY_FEATURES},
+    **{f: "float" for f in SPOT_CONTEXT_FEATURES},
     **{f: "float" for f in OPENING_RANGE_FEATURES},
     **{f: "float" for f in MARKET_STRUCTURE_FEATURES},
 }
@@ -237,6 +288,8 @@ CORE_REQUIRED_FEATURES: Set[str] = REQUIRED_CANDLE_FEATURES | REQUIRED_REGIME_FE
 def _build_allowed_live_features() -> Set[str]:
     """Build the set of allowed live features from required schema."""
     allowed = set(REQUIRED_FEATURE_SCHEMA.keys())
+    allowed.difference_update(BS_FEATURES - OPTION_CHAIN_FEATURES)
+    allowed.difference_update(BS_FLAG_FEATURES)
     # Add common derived features that might be computed at inference
     allowed.update({
         "atr_5", "atr_10", "atr_20",
@@ -247,6 +300,10 @@ def _build_allowed_live_features() -> Set[str]:
         "skew", "kurtosis",
         "option_price", "spot", "dte_norm",
     })
+    # Add raw OHLCV features - these are available in live candle data
+    # even though the training pipeline (ml_pipeline.py) uses last_* prefixed versions.
+    # live_feature_builder.py produces both prefixed and unprefixed OHLCV.
+    allowed.update({"open", "high", "low", "close", "volume"})
     return allowed
 
 ALLOWED_LIVE_FEATURES: Set[str] = _build_allowed_live_features()

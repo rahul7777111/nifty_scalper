@@ -1,0 +1,102 @@
+{
+  "candidates": [
+    {
+      "candidate_id": "elasticnet_PE_only_balanced_PE_only_balanced_t30_20260610_130953",
+      "enabled": false,
+      "classification": "paper_forward_only",
+      "artifact_dir": "artifacts/candidates/elasticnet_PE_only_balanced_PE_only_balanced_t30_20260610_130953",
+      "model_name": "elasticnet",
+      "preset_family": "PE_only_balanced",
+      "side_policy": "PE_ONLY",
+      "paper_forward_only": true,
+      "shadow_ready": false,
+      "notes": "paper observation only",
+      "disabled_reason": "ARTIFACT_NOT_FOUND",
+      "artifact_identity_verified": false
+    },
+    {
+      "candidate_id": "elasticnet_PE_only_balanced_PE_only_balanced_t35_20260610_130953",
+      "enabled": false,
+      "classification": "paper_forward_only",
+      "artifact_dir": "artifacts/candidates/elasticnet_PE_only_balanced_PE_only_balanced_t35_20260610_130953",
+      "model_name": "elasticnet",
+      "preset_family": "PE_only_balanced",
+      "side_policy": "PE_ONLY",
+      "paper_forward_only": true,
+      "shadow_ready": false,
+      "notes": "paper observation only",
+      "disabled_reason": "ARTIFACT_NOT_FOUND",
+      "artifact_identity_verified": false
+    },
+    {
+      "candidate_id": "elasticnet_BOTH_auto_balanced_BOTH_auto_bal_t30_20260610_130953",
+      "enabled": false,
+      "classification": "paper_forward_only",
+      "artifact_dir": "artifacts/candidates/elasticnet_BOTH_auto_balanced_BOTH_auto_bal_t30_20260610_130953",
+      "model_name": "elasticnet",
+      "preset_family": "BOTH_auto_balanced",
+      "side_policy": "AUTO_DIRECTIONAL",
+      "paper_forward_only": true,
+      "shadow_ready": false,
+      "notes": "paper observation only",
+      "disabled_reason": "ARTIFACT_NOT_FOUND",
+      "artifact_identity_verified": false
+    },
+    {
+      "candidate_id": "elasticnet_BOTH_auto_balanced_BOTH_auto_bal_t35_20260610_130953",
+      "enabled": false,
+      "classification": "paper_forward_only",
+      "artifact_dir": "artifacts/candidates/elasticnet_BOTH_auto_balanced_BOTH_auto_bal_t35_20260610_130953",
+      "model_name": "elasticnet",
+      "preset_family": "BOTH_auto_balanced",
+      "side_policy": "AUTO_DIRECTIONAL",
+      "paper_forward_only": true,
+      "shadow_ready": false,
+      "notes": "paper observation only",
+      "disabled_reason": "ARTIFACT_NOT_FOUND",
+      "artifact_identity_verified": false
+    },
+    {
+      "candidate_id": "logistic_regression_BOTH_auto_balanced_BOTH_auto_bal_t30_20260610_130953",
+      "enabled": false,
+      "classification": "paper_forward_only",
+      "artifact_dir": "artifacts/candidates/logistic_regression_BOTH_auto_balanced_BOTH_auto_bal_t30_20260610_130953",
+      "model_name": "logistic_regression",
+      "preset_family": "BOTH_auto_balanced",
+      "side_policy": "AUTO_DIRECTIONAL",
+      "paper_forward_only": true,
+      "shadow_ready": false,
+      "notes": "paper observation only",
+      "disabled_reason": "ARTIFACT_NOT_FOUND",
+      "artifact_identity_verified": false
+    },
+    {
+      "candidate_id": "logistic_regression_BOTH_auto_balanced_BOTH_auto_bal_t35_20260610_130953",
+      "enabled": false,
+      "classification": "paper_forward_only",
+      "artifact_dir": "artifacts/candidates/logistic_regression_BOTH_auto_balanced_BOTH_auto_bal_t35_20260610_130953",
+      "model_name": "logistic_regression",
+      "preset_family": "BOTH_auto_balanced",
+      "side_policy": "AUTO_DIRECTIONAL",
+      "paper_forward_only": true,
+      "shadow_ready": false,
+      "notes": "paper observation only",
+      "disabled_reason": "ARTIFACT_NOT_FOUND",
+      "artifact_identity_verified": false
+    },
+    {
+      "candidate_id": "xgboost_cost_survivor_balanced_cost_surv_bal_t30_20260610_130953",
+      "enabled": false,
+      "classification": "paper_forward_only",
+      "artifact_dir": "artifacts/candidates/xgboost_cost_survivor_balanced_cost_surv_bal_t30_20260610_130953",
+      "model_name": "xgboost",
+      "preset_family": "cost_survivor_balanced",
+      "side_policy": "BOTH",
+      "paper_forward_only": true,
+      "shadow_ready": false,
+      "notes": "paper observation only",
+      "disabled_reason": "ARTIFACT_NOT_FOUND",
+      "artifact_identity_verified": false
+    }
+  ]
+}
