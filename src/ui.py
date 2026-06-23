@@ -245,9 +245,9 @@ from live_order_dryrun import is_live_dry_run_active, execute_dry_run_if_request
 from mstock_client import MStockTypeBClient
 from strategy import NiftyScalper, TradeLogEvent
 from rf_gui_backtest import (
-    discover_rf_test_target,
-    find_latest_rf_artifact,
-    materialize_rf_dynamic_candidate,
+    discover_ensemble_test_target,
+    find_latest_ensemble_artifact,
+    materialize_ensemble_dynamic_candidate,
     resolve_dataset_path,
 )
 
@@ -1231,10 +1231,10 @@ class ScalperUI(tk.Tk):
         self._bt_thread: threading.Thread | None = None
         self._bt_stop_event = threading.Event()
         self._bt_last_output_dir: Optional[str] = None
-        self._bt_last_rf_artifact: str = ""
-        self._bt_last_rf_artifact_dir: str = ""
-        self._bt_last_rf_wrapper_dir: str = ""
-        self._bt_last_rf_config: str = ""
+        self._bt_last_ensemble_artifact: str = ""
+        self._bt_last_ensemble_artifact_dir: str = ""
+        self._bt_last_ensemble_wrapper_dir: str = ""
+        self._bt_last_ensemble_config: str = ""
         self._engine_diag_last_snapshot: dict[str, object] = {}
         self._ensemble_router: EnsembleAutoRouter | None = None
         self._ensemble_paper: EnsemblePaperTrader | None = None
@@ -3268,10 +3268,10 @@ class ScalperUI(tk.Tk):
         self.bt_run_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.bt_stop_btn = ttk.Button(btns, text="Stop Backtest", command=self._on_stop_ml_backtest, state=tk.DISABLED)
         self.bt_stop_btn.pack(side=tk.LEFT, padx=6)
-        self.bt_rf_retrain_btn = ttk.Button(btns, text="Retrain Random Forest", command=self._on_retrain_random_forest)
-        self.bt_rf_retrain_btn.pack(side=tk.LEFT, padx=6)
-        self.bt_rf_test_btn = ttk.Button(btns, text="Test Random Forest", command=self._on_test_random_forest)
-        self.bt_rf_test_btn.pack(side=tk.LEFT, padx=6)
+        self.bt_ensemble_retrain_btn = ttk.Button(btns, text="Retrain Ensemble", command=self._on_retrain_ensemble)
+        self.bt_ensemble_retrain_btn.pack(side=tk.LEFT, padx=6)
+        self.bt_ensemble_test_btn = ttk.Button(btns, text="Test Ensemble", command=self._on_test_ensemble)
+        self.bt_ensemble_test_btn.pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="Open Output Folder", command=self._on_open_bt_output).pack(side=tk.LEFT, padx=6)
 
         self.bt_status_var = tk.StringVar(value="IDLE")
@@ -3325,7 +3325,7 @@ class ScalperUI(tk.Tk):
 
         ml_frame.grid_columnconfigure(1, weight=1)
         ml_frame.grid_rowconfigure(10, weight=1)
-        self._bt_prime_rf_test_defaults()
+        self._bt_prime_ensemble_test_defaults()
 
     def _build_telemetry_tab(self) -> None:
         """Create the layout for portfolio Greeks, system health metrics, 
@@ -3816,7 +3816,7 @@ class ScalperUI(tk.Tk):
     def _bt_reset_progress(self) -> None:
         self._bt_set_progress(0.0, "Starting...")
 
-    def _bt_rf_retrain_progress_from_log(self, line: str) -> None:
+    def _bt_ensemble_retrain_progress_from_log(self, line: str) -> None:
         text = str(line or "").strip().lower()
         if not text:
             return
@@ -3833,8 +3833,8 @@ class ScalperUI(tk.Tk):
             ("[retrain] evaluation return column=", 0.72, "Evaluation setup ready"),
             ("[retrain] train/test split mode=", 0.76, "Chronological split ready"),
             ('"status": "trained"', 0.90, "Training finished, finalizing artifacts..."),
-            ("rf artifact selected:", 0.96, "Artifact selected"),
-            ("rf dynamic candidate config selected:", 0.98, "Candidate wrapper generated"),
+            ("ensemble artifact selected:", 0.96, "Artifact selected"),
+            ("ensemble dynamic candidate config selected:", 0.98, "Candidate wrapper generated"),
         ]
         for needle, fraction, message in stages:
             if needle in text:
@@ -3878,7 +3878,7 @@ class ScalperUI(tk.Tk):
         state = tk.NORMAL if enabled else tk.DISABLED
 
         def _do() -> None:
-            for attr in ("bt_run_btn", "bt_rf_retrain_btn", "bt_rf_test_btn"):
+            for attr in ("bt_run_btn", "bt_ensemble_retrain_btn", "bt_ensemble_test_btn"):
                 try:
                     getattr(self, attr).configure(state=state)
                 except Exception:
@@ -3886,32 +3886,32 @@ class ScalperUI(tk.Tk):
 
         self.ui_call(_do)
 
-    def _bt_find_latest_rf_artifact(self, output_root: Path) -> tuple[Path | None, Path | None]:
-        return find_latest_rf_artifact(output_root)
+    def _bt_find_latest_ensemble_artifact(self, output_root: Path) -> tuple[Path | None, Path | None]:
+        return find_latest_ensemble_artifact(output_root)
 
-    def _bt_materialize_rf_dynamic_candidate(self, artifact_path: Path, artifact_dir: Path) -> tuple[Path | None, Path | None]:
+    def _bt_materialize_ensemble_dynamic_candidate(self, artifact_path: Path, artifact_dir: Path) -> tuple[Path | None, Path | None]:
         try:
-            return materialize_rf_dynamic_candidate(REPO_ROOT, artifact_path, artifact_dir)
+            return materialize_ensemble_dynamic_candidate(REPO_ROOT, artifact_path, artifact_dir)
         except Exception:
-            logger.exception("Failed to materialize RF dynamic candidate wrapper")
+            logger.exception("Failed to materialize ensemble dynamic candidate wrapper")
             return None, None
 
-    def _bt_discover_rf_test_target(self) -> dict[str, Any]:
-        return discover_rf_test_target(
+    def _bt_discover_ensemble_test_target(self) -> dict[str, Any]:
+        return discover_ensemble_test_target(
             REPO_ROOT,
-            last_config=str(getattr(self, "_bt_last_rf_config", "") or "").strip(),
-            last_artifact=str(getattr(self, "_bt_last_rf_artifact", "") or "").strip(),
+            last_config=str(getattr(self, "_bt_last_ensemble_config", "") or "").strip(),
+            last_artifact=str(getattr(self, "_bt_last_ensemble_artifact", "") or "").strip(),
         )
 
-    def _bt_apply_rf_test_safe_defaults(self) -> None:
+    def _bt_apply_ensemble_test_safe_defaults(self) -> None:
         if hasattr(self, "bt_max_rows_var") and not str(self.bt_max_rows_var.get() or "").strip():
             self.bt_max_rows_var.set("100000")
-            self._bt_append_log("RF test: capped to 100000 rows for safer startup (set Rows to override).")
+            self._bt_append_log("Ensemble test: capped to 100000 rows for safer startup (set Rows to override).")
         if hasattr(self, "bt_fast_mode_var"):
             self.bt_fast_mode_var.set(True)
 
-    def _bt_ensure_rf_test_config(self, target: dict[str, Any]) -> dict[str, Any]:
-        """Build the RF dynamic-candidate config when discovery only found a raw artifact."""
+    def _bt_ensure_ensemble_test_config(self, target: dict[str, Any]) -> dict[str, Any]:
+        """Build the ensemble dynamic-candidate config when discovery only found a raw artifact."""
         resolved = dict(target)
         config_path = str(resolved.get("config_path") or "").strip()
         if config_path and Path(config_path).is_file():
@@ -3924,18 +3924,18 @@ class ScalperUI(tk.Tk):
         if not artifact_p.is_file():
             return resolved
 
-        wrapper_dir, wrapper_config = self._bt_materialize_rf_dynamic_candidate(artifact_p, artifact_p.parent)
+        wrapper_dir, wrapper_config = self._bt_materialize_ensemble_dynamic_candidate(artifact_p, artifact_p.parent)
         if not wrapper_config:
             resolved["error"] = (
-                "Failed to build RF dynamic candidate wrapper for the selected artifact. "
-                "Retrain the random forest again or select a valid RF config/artifact."
+                "Failed to build ensemble dynamic candidate wrapper for the selected artifact. "
+                "Retrain the ensemble again or select a valid ensemble config/artifact."
             )
             return resolved
 
         resolved["config_path"] = str(wrapper_config)
-        self._bt_last_rf_config = str(wrapper_config)
+        self._bt_last_ensemble_config = str(wrapper_config)
         if wrapper_dir:
-            self._bt_last_rf_wrapper_dir = str(wrapper_dir)
+            self._bt_last_ensemble_wrapper_dir = str(wrapper_dir)
         try:
             payload = json.loads(Path(wrapper_config).read_text(encoding="utf-8"))
             cand = (payload.get("candidates") or [{}])[0]
@@ -3949,7 +3949,7 @@ class ScalperUI(tk.Tk):
             pass
         return resolved
 
-    def _bt_rf_test_ready(self) -> tuple[bool, str]:
+    def _bt_ensemble_test_ready(self) -> tuple[bool, str]:
         required = [
             "bt_config_path_var",
             "bt_csv_path_var",
@@ -3963,23 +3963,23 @@ class ScalperUI(tk.Tk):
             except Exception:
                 missing.append(name)
         if missing:
-            return False, f"RF test controls are not ready yet: missing {', '.join(missing)}"
+            return False, f"Ensemble test controls are not ready yet: missing {', '.join(missing)}"
         return True, ""
 
-    def _bt_apply_rf_test_target(self, target: dict[str, Any]) -> None:
-        ready, reason = self._bt_rf_test_ready()
+    def _bt_apply_ensemble_test_target(self, target: dict[str, Any]) -> None:
+        ready, reason = self._bt_ensemble_test_ready()
         if not ready:
             raise RuntimeError(reason)
         config_path = str(target.get("config_path") or "").strip()
         artifact_path = str(target.get("artifact_path") or "").strip()
         if config_path:
-            self._bt_last_rf_config = config_path
+            self._bt_last_ensemble_config = config_path
             self.bt_config_path_var.set(config_path)
-            self._bt_append_log(f"Testing RF dynamic candidate config: {config_path}")
+            self._bt_append_log(f"Testing ensemble dynamic candidate config: {config_path}")
         elif artifact_path:
-            self._bt_last_rf_artifact = artifact_path
+            self._bt_last_ensemble_artifact = artifact_path
             self.bt_config_path_var.set(artifact_path)
-            self._bt_append_log(f"Testing retrained random forest artifact: {artifact_path}")
+            self._bt_append_log(f"Testing retrained ensemble artifact: {artifact_path}")
 
         dataset_hint = str(target.get("dataset_hint") or "").strip()
         retrain_csv = str(self.bt_retrain_dataset_var.get() or "").strip()
@@ -3990,7 +3990,7 @@ class ScalperUI(tk.Tk):
             if resolved_csv:
                 if resolved_csv != csvp:
                     self.bt_csv_path_var.set(resolved_csv)
-                    self._bt_append_log(f"Using dataset for RF test: {resolved_csv}")
+                    self._bt_append_log(f"Using dataset for ensemble test: {resolved_csv}")
                 break
 
         if target.get("selected_threshold") is not None:
@@ -4023,22 +4023,22 @@ class ScalperUI(tk.Tk):
                 self.bt_selected_only_var.set(True)
                 self.bt_selected_candidates_var.set(candidate_id)
 
-    def _bt_prime_rf_test_defaults(self) -> None:
+    def _bt_prime_ensemble_test_defaults(self) -> None:
         if str(self.bt_config_path_var.get() or "").strip():
             return
-        target = self._bt_discover_rf_test_target()
+        target = self._bt_discover_ensemble_test_target()
         if target.get("error"):
             return
         config_path = str(target.get("config_path") or "").strip()
         artifact_path = str(target.get("artifact_path") or "").strip()
         if config_path:
-            self._bt_last_rf_config = config_path
+            self._bt_last_ensemble_config = config_path
             self.bt_config_path_var.set(config_path)
         elif artifact_path:
-            self._bt_last_rf_artifact = artifact_path
+            self._bt_last_ensemble_artifact = artifact_path
             self.bt_config_path_var.set(artifact_path)
 
-    def _on_retrain_random_forest(self) -> None:
+    def _on_retrain_ensemble(self) -> None:
         if getattr(self, "_bt_thread", None) is not None and self._bt_thread.is_alive():
             try:
                 messagebox.showwarning("Retrain", "Another ML backtest or retrain task is already running.")
@@ -4061,7 +4061,7 @@ class ScalperUI(tk.Tk):
             messagebox.showerror("Retrain", "Retrain dataset must be a .csv file.")
             return
 
-        rf_output_root = REPO_ROOT / "models" / f"rf_gui_retrain_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        ensemble_output_root = REPO_ROOT / "models" / f"ensemble_gui_retrain_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         cmd = [
             sys.executable,
             "-u",
@@ -4072,11 +4072,11 @@ class ScalperUI(tk.Tk):
             "--live-computable-only",
             "--no-production-adopt",
             "--only-model",
-            "random_forest",
+            "xgb_rf_ensemble",
             "--only-target",
             "profitable_trade_label",
             "--output-dir",
-            str(rf_output_root),
+            str(ensemble_output_root),
         ]
 
         self._bt_set_action_buttons_enabled(False)
@@ -4084,9 +4084,9 @@ class ScalperUI(tk.Tk):
             self.bt_stop_btn.configure(state=tk.DISABLED)
         except Exception:
             pass
-        self._bt_set_status("RF RETRAIN RUNNING")
+        self._bt_set_status("ENSEMBLE RETRAIN RUNNING")
         self._bt_reset_progress()
-        self._bt_append_log(f"Starting random forest retrain with dataset: {dataset_path}")
+        self._bt_append_log(f"Starting ensemble retrain with dataset: {dataset_path}")
         self._bt_append_log("Command: " + " ".join(f'"{part}"' if " " in str(part) else str(part) for part in cmd))
 
         def worker() -> None:
@@ -4095,8 +4095,8 @@ class ScalperUI(tk.Tk):
             try:
                 child_env = os.environ.copy()
                 child_env["PYTHONUNBUFFERED"] = "1"
-                rf_output_root.mkdir(parents=True, exist_ok=True)
-                subprocess_log_path = rf_output_root / "rf_retrain_subprocess.log"
+                ensemble_output_root.mkdir(parents=True, exist_ok=True)
+                subprocess_log_path = ensemble_output_root / "ensemble_retrain_subprocess.log"
                 proc = subprocess.Popen(
                     cmd,
                     cwd=str(REPO_ROOT),
@@ -4106,7 +4106,7 @@ class ScalperUI(tk.Tk):
                     bufsize=1,
                     env=child_env,
                 )
-                self._bt_append_log(f"Random forest retrain subprocess started. pid={getattr(proc, 'pid', 'n/a')}")
+                self._bt_append_log(f"Ensemble retrain subprocess started. pid={getattr(proc, 'pid', 'n/a')}")
                 with subprocess_log_path.open("a", encoding="utf-8") as log_fh:
                     if proc.stdout is not None:
                         for line in proc.stdout:
@@ -4115,10 +4115,10 @@ class ScalperUI(tk.Tk):
                                 log_fh.write(text + "\n")
                                 log_fh.flush()
                                 self._bt_append_log(text)
-                                self._bt_rf_retrain_progress_from_log(text)
+                                self._bt_ensemble_retrain_progress_from_log(text)
                 return_code = proc.wait()
                 if return_code != 0:
-                    hygiene_reports = sorted(rf_output_root.rglob("feature_hygiene_report.json"))
+                    hygiene_reports = sorted(ensemble_output_root.rglob("feature_hygiene_report.json"))
                     hygiene_hint = ""
                     if hygiene_reports:
                         try:
@@ -4130,27 +4130,27 @@ class ScalperUI(tk.Tk):
                         except Exception:
                             hygiene_hint = f" Feature hygiene report written to {hygiene_reports[-1]}"
                     raise RuntimeError(
-                        f"Random forest retrain failed with exit code {return_code}. "
+                        f"Ensemble retrain failed with exit code {return_code}. "
                         f"Full subprocess log: {subprocess_log_path}.{hygiene_hint}"
                     )
 
-                artifact_path, artifact_dir = self._bt_find_latest_rf_artifact(rf_output_root)
+                artifact_path, artifact_dir = self._bt_find_latest_ensemble_artifact(ensemble_output_root)
                 if artifact_path is None or artifact_dir is None:
-                    raise FileNotFoundError(f"No random forest artifact found under {rf_output_root}")
-                wrapper_dir, wrapper_config = self._bt_materialize_rf_dynamic_candidate(artifact_path, artifact_dir)
+                    raise FileNotFoundError(f"No ensemble artifact found under {ensemble_output_root}")
+                wrapper_dir, wrapper_config = self._bt_materialize_ensemble_dynamic_candidate(artifact_path, artifact_dir)
 
                 def _done() -> None:
-                    self._bt_last_rf_artifact = str(artifact_path)
-                    self._bt_last_rf_artifact_dir = str(artifact_dir)
-                    self._bt_last_rf_wrapper_dir = str(wrapper_dir) if wrapper_dir else ""
-                    self._bt_last_rf_config = str(wrapper_config) if wrapper_config else ""
+                    self._bt_last_ensemble_artifact = str(artifact_path)
+                    self._bt_last_ensemble_artifact_dir = str(artifact_dir)
+                    self._bt_last_ensemble_wrapper_dir = str(wrapper_dir) if wrapper_dir else ""
+                    self._bt_last_ensemble_config = str(wrapper_config) if wrapper_config else ""
                     self.bt_config_path_var.set(str(wrapper_config or artifact_path))
-                    self._bt_set_status("RF RETRAIN COMPLETE")
+                    self._bt_set_status("ENSEMBLE RETRAIN COMPLETE")
                     self._bt_set_progress(1.0, "Retrain complete")
-                    self._bt_append_log(f"RF artifact selected: {artifact_path}")
+                    self._bt_append_log(f"Ensemble artifact selected: {artifact_path}")
                     if wrapper_config:
-                        self._bt_append_log(f"RF dynamic candidate config selected: {wrapper_config}")
-                    self._bt_append_log("Random forest retrain COMPLETE. Use 'Test Random Forest' to run the backtest with this artifact.")
+                        self._bt_append_log(f"Ensemble dynamic candidate config selected: {wrapper_config}")
+                    self._bt_append_log("Ensemble retrain COMPLETE. Use 'Test Ensemble' to run the backtest with this artifact.")
                     self._bt_set_action_buttons_enabled(True)
 
                 self.ui_call(_done)
@@ -4158,14 +4158,14 @@ class ScalperUI(tk.Tk):
                 tb = traceback.format_exc()
 
                 def _fail() -> None:
-                    self._bt_set_status("RF RETRAIN FAILED")
+                    self._bt_set_status("ENSEMBLE RETRAIN FAILED")
                     self._bt_set_progress(0.0, "Retrain failed")
                     self._bt_append_log(f"ERROR: {exc}")
                     last = (tb or "").strip().splitlines()[-1] if tb else ""
                     if last:
                         self._bt_append_log(last)
                     self._bt_set_action_buttons_enabled(True)
-                    logger.exception("Random forest retrain failed")
+                    logger.exception("Ensemble retrain failed")
 
                 self.ui_call(_fail)
 
@@ -4173,34 +4173,34 @@ class ScalperUI(tk.Tk):
         if thread is not None:
             self._bt_thread = thread
 
-    def _on_test_random_forest(self) -> None:
+    def _on_test_ensemble(self) -> None:
         try:
-            ready, reason = self._bt_rf_test_ready()
+            ready, reason = self._bt_ensemble_test_ready()
             if not ready:
-                messagebox.showerror("Test Random Forest", reason)
+                messagebox.showerror("Test Ensemble", reason)
                 return
-            target = self._bt_discover_rf_test_target()
+            target = self._bt_discover_ensemble_test_target()
             if target.get("error"):
                 cfgp = str(self.bt_config_path_var.get() or "").strip()
                 if cfgp and Path(cfgp).exists():
-                    self._bt_append_log(f"Testing manually selected RF config/artifact: {cfgp}")
+                    self._bt_append_log(f"Testing manually selected ensemble config/artifact: {cfgp}")
                 else:
-                    messagebox.showerror("Test Random Forest", str(target["error"]))
+                    messagebox.showerror("Test Ensemble", str(target["error"]))
                     return
             else:
                 config_path = str(target.get("config_path") or "").strip()
                 artifact_path = str(target.get("artifact_path") or "").strip()
                 if config_path and not Path(config_path).exists():
-                    messagebox.showerror("Test Random Forest", f"RF dynamic candidate config no longer exists:\n{config_path}")
+                    messagebox.showerror("Test Ensemble", f"Ensemble dynamic candidate config no longer exists:\n{config_path}")
                     return
                 if not config_path and artifact_path and not Path(artifact_path).exists():
-                    messagebox.showerror("Test Random Forest", f"Retrained random forest artifact no longer exists:\n{artifact_path}")
+                    messagebox.showerror("Test Ensemble", f"Retrained ensemble artifact no longer exists:\n{artifact_path}")
                     return
-                target = self._bt_ensure_rf_test_config(target)
+                target = self._bt_ensure_ensemble_test_config(target)
                 if target.get("error"):
-                    messagebox.showerror("Test Random Forest", str(target["error"]))
+                    messagebox.showerror("Test Ensemble", str(target["error"]))
                     return
-                self._bt_apply_rf_test_target(target)
+                self._bt_apply_ensemble_test_target(target)
                 if (
                     hasattr(self, "bt_use_candidate_thresholds_var")
                     and self.bt_use_candidate_thresholds_var.get()
@@ -4225,17 +4225,17 @@ class ScalperUI(tk.Tk):
             csvp = str(self.bt_csv_path_var.get() or "").strip()
             if not csvp or not Path(csvp).exists():
                 messagebox.showerror(
-                    "Test Random Forest",
-                    "Select a valid Test/Backtest CSV, or set the Retrain dataset CSV so the RF test can reuse it.",
+                    "Test Ensemble",
+                    "Select a valid Test/Backtest CSV, or set the Retrain dataset CSV so the ensemble test can reuse it.",
                 )
                 return
 
-            self._bt_apply_rf_test_safe_defaults()
+            self._bt_apply_ensemble_test_safe_defaults()
             self._on_run_ml_backtest()
         except Exception as exc:
-            logger.exception("RF test initiation failed")
+            logger.exception("Ensemble test initiation failed")
             try:
-                messagebox.showerror("Test Random Forest", f"Failed to start RF test:\n{exc}")
+                messagebox.showerror("Test Ensemble", f"Failed to start ensemble test:\n{exc}")
             except Exception:
                 pass
 
@@ -18924,7 +18924,8 @@ class ScalperUI(tk.Tk):
         cols = (
             "enabled", "candidate_id", "model", "preset", "side", "stage", "next_step", "can_advance",
             "block_reason", "missing_requirements", "artifact_status", "data_status", "confidence_health",
-            "trades_days", "final_signal", "conf", "paper_action", "trade_reason",
+            "trades_days", "final_signal", "conf", "ensemble_prob", "xgb_prob", "rf_prob", "allowed", "model_type",
+            "feature_missing_count", "feature_invalid_count", "pred_block_reason", "paper_action", "trade_reason",
             "pos", "sel_strike", "sel_type", "sel_symbol", "entries", "exits", "entry_px", "cur_opt_px", "qty", "spot", "unreal_pnl", "real_pnl",
             "mark_source", "cost_quality", "last_mark_time", "trades", "sim_wr", "max_dd", "last_reason", "updated",
         )
@@ -18957,13 +18958,21 @@ class ScalperUI(tk.Tk):
             "data_status": "Data Status",
             "confidence_health": "Confidence Health",
             "trades_days": "Trades / Days",
+            "ensemble_prob": "Ens Prob",
+            "xgb_prob": "XGB Prob",
+            "rf_prob": "RF Prob",
+            "allowed": "Allowed",
+            "model_type": "Model Type",
+            "feature_missing_count": "Feat Miss",
+            "feature_invalid_count": "Feat Bad",
+            "pred_block_reason": "Pred Block",
             "paper_action": "Paper Action",
             "trade_reason": "Trade Reason",
         }
         for c in cols:
             self.pf_tree.heading(c, text=col_titles.get(c, c.replace("_", " ").title()))
-            narrow = c in ("enabled", "conf", "pos", "sel_type", "entries", "exits", "sim_wr", "trades", "spot", "qty", "can_advance", "paper_action")
-            width = 70 if narrow else (260 if c == "candidate_id" else (240 if c == "trade_reason" else (220 if c in ("sel_symbol", "block_reason", "missing_requirements") else (300 if c == "last_reason" else 110))))
+            narrow = c in ("enabled", "conf", "ensemble_prob", "xgb_prob", "rf_prob", "allowed", "feature_missing_count", "feature_invalid_count", "pos", "sel_type", "entries", "exits", "sim_wr", "trades", "spot", "qty", "can_advance", "paper_action")
+            width = 70 if narrow else (260 if c == "candidate_id" else (240 if c == "trade_reason" else (220 if c in ("sel_symbol", "block_reason", "missing_requirements", "pred_block_reason") else (300 if c == "last_reason" else 110))))
             anchor = "e" if c in ("unreal_pnl", "real_pnl", "max_dd", "entry_px", "cur_opt_px", "spot", "sel_strike") else "w"
             # stretch=False so horizontal scrollbar reveals wide candidate_id / last_reason columns.
             self.pf_tree.column(c, width=width, stretch=False, anchor=anchor)
@@ -19493,6 +19502,31 @@ class ScalperUI(tk.Tk):
 
     def _render_paper_forward_row(self, r: Dict[str, Any]) -> tuple:
         """TASK4: render row strictly from (enhanced) runtime decision state."""
+        def _fmt_prob(value: Any) -> str:
+            try:
+                if value in (None, ""):
+                    return "-"
+                return f"{float(value):.4f}"
+            except Exception:
+                return "-"
+
+        def _fmt_count(value: Any) -> str:
+            try:
+                if value in (None, ""):
+                    return "-"
+                return str(int(value))
+            except Exception:
+                return "-"
+
+        def _fmt_allowed(value: Any) -> str:
+            if value is True:
+                return "Y"
+            if value is False:
+                return "N"
+            if value in (None, ""):
+                return "-"
+            return str(value)
+
         conf = r.get("confidence")
         predict_attempted = bool(r.get("predict_attempted", False))
         raw_reason = str(r.get("raw_reason") or r.get("last_no_trade_reason", r.get("no_trade_reason", r.get("reason_code", ""))))
@@ -19566,6 +19600,14 @@ class ScalperUI(tk.Tk):
             "trades_days": f"{lifecycle.trades}/{lifecycle.days}" if lifecycle is not None else f"{int(r.get('total_trades', r.get('trades', 0)) or 0)}/-",
             "final_signal": r.get("final_signal", r.get("last_signal", "NO_TRADE")),
             "conf": conf_str,
+            "ensemble_prob": _fmt_prob(r.get("ensemble_prob")),
+            "xgb_prob": _fmt_prob(r.get("xgb_prob")),
+            "rf_prob": _fmt_prob(r.get("rf_prob")),
+            "allowed": _fmt_allowed(r.get("allowed")),
+            "model_type": str(r.get("model_type") or "-"),
+            "feature_missing_count": _fmt_count(r.get("feature_missing_count")),
+            "feature_invalid_count": _fmt_count(r.get("feature_invalid_count")),
+            "pred_block_reason": str(r.get("block_reason") or "-"),
             "paper_action": str(r.get("paper_action") or r.get("simulated_action") or "-"),
             "trade_reason": str(r.get("trade_reason") or display_reason or "-"),
             "pos": pos,
@@ -19672,6 +19714,14 @@ class ScalperUI(tk.Tk):
                 "selected_strike": dec.get("selected_strike") or dec.get("entry_strike"),
                 "selected_option_type": dec.get("selected_option_type") or dec.get("sim_side"),
                 "selected_symbol": dec.get("selected_symbol") or dec.get("entry_symbol"),
+                "ensemble_prob": dec.get("ensemble_prob"),
+                "xgb_prob": dec.get("xgb_prob"),
+                "rf_prob": dec.get("rf_prob"),
+                "block_reason": dec.get("block_reason"),
+                "allowed": dec.get("allowed"),
+                "model_type": dec.get("model_type"),
+                "feature_missing_count": dec.get("feature_missing_count"),
+                "feature_invalid_count": dec.get("feature_invalid_count"),
             }
         print(f"[PF-DECISION-CACHE] updated={len(decisions)} cached={len(cache)} keys=row_key")
 
@@ -20222,7 +20272,16 @@ class ScalperUI(tk.Tk):
                 values = []
             cid = str(values[1] if len(values) > 1 else iid)
             rows = getattr(self, "_pf_last_gui_rows_by_candidate", {}) or {}
-            row = dict(rows.get(cid) or {})
+            row = dict(rows.get(iid) or rows.get(cid) or {})
+            if not row:
+                row = next(
+                    (
+                        dict(item)
+                        for item in rows.values()
+                        if str((item or {}).get("candidate_id") or "") == cid
+                    ),
+                    {},
+                )
             candidate = None
             for cand in list(getattr(self, "pf_candidates", []) or []) + list(getattr(getattr(self, "pf_engine", None), "candidates", []) or []):
                 if str(cand.get("candidate_id") or "") == cid:
@@ -20239,6 +20298,14 @@ class ScalperUI(tk.Tk):
                 f"raw_reason={raw_reason or '-'}\n"
                 f"final_signal={row.get('final_signal', '-')}\n"
                 f"confidence={row.get('confidence', '-')}\n"
+                f"ensemble_prob={row.get('ensemble_prob', '-')}\n"
+                f"xgb_prob={row.get('xgb_prob', '-')}\n"
+                f"rf_prob={row.get('rf_prob', '-')}\n"
+                f"allowed={row.get('allowed', '-')}\n"
+                f"model_type={row.get('model_type', '-')}\n"
+                f"feature_missing_count={row.get('feature_missing_count', '-')}\n"
+                f"feature_invalid_count={row.get('feature_invalid_count', '-')}\n"
+                f"block_reason={row.get('block_reason', '-')}\n"
                 f"entries={row.get('total_entries', 0)} exits={row.get('total_exits', 0)} "
                 f"completed_trades={row.get('total_trades', 0)}\n"
                 f"entry_price={row.get('entry_price', '-')} current_price={row.get('current_price', '-')}\n"

@@ -1,4 +1,4 @@
-"""Helpers for the Historical ML Backtest tab RF retrain/test workflow."""
+"""Helpers for the Historical ML Backtest tab ensemble retrain/test workflow."""
 
 from __future__ import annotations
 
@@ -9,15 +9,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-RF_DYNAMIC_CONFIG_NAME = "rf_random_forest_dynamic_candidate.json"
-RF_ARTIFACT_GLOB = "*random_forest*profitable_trade_label*.pkl"
+ENSEMBLE_DYNAMIC_CONFIG_NAME = "ensemble_xgb_rf_dynamic_candidate.json"
+ENSEMBLE_ARTIFACT_GLOB = "*xgb_rf_ensemble*profitable_trade_label*.pkl"
 
 
 def _artifact_freshness_key(path: Path | None) -> tuple[str, float]:
     if path is None:
         return ("", -1.0)
     text = str(path)
-    match = re.search(r"(?:research_retrain|rf_gui_retrain)_(\d{8}_\d{6})", text)
+    match = re.search(r"(?:research_retrain|ensemble_gui_retrain)_(\d{8}_\d{6})", text)
     stamp = match.group(1) if match else ""
     try:
         mtime = path.stat().st_mtime
@@ -26,7 +26,7 @@ def _artifact_freshness_key(path: Path | None) -> tuple[str, float]:
     return (stamp, mtime)
 
 
-def load_rf_feature_names(artifact_dir: Path) -> list[str]:
+def load_ensemble_feature_names(artifact_dir: Path) -> list[str]:
     """Load feature names from the artifacts retrain scripts actually write."""
     if not artifact_dir.exists():
         return []
@@ -58,8 +58,8 @@ def load_rf_feature_names(artifact_dir: Path) -> list[str]:
     return []
 
 
-def find_latest_rf_artifact(output_root: Path) -> tuple[Path | None, Path | None]:
-    """Return the newest RF profitable_trade_label artifact under a retrain output root."""
+def find_latest_ensemble_artifact(output_root: Path) -> tuple[Path | None, Path | None]:
+    """Return the newest xgb_rf_ensemble profitable_trade_label artifact under a retrain output root."""
     candidates = [output_root] if output_root.exists() and output_root.is_dir() else []
     if output_root.exists():
         candidates.extend(path for path in output_root.iterdir() if path.is_dir())
@@ -71,7 +71,7 @@ def find_latest_rf_artifact(output_root: Path) -> tuple[Path | None, Path | None
     for folder in candidates:
         try:
             model_files = sorted(
-                folder.glob(RF_ARTIFACT_GLOB),
+                folder.glob(ENSEMBLE_ARTIFACT_GLOB),
                 key=lambda path: path.stat().st_mtime,
                 reverse=True,
             )
@@ -101,8 +101,8 @@ def resolve_dataset_path(repo_root: Path, raw: str | None) -> str:
     return str(path) if path.is_file() else ""
 
 
-def _load_rf_metrics(artifact_dir: Path) -> dict[str, Any]:
-    for path in sorted(artifact_dir.glob("*random_forest*profitable_trade_label*_metrics.json"), reverse=True):
+def _load_ensemble_metrics(artifact_dir: Path) -> dict[str, Any]:
+    for path in sorted(artifact_dir.glob("*xgb_rf_ensemble*profitable_trade_label*_metrics.json"), reverse=True):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
@@ -112,9 +112,9 @@ def _load_rf_metrics(artifact_dir: Path) -> dict[str, Any]:
     return {}
 
 
-def load_rf_selected_threshold(artifact_dir: Path) -> float | None:
+def load_ensemble_selected_threshold(artifact_dir: Path) -> float | None:
     """Read only the validation-selected threshold without parsing huge metrics blobs."""
-    for path in sorted(artifact_dir.glob("*random_forest*profitable_trade_label*_metadata.json"), reverse=True):
+    for path in sorted(artifact_dir.glob("*xgb_rf_ensemble*profitable_trade_label*_metadata.json"), reverse=True):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
@@ -126,7 +126,7 @@ def load_rf_selected_threshold(artifact_dir: Path) -> float | None:
         except Exception:
             continue
 
-    for path in sorted(artifact_dir.glob("*random_forest*profitable_trade_label*_metrics.json"), reverse=True):
+    for path in sorted(artifact_dir.glob("*xgb_rf_ensemble*profitable_trade_label*_metrics.json"), reverse=True):
         try:
             with path.open("r", encoding="utf-8") as fh:
                 head = fh.read(16384)
@@ -212,7 +212,7 @@ def _candidate_from_config(repo_root: Path, config_path: Path) -> dict[str, Any]
     for cand in cands:
         if not isinstance(cand, dict) or not cand.get("enabled", True):
             continue
-        if str(cand.get("model_name") or "").lower() == "random_forest":
+        if str(cand.get("model_name") or "").lower() == "xgb_rf_ensemble":
             return cand
     return cands[0] if cands and isinstance(cands[0], dict) else None
 
@@ -225,25 +225,25 @@ def _config_model_path_exists(repo_root: Path, config_path: Path) -> bool:
     return bool(model_path and model_path.is_file())
 
 
-def discover_latest_rf_gui_retrain_root(repo_root: Path) -> Path | None:
+def discover_latest_ensemble_gui_retrain_root(repo_root: Path) -> Path | None:
     models_dir = repo_root / "models"
     if not models_dir.is_dir():
         return None
     roots = sorted(
-        (p for p in models_dir.glob("rf_gui_retrain_*") if p.is_dir()),
+        (p for p in models_dir.glob("ensemble_gui_retrain_*") if p.is_dir()),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
     return roots[0] if roots else None
 
 
-def discover_rf_test_target(
+def discover_ensemble_test_target(
     repo_root: Path,
     *,
     last_config: str = "",
     last_artifact: str = "",
 ) -> dict[str, Any]:
-    """Resolve the RF config/artifact and backtest defaults for the GUI Test button."""
+    """Resolve the ensemble config/artifact and backtest defaults for the GUI Test button."""
     last_config_path = Path(last_config) if last_config else None
     if last_config_path and last_config_path.is_file():
         cand = _candidate_from_config(repo_root, last_config_path) or {}
@@ -259,7 +259,7 @@ def discover_rf_test_target(
 
     last_artifact_path = Path(last_artifact) if last_artifact else None
     if last_artifact_path and last_artifact_path.is_file():
-        threshold = load_rf_selected_threshold(last_artifact_path.parent)
+        threshold = load_ensemble_selected_threshold(last_artifact_path.parent)
         return {
             "config_path": "",
             "artifact_path": str(last_artifact_path),
@@ -273,14 +273,14 @@ def discover_rf_test_target(
             "source": "session_artifact",
         }
 
-    latest_root = discover_latest_rf_gui_retrain_root(repo_root)
+    latest_root = discover_latest_ensemble_gui_retrain_root(repo_root)
     latest_gui_target: dict[str, Any] | None = None
     latest_gui_artifact_key = ("", -1.0)
     if latest_root is not None:
-        artifact_path, artifact_dir = find_latest_rf_artifact(latest_root)
+        artifact_path, artifact_dir = find_latest_ensemble_artifact(latest_root)
         if artifact_path and artifact_dir:
             latest_gui_artifact_key = _artifact_freshness_key(artifact_path)
-            threshold = load_rf_selected_threshold(artifact_dir)
+            threshold = load_ensemble_selected_threshold(artifact_dir)
             latest_gui_target = {
                 "config_path": "",
                 "artifact_path": str(artifact_path),
@@ -294,7 +294,7 @@ def discover_rf_test_target(
                 "source": "latest_gui_retrain",
             }
 
-    static_config = repo_root / "config" / RF_DYNAMIC_CONFIG_NAME
+    static_config = repo_root / "config" / ENSEMBLE_DYNAMIC_CONFIG_NAME
     if static_config.is_file() and _config_model_path_exists(repo_root, static_config):
         static_candidate = _candidate_from_config(repo_root, static_config) or {}
         static_artifact = _resolve_repo_path(
@@ -319,34 +319,34 @@ def discover_rf_test_target(
         return latest_gui_target
 
     return {
-        "error": "Retrain the random forest first or select a model artifact/config path.",
+        "error": "Retrain the ensemble first or select a model artifact/config path.",
     }
 
 
-def materialize_rf_dynamic_candidate(
+def materialize_ensemble_dynamic_candidate(
     repo_root: Path,
     artifact_path: Path,
     artifact_dir: Path,
 ) -> tuple[Path | None, Path | None]:
-    """Build the RF dynamic-preset wrapper and config JSON used by the GUI test flow."""
+    """Build the ensemble dynamic-preset wrapper and config JSON used by the GUI test flow."""
     try:
-        features = load_rf_feature_names(artifact_dir)
+        features = load_ensemble_feature_names(artifact_dir)
         if not features:
             return None, None
 
-        metrics_payload = _load_rf_metrics(artifact_dir)
+        metrics_payload = _load_ensemble_metrics(artifact_dir)
         raw_threshold = (metrics_payload.get("selected_threshold_from_validation") or {}).get("threshold")
         wrapper_threshold = float(raw_threshold) if raw_threshold is not None else 0.45
         source_threshold = float(raw_threshold) if raw_threshold is not None else wrapper_threshold
 
         created_at = datetime.now(timezone.utc).isoformat()
         artifact_suffix = artifact_dir.name.replace("research_retrain_", "")
-        candidate_id = f"random_forest_high_confidence_low_frequency_hi_conf_low_freq_t45_{artifact_suffix}"
+        candidate_id = f"xgb_rf_ensemble_high_confidence_low_frequency_hi_conf_low_freq_t45_{artifact_suffix}"
         wrapper_dir = repo_root / "models" / "candidates" / candidate_id
         wrapper_dir.mkdir(parents=True, exist_ok=True)
 
         model_rel = os.path.relpath(artifact_path, wrapper_dir).replace("/", "\\")
-        metrics_path = next(iter(sorted(artifact_dir.glob("*random_forest*profitable_trade_label*_metrics.json"), reverse=True)), None)
+        metrics_path = next(iter(sorted(artifact_dir.glob("*xgb_rf_ensemble*profitable_trade_label*_metrics.json"), reverse=True)), None)
         metrics_rel = (
             str(metrics_path.relative_to(repo_root)).replace("/", "\\")
             if metrics_path and metrics_path.exists()
@@ -396,7 +396,7 @@ def materialize_rf_dynamic_candidate(
         )
         dynamic_presets = {"hi_conf_low_freq_t45": preset_t45, "hi_conf_low_freq_t50": preset_t50}
         wrapper_metrics = {
-            "model_name": "random_forest",
+            "model_name": "xgb_rf_ensemble",
             "source_artifact_threshold": source_threshold,
             "wrapper_selected_threshold": wrapper_threshold,
             "validation_metrics": metrics_payload.get("validation_metrics") or {},
@@ -405,8 +405,8 @@ def materialize_rf_dynamic_candidate(
         }
         candidate_profile = {
             "candidate_id": candidate_id,
-            "model_name": "random_forest",
-            "feature_set_name": "rf_retrain_feature_manifest",
+            "model_name": "xgb_rf_ensemble",
+            "feature_set_name": "ensemble_retrain_feature_manifest",
             "target_name": "profitable_trade_label",
             "side_policy": "BOTH",
             "preset_family": "high_confidence_low_frequency",
@@ -428,7 +428,7 @@ def materialize_rf_dynamic_candidate(
             "real_trading_enabled": False,
             "created_at": created_at,
             "status": "RESEARCH_ONLY_DYNAMIC_PRESET_WRAPPER",
-            "model_name": "random_forest",
+            "model_name": "xgb_rf_ensemble",
             "target": "profitable_trade_label",
             "model_pkl": model_rel,
             "selected_threshold": wrapper_threshold,
@@ -452,7 +452,7 @@ def materialize_rf_dynamic_candidate(
             "source_artifact_dir": str(artifact_dir.relative_to(repo_root)).replace("/", "\\"),
             "feature_manifest_path": feature_rel,
             "dataset_path": _dataset_hint_from_artifact_dir(artifact_dir),
-            "notes": "RF dynamic preset wrapper generated from GUI retrain flow",
+            "notes": "Ensemble dynamic preset wrapper generated from GUI retrain flow",
         }
         filter_definition = {
             "filter_name": "dynamic_preset",
@@ -484,13 +484,13 @@ def materialize_rf_dynamic_candidate(
         for name, payload in files_to_write.items():
             (wrapper_dir / name).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-        config_path = repo_root / "config" / RF_DYNAMIC_CONFIG_NAME
+        config_path = repo_root / "config" / ENSEMBLE_DYNAMIC_CONFIG_NAME
         config_payload = {
             "mode": "paper_forward_multi",
             "live_orders_enabled": False,
             "broker_orders_enabled": False,
             "created_at": created_at,
-            "source_report": "GUI RF retrain dynamic preset wrapper",
+            "source_report": "GUI ensemble retrain dynamic preset wrapper",
             "candidates": [
                 {
                     "candidate_id": candidate_id,
@@ -499,7 +499,7 @@ def materialize_rf_dynamic_candidate(
                     "paper_forward_only": True,
                     "paper_only": True,
                     "real_trading_enabled": False,
-                    "model_name": "random_forest",
+                    "model_name": "xgb_rf_ensemble",
                     "preset_family": "high_confidence_low_frequency",
                     "side_policy": "BOTH",
                     "artifact_dir": str(wrapper_dir.relative_to(repo_root)).replace("/", "\\"),

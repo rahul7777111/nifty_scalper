@@ -13,7 +13,7 @@ if str(SRC_DIR) not in sys.path:
 import pytest
 
 import ui  # noqa: E402
-from rf_gui_backtest import find_latest_rf_artifact  # noqa: E402
+from rf_gui_backtest import find_latest_ensemble_artifact  # noqa: E402
 
 
 def _build_bt_app(tmp_path: Path) -> ui.ScalperUI:
@@ -24,8 +24,8 @@ def _build_bt_app(tmp_path: Path) -> ui.ScalperUI:
     root.withdraw()
     app = object.__new__(ui.ScalperUI)
     app._test_tk_root = root
-    app._bt_last_rf_config = ""
-    app._bt_last_rf_artifact = ""
+    app._bt_last_ensemble_config = ""
+    app._bt_last_ensemble_artifact = ""
     app._bt_thread = None
     app._worker_threads = {}
     app._stop_events = {}
@@ -37,18 +37,18 @@ def _build_bt_app(tmp_path: Path) -> ui.ScalperUI:
     app._is_ui_alive = lambda *_a, **_k: True
     app.ui_call = lambda fn, *args, **kwargs: fn(*args, **kwargs)
     app._bt_append_log = MagicMock()
-    app._bt_discover_rf_test_target = MagicMock(
+    app._bt_discover_ensemble_test_target = MagicMock(
         return_value={
-            "config_path": str(REPO_ROOT / "config" / "rf_random_forest_dynamic_candidate.json"),
+            "config_path": str(REPO_ROOT / "config" / "ensemble_xgb_rf_dynamic_candidate.json"),
             "artifact_path": "",
-            "candidate_id": "rf_test_candidate",
+            "candidate_id": "ensemble_test_candidate",
             "dataset_hint": "",
             "selected_threshold": 0.4,
             "max_trades_per_day": 1,
             "source": "static_config",
         }
     )
-    app._bt_apply_rf_test_target = ui.ScalperUI._bt_apply_rf_test_target.__get__(app, ui.ScalperUI)
+    app._bt_apply_ensemble_test_target = ui.ScalperUI._bt_apply_ensemble_test_target.__get__(app, ui.ScalperUI)
 
     csv_path = tmp_path / "sample.csv"
     csv_path.write_text("timestamp,ltp,symbol\n2026-01-01 09:15:00,100,NIFTY\n", encoding="utf-8")
@@ -67,11 +67,11 @@ def _build_bt_app(tmp_path: Path) -> ui.ScalperUI:
     return app
 
 
-def test_bt_ensure_rf_test_config_materializes_wrapper_from_artifact(tmp_path: Path) -> None:
-    root = REPO_ROOT / "models" / "rf_gui_retrain_fixed"
-    artifact_path, artifact_dir = find_latest_rf_artifact(root)
+def test_bt_ensure_ensemble_test_config_materializes_wrapper_from_artifact(tmp_path: Path) -> None:
+    root = REPO_ROOT / "models" / "ensemble_gui_retrain_fixed"
+    artifact_path, artifact_dir = find_latest_ensemble_artifact(root)
     if artifact_path is None or artifact_dir is None:
-        pytest.skip("RF GUI retrain fixtures not present")
+        pytest.skip("Ensemble GUI retrain fixtures not present")
 
     app = _build_bt_app(tmp_path)
     target = {
@@ -83,13 +83,13 @@ def test_bt_ensure_rf_test_config_materializes_wrapper_from_artifact(tmp_path: P
         "max_trades_per_day": 1,
         "source": "session_artifact",
     }
-    resolved = app._bt_ensure_rf_test_config(target)
+    resolved = app._bt_ensure_ensemble_test_config(target)
     assert resolved["config_path"]
     assert Path(resolved["config_path"]).is_file()
     assert resolved.get("candidate_id")
 
 
-def test_on_test_random_forest_starts_backtest_without_crashing(tmp_path: Path, monkeypatch) -> None:
+def test_on_test_ensemble_starts_backtest_without_crashing(tmp_path: Path, monkeypatch) -> None:
     app = _build_bt_app(tmp_path)
     started = {"called": False}
 
@@ -97,13 +97,13 @@ def test_on_test_random_forest_starts_backtest_without_crashing(tmp_path: Path, 
         started["called"] = True
 
     monkeypatch.setattr(app, "_on_run_ml_backtest", _fake_run)
-    ui.ScalperUI._on_test_random_forest(app)
+    ui.ScalperUI._on_test_ensemble(app)
     assert started["called"] is True
     assert app.bt_max_rows_var.get() == "100000"
     assert app.bt_fast_mode_var.get() is True
 
 
-def test_on_test_random_forest_prefers_manual_threshold_over_candidate_threshold(tmp_path: Path, monkeypatch) -> None:
+def test_on_test_ensemble_prefers_manual_threshold_over_candidate_threshold(tmp_path: Path, monkeypatch) -> None:
     app = _build_bt_app(tmp_path)
     app.bt_threshold_var.set("0.35")
     app.bt_use_candidate_thresholds_var.set(True)
@@ -113,13 +113,13 @@ def test_on_test_random_forest_prefers_manual_threshold_over_candidate_threshold
         started["called"] = True
 
     monkeypatch.setattr(app, "_on_run_ml_backtest", _fake_run)
-    ui.ScalperUI._on_test_random_forest(app)
+    ui.ScalperUI._on_test_ensemble(app)
 
     assert started["called"] is True
     assert app.bt_use_candidate_thresholds_var.get() is False
 
 
-def test_on_test_random_forest_handles_missing_ui_state_without_crashing(monkeypatch) -> None:
+def test_on_test_ensemble_handles_missing_ui_state_without_crashing(monkeypatch) -> None:
     try:
         root = tk.Tk()
     except tk.TclError as exc:
@@ -127,7 +127,7 @@ def test_on_test_random_forest_handles_missing_ui_state_without_crashing(monkeyp
     root.withdraw()
     app = object.__new__(ui.ScalperUI)
     app._test_tk_root = root
-    app._bt_discover_rf_test_target = MagicMock(return_value={"error": "unused"})
+    app._bt_discover_ensemble_test_target = MagicMock(return_value={"error": "unused"})
     shown: dict[str, str] = {}
 
     def _fake_showerror(title: str, msg: str) -> None:
@@ -135,18 +135,18 @@ def test_on_test_random_forest_handles_missing_ui_state_without_crashing(monkeyp
         shown["msg"] = msg
 
     monkeypatch.setattr(ui.messagebox, "showerror", _fake_showerror)
-    ui.ScalperUI._on_test_random_forest(app)
-    assert shown["title"] == "Test Random Forest"
-    assert "RF test controls are not ready yet" in shown["msg"]
+    ui.ScalperUI._on_test_ensemble(app)
+    assert shown["title"] == "Test Ensemble"
+    assert "Ensemble test controls are not ready yet" in shown["msg"]
 
 
-def test_on_test_random_forest_stops_cleanly_when_wrapper_materialization_fails(tmp_path: Path, monkeypatch) -> None:
+def test_on_test_ensemble_stops_cleanly_when_wrapper_materialization_fails(tmp_path: Path, monkeypatch) -> None:
     app = _build_bt_app(tmp_path)
-    artifact_path, artifact_dir = find_latest_rf_artifact(REPO_ROOT / "models" / "rf_gui_retrain_fixed")
+    artifact_path, artifact_dir = find_latest_ensemble_artifact(REPO_ROOT / "models" / "ensemble_gui_retrain_fixed")
     if artifact_path is None or artifact_dir is None:
-        pytest.skip("RF GUI retrain fixtures not present")
+        pytest.skip("Ensemble GUI retrain fixtures not present")
 
-    app._bt_discover_rf_test_target = MagicMock(
+    app._bt_discover_ensemble_test_target = MagicMock(
         return_value={
             "config_path": "",
             "artifact_path": str(artifact_path),
@@ -157,7 +157,7 @@ def test_on_test_random_forest_stops_cleanly_when_wrapper_materialization_fails(
             "source": "session_artifact",
         }
     )
-    app._bt_materialize_rf_dynamic_candidate = MagicMock(return_value=(None, None))
+    app._bt_materialize_ensemble_dynamic_candidate = MagicMock(return_value=(None, None))
     started = {"called": False}
     shown: dict[str, str] = {}
 
@@ -170,34 +170,34 @@ def test_on_test_random_forest_stops_cleanly_when_wrapper_materialization_fails(
 
     monkeypatch.setattr(app, "_on_run_ml_backtest", _fake_run)
     monkeypatch.setattr(ui.messagebox, "showerror", _fake_showerror)
-    ui.ScalperUI._on_test_random_forest(app)
+    ui.ScalperUI._on_test_ensemble(app)
     assert started["called"] is False
-    assert shown["title"] == "Test Random Forest"
-    assert "Failed to build RF dynamic candidate wrapper" in shown["msg"]
+    assert shown["title"] == "Test Ensemble"
+    assert "Failed to build ensemble dynamic candidate wrapper" in shown["msg"]
 
 
-def test_bt_apply_rf_test_target_prefers_artifact_dataset_over_stale_csv(tmp_path: Path) -> None:
+def test_bt_apply_ensemble_test_target_prefers_artifact_dataset_over_stale_csv(tmp_path: Path) -> None:
     app = _build_bt_app(tmp_path)
     stale_csv = Path(app.bt_csv_path_var.get())
     artifact_dataset = tmp_path / "artifact_dataset.csv"
     artifact_dataset.write_text("timestamp,ltp,symbol\n2026-01-01 09:15:00,101,NIFTY\n", encoding="utf-8")
 
     target = {
-        "config_path": str(REPO_ROOT / "config" / "rf_random_forest_dynamic_candidate.json"),
+        "config_path": str(REPO_ROOT / "config" / "ensemble_xgb_rf_dynamic_candidate.json"),
         "artifact_path": "",
-        "candidate_id": "rf_test_candidate",
+        "candidate_id": "ensemble_test_candidate",
         "dataset_hint": str(artifact_dataset),
         "selected_threshold": 0.4,
         "max_trades_per_day": 1,
         "source": "static_config",
     }
 
-    ui.ScalperUI._bt_apply_rf_test_target(app, target)
+    ui.ScalperUI._bt_apply_ensemble_test_target(app, target)
     assert stale_csv != artifact_dataset
     assert Path(app.bt_csv_path_var.get()) == artifact_dataset
 
 
-def test_bt_apply_rf_test_target_preserves_existing_form_values(tmp_path: Path) -> None:
+def test_bt_apply_ensemble_test_target_preserves_existing_form_values(tmp_path: Path) -> None:
     app = _build_bt_app(tmp_path)
     app.bt_threshold_var.set("0.60")
     app.bt_maxday_var.set("3")
@@ -206,16 +206,16 @@ def test_bt_apply_rf_test_target_preserves_existing_form_values(tmp_path: Path) 
     app.bt_selected_candidates_var.set("custom_candidate")
 
     target = {
-        "config_path": str(REPO_ROOT / "config" / "rf_random_forest_dynamic_candidate.json"),
+        "config_path": str(REPO_ROOT / "config" / "ensemble_xgb_rf_dynamic_candidate.json"),
         "artifact_path": "",
-        "candidate_id": "rf_test_candidate",
+        "candidate_id": "ensemble_test_candidate",
         "dataset_hint": "",
         "selected_threshold": 0.4,
         "max_trades_per_day": 1,
         "source": "static_config",
     }
 
-    ui.ScalperUI._bt_apply_rf_test_target(app, target)
+    ui.ScalperUI._bt_apply_ensemble_test_target(app, target)
 
     assert app.bt_threshold_var.get() == "0.60"
     assert app.bt_maxday_var.get() == "3"
