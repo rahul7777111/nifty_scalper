@@ -920,6 +920,7 @@ class PaperForwardCandidateRuntimeState:
         self.ensemble_prob: Optional[float] = None
         self.xgb_prob: Optional[float] = None
         self.rf_prob: Optional[float] = None
+        self.model_disagreement: Optional[float] = None
         self.block_reason = ""
         self.allowed: Optional[bool] = None
         self.model_type = ""
@@ -3201,7 +3202,7 @@ class PaperForwardEngine:
                 cs.feature_invalid_count = int(decision.get("feature_invalid_count") or 0)
             except Exception:
                 cs.feature_invalid_count = 0
-        for attr_name in ("ensemble_prob", "xgb_prob", "rf_prob"):
+        for attr_name in ("ensemble_prob", "xgb_prob", "rf_prob", "model_disagreement"):
             if attr_name not in decision:
                 continue
             raw_val = decision.get(attr_name)
@@ -3307,6 +3308,7 @@ class PaperForwardEngine:
         st["ensemble_prob"] = cs.ensemble_prob
         st["xgb_prob"] = cs.xgb_prob
         st["rf_prob"] = cs.rf_prob
+        st["model_disagreement"] = cs.model_disagreement
         st["block_reason"] = cs.block_reason
         st["allowed"] = cs.allowed
         st["model_type"] = cs.model_type
@@ -5238,6 +5240,7 @@ class PaperForwardEngine:
                 "ensemble_prob": st.get("ensemble_prob"),
                 "xgb_prob": st.get("xgb_prob"),
                 "rf_prob": st.get("rf_prob"),
+                "model_disagreement": st.get("model_disagreement"),
                 "block_reason": st.get("block_reason") or st.get("last_no_trade_reason"),
                 "allowed": st.get("allowed"),
                 "model_type": st.get("model_type") or c.get("model_name", ""),
@@ -5309,6 +5312,7 @@ class PaperForwardEngine:
                 "ensemble_prob": st.get("ensemble_prob"),
                 "xgb_prob": st.get("xgb_prob"),
                 "rf_prob": st.get("rf_prob"),
+                "model_disagreement": st.get("model_disagreement"),
                 "block_reason": st.get("block_reason") or st.get("last_no_trade_reason"),
                 "allowed": st.get("allowed"),
                 "model_type": st.get("model_type") or c.get("model_name"),

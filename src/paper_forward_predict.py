@@ -759,6 +759,43 @@ def predict_confidence_from_artifact(
         _diag("XGBOOST_NOT_INSTALLED", out, fo, {})
         return out
 
+    # Ensemble artifact directory short-circuit (RF+XGB separate pickles + config)
+    if artifact_dir:
+        try:
+            from ml.ensemble_artifact_loader import try_load_ensemble_dir
+            ad_path = P(artifact_dir)
+            loader = try_load_ensemble_dir(ad_path)
+            if loader is not None:
+                result = loader.predict(snapshot)
+                status = str(result.get("status") or "")
+                eprob = result.get("ensemble_prob")
+                out = _merge_predict_out(
+                    {
+                        "raw": eprob,
+                        "prob": eprob,
+                        "confidence": eprob,
+                        "error": result.get("error") or None,
+                        "predict_method": "ensemble_artifact_loader",
+                        "decision": "OK" if result.get("allowed") else "BLOCKED",
+                        "artifact_path": str(artifact_dir),
+                        "model_present": status != STATUS_MODEL_LOAD_FAILED,
+                        "feature_missing_count": result.get("feature_missing_count"),
+                        "feature_invalid_count": result.get("feature_invalid_count"),
+                        "ensemble_prob": eprob,
+                        "xgb_prob": result.get("xgb_prob"),
+                        "rf_prob": result.get("rf_prob"),
+                        "model_disagreement": result.get("model_disagreement"),
+                        "allowed": result.get("allowed"),
+                        "block_reason": result.get("block_reason"),
+                        "model_type": "ensemble",
+                    },
+                    debug,
+                )
+                _diag("OK" if result.get("allowed") else "BLOCKED", out, fo, {})
+                return out
+        except Exception:
+            pass
+
     if not pkl_path or not pkl_path.exists():
         out = _blocked_result(
             "model_pkl_not_found",

@@ -18924,7 +18924,7 @@ class ScalperUI(tk.Tk):
         cols = (
             "enabled", "candidate_id", "model", "preset", "side", "stage", "next_step", "can_advance",
             "block_reason", "missing_requirements", "artifact_status", "data_status", "confidence_health",
-            "trades_days", "final_signal", "conf", "ensemble_prob", "xgb_prob", "rf_prob", "allowed", "model_type",
+            "trades_days", "final_signal", "conf", "ensemble_prob", "xgb_prob", "rf_prob", "model_disagreement", "allowed", "model_type",
             "feature_missing_count", "feature_invalid_count", "pred_block_reason", "paper_action", "trade_reason",
             "pos", "sel_strike", "sel_type", "sel_symbol", "entries", "exits", "entry_px", "cur_opt_px", "qty", "spot", "unreal_pnl", "real_pnl",
             "mark_source", "cost_quality", "last_mark_time", "trades", "sim_wr", "max_dd", "last_reason", "updated",
@@ -18961,6 +18961,7 @@ class ScalperUI(tk.Tk):
             "ensemble_prob": "Ens Prob",
             "xgb_prob": "XGB Prob",
             "rf_prob": "RF Prob",
+            "model_disagreement": "Disagree",
             "allowed": "Allowed",
             "model_type": "Model Type",
             "feature_missing_count": "Feat Miss",
@@ -18971,7 +18972,7 @@ class ScalperUI(tk.Tk):
         }
         for c in cols:
             self.pf_tree.heading(c, text=col_titles.get(c, c.replace("_", " ").title()))
-            narrow = c in ("enabled", "conf", "ensemble_prob", "xgb_prob", "rf_prob", "allowed", "feature_missing_count", "feature_invalid_count", "pos", "sel_type", "entries", "exits", "sim_wr", "trades", "spot", "qty", "can_advance", "paper_action")
+            narrow = c in ("enabled", "conf", "ensemble_prob", "xgb_prob", "rf_prob", "model_disagreement", "allowed", "feature_missing_count", "feature_invalid_count", "pos", "sel_type", "entries", "exits", "sim_wr", "trades", "spot", "qty", "can_advance", "paper_action")
             width = 70 if narrow else (260 if c == "candidate_id" else (240 if c == "trade_reason" else (220 if c in ("sel_symbol", "block_reason", "missing_requirements", "pred_block_reason") else (300 if c == "last_reason" else 110))))
             anchor = "e" if c in ("unreal_pnl", "real_pnl", "max_dd", "entry_px", "cur_opt_px", "spot", "sel_strike") else "w"
             # stretch=False so horizontal scrollbar reveals wide candidate_id / last_reason columns.
@@ -19603,6 +19604,7 @@ class ScalperUI(tk.Tk):
             "ensemble_prob": _fmt_prob(r.get("ensemble_prob")),
             "xgb_prob": _fmt_prob(r.get("xgb_prob")),
             "rf_prob": _fmt_prob(r.get("rf_prob")),
+            "model_disagreement": _fmt_prob(r.get("model_disagreement")),
             "allowed": _fmt_allowed(r.get("allowed")),
             "model_type": str(r.get("model_type") or "-"),
             "feature_missing_count": _fmt_count(r.get("feature_missing_count")),
@@ -19717,6 +19719,7 @@ class ScalperUI(tk.Tk):
                 "ensemble_prob": dec.get("ensemble_prob"),
                 "xgb_prob": dec.get("xgb_prob"),
                 "rf_prob": dec.get("rf_prob"),
+                "model_disagreement": dec.get("model_disagreement"),
                 "block_reason": dec.get("block_reason"),
                 "allowed": dec.get("allowed"),
                 "model_type": dec.get("model_type"),
@@ -20301,6 +20304,7 @@ class ScalperUI(tk.Tk):
                 f"ensemble_prob={row.get('ensemble_prob', '-')}\n"
                 f"xgb_prob={row.get('xgb_prob', '-')}\n"
                 f"rf_prob={row.get('rf_prob', '-')}\n"
+                f"model_disagreement={row.get('model_disagreement', '-')}\n"
                 f"allowed={row.get('allowed', '-')}\n"
                 f"model_type={row.get('model_type', '-')}\n"
                 f"feature_missing_count={row.get('feature_missing_count', '-')}\n"
