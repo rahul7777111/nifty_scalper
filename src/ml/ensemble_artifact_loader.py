@@ -515,6 +515,45 @@ def try_load_ensemble_dir(artifact_dir: Path | str) -> Optional[EnsembleArtifact
     return loader
 
 
+def discover_ensemble_artifact_dirs(root: Path | str) -> List[Path]:
+    """Return all directories under *root* that look like ensemble artifacts.
+
+    Searches recursively for ``ensemble_config.json`` paired with both RF and
+    XGB model pickles.  Results are sorted by modification time (newest first).
+    """
+    r = Path(root)
+    if not r.is_dir():
+        return []
+    results: List[Path] = []
+    for path in r.rglob("ensemble_config.json"):
+        pdir = path.parent
+        if _find_rf_model(pdir) is not None and _find_xgb_model(pdir) is not None:
+            results.append(pdir)
+    # Deduplicate and sort newest-first
+    seen: set[str] = set()
+    unique: List[Path] = []
+    for p in results:
+        key = str(p.resolve())
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return sorted(unique, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def select_best_ensemble_dir(root: Path | str) -> Optional[Path]:
+    """Auto-select the best ensemble artifact directory under *root*.
+
+    Prefers directories that also contain ``ensemble_metrics.json``.
+    Falls back to any directory with both model pickles.
+    Returns ``None`` if nothing suitable is found.
+    """
+    dirs = discover_ensemble_artifact_dirs(root)
+    for p in dirs:
+        if (p / "ensemble_metrics.json").exists():
+            return p
+    return dirs[0] if dirs else None
+
+
 def predict_from_ensemble_dir(
     artifact_dir: Path | str,
     snapshot: Mapping[str, Any],
