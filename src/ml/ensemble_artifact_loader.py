@@ -20,8 +20,6 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-import numpy as np
-
 
 STATUS_OK = "OK"
 STATUS_ARTIFACT_NOT_FOUND = "ARTIFACT_NOT_FOUND"
@@ -133,6 +131,8 @@ def _load_pickle(path: Path) -> Any:
 
 
 def _find_positive_class_index(model: Any) -> Optional[int]:
+    import numpy as np
+
     classes = getattr(model, "classes_", None)
     if classes is None:
         return None
@@ -154,8 +154,10 @@ def _find_positive_class_index(model: Any) -> Optional[int]:
         return None
 
 
-def _predict_prob_positive(model: Any, X: np.ndarray, feature_names: Sequence[str]) -> float:
+def _predict_prob_positive(model: Any, X: Any, feature_names: Sequence[str]) -> float:
     """Return the positive-class probability for a *single* row."""
+    import numpy as np
+
     est = model
     if isinstance(model, dict):
         est = model.get("model") or model.get("estimator") or model
@@ -192,7 +194,9 @@ def _xgb_booster(model: Any) -> bool:
         return type(model).__name__ == "Booster" and str(getattr(model, "__module__", "")).startswith("xgboost")
 
 
-def _infer_xgb_prob(model: Any, X: np.ndarray, feature_names: Sequence[str]) -> float:
+def _infer_xgb_prob(model: Any, X: Any, feature_names: Sequence[str]) -> float:
+    import numpy as np
+
     if _xgb_booster(model):
         try:
             import xgboost as xgb  # type: ignore[import-untyped]
@@ -297,13 +301,15 @@ class EnsembleArtifactLoader:
         self.error = ""
         return self
 
-    def _build_feature_vector(self, snapshot: Mapping[str, Any]) -> Tuple[np.ndarray, int, int]:
+    def _build_feature_vector(self, snapshot: Mapping[str, Any]) -> Tuple[Any, int, int]:
         """Return (X_row, missing_count, invalid_count).
 
         Missing values are imputed with ``self.fill_values``.
         Values that cannot be coerced to float become ``0.0`` and count as
         invalid.
         """
+        import numpy as np
+
         feature_missing_count = 0
         feature_invalid_count = 0
         row: List[float] = []
