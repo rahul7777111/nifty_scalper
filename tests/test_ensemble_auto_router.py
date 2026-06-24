@@ -165,6 +165,29 @@ def test_binary_scoring_uses_ce_pe_probabilities_and_raw_output(tmp_path: Path):
     assert "favorable_trade" in row.label_mapping
 
 
+def test_final_direction_and_confidence_are_weighted_averages(tmp_path: Path):
+    a = _write_artifact(tmp_path, "a", SideSensitiveModel(0.72, 0.41))
+    b = _write_artifact(tmp_path, "b", SideSensitiveModel(0.60, 0.20))
+    router = EnsembleAutoRouter(
+        _config(
+            tmp_path,
+            {"a": _model_spec(a, 0.75), "b": _model_spec(b, 0.25)},
+            thresholds={
+                "ensemble_min_confidence": 0.55,
+                "ensemble_min_direction_edge": 0.20,
+                "ensemble_max_model_disagreement": 0.35,
+                "ensemble_min_valid_models": 2,
+            },
+        )
+    )
+
+    result = router.decide(_snapshot())
+
+    assert result.decision == DECISION_BUY_CE
+    assert abs(result.final_direction - ((0.31 * 0.75) + (0.40 * 0.25))) < 1e-9
+    assert abs(result.final_confidence - ((0.72 * 0.75) + (0.60 * 0.25))) < 1e-9
+
+
 def test_missing_label_metadata_is_no_vote_not_fake_zero(tmp_path: Path):
     d = tmp_path / "unmapped"
     d.mkdir()
@@ -198,6 +221,18 @@ def test_disagreement_block_works(tmp_path: Path):
     result = router.decide(_snapshot())
     assert result.decision == DECISION_NO_TRADE
     assert result.block_reason == "MODELS_DISAGREE_STRONGLY"
+
+
+def test_disagreement_just_below_threshold_does_not_block(tmp_path: Path):
+    a = _write_artifact(tmp_path, "a", SideSensitiveModel(0.85, 0.30))
+    b = _write_artifact(tmp_path, "b", SideSensitiveModel(0.75, 0.546))
+    router = EnsembleAutoRouter(_config(tmp_path, {"a": _model_spec(a), "b": _model_spec(b)}))
+
+    result = router.decide(_snapshot())
+
+    assert result.decision == DECISION_BUY_CE
+    assert result.block_reason == ""
+    assert abs(result.final_direction - 0.377) < 1e-9
 
 
 def test_duplicate_position_block_works(tmp_path: Path):

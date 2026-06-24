@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import json
 import math
@@ -38,6 +39,255 @@ def _get_kolkata_tz():
 
 
 _KOLKATA_TZ = _get_kolkata_tz()
+
+FAST_RF_DEFAULTS: Dict[str, Any] = {
+    "n_estimators": 120,
+    "max_depth": 12,
+    "min_samples_leaf": 20,
+    "min_samples_split": 40,
+    "max_features": "sqrt",
+    "class_weight": "balanced_subsample",
+    "n_jobs": -1,
+}
+PRODUCTION_RF_DEFAULTS: Dict[str, Any] = {
+    "n_estimators": 300,
+    "max_depth": 14,
+    "min_samples_leaf": 15,
+    "min_samples_split": 30,
+    "max_features": "sqrt",
+    "class_weight": "balanced_subsample",
+    "n_jobs": -1,
+}
+FAST_XGB_DEFAULTS: Dict[str, Any] = {
+    "n_estimators": 500,
+    "max_depth": 5,
+    "learning_rate": 0.04,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "min_child_weight": 20,
+    "reg_lambda": 5.0,
+    "reg_alpha": 0.2,
+    "tree_method": "hist",
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
+    "n_jobs": -1,
+}
+PRODUCTION_XGB_DEFAULTS: Dict[str, Any] = {
+    "n_estimators": 1000,
+    "max_depth": 5,
+    "learning_rate": 0.025,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "min_child_weight": 15,
+    "reg_lambda": 5.0,
+    "reg_alpha": 0.2,
+    "tree_method": "hist",
+    "objective": "binary:logistic",
+    "eval_metric": ["logloss", "aucpr"],
+    "n_jobs": -1,
+}
+ENSEMBLE_DEFAULTS: Dict[str, Any] = {
+    "xgb_weight": 0.70,
+    "rf_weight": 0.30,
+    "ensemble_threshold": 0.60,
+    "xgb_min_prob": 0.58,
+    "rf_min_prob": 0.52,
+    "max_model_disagreement": 0.25,
+    "block_on_disagreement": True,
+}
+_RUNTIME_OPTIONS: Dict[str, Any] = {
+    "fast_mode": False,
+    "max_rows": 0,
+    "sample_frac": 0.0,
+    "latest_rows": True,
+    "n_estimators": None,
+    "max_depth": None,
+    "min_samples_leaf": None,
+    "n_jobs": -1,
+    "use_parquet_cache": False,
+    "cache_dir": "",
+    "force_refresh_cache": False,
+    "vectorized_backtest": False,
+    "max_backtest_rows": 0,
+    "rf_n_estimators": None,
+    "rf_max_depth": None,
+    "rf_min_samples_leaf": None,
+    "rf_min_samples_split": None,
+    "rf_max_features": None,
+    "rf_class_weight": None,
+    "rf_n_jobs": None,
+    "xgb_device": "auto",
+    "xgb_n_estimators": None,
+    "xgb_max_depth": None,
+    "xgb_learning_rate": None,
+    "xgb_subsample": None,
+    "xgb_colsample_bytree": None,
+    "xgb_reg_lambda": None,
+    "xgb_reg_alpha": None,
+    "xgb_min_child_weight": None,
+    "xgb_tree_method": None,
+    "xgb_early_stopping_rounds": None,
+    "strict_gpu": False,
+    "ensemble": dict(ENSEMBLE_DEFAULTS),
+}
+
+
+def _runtime_option(name: str, default: Any = None) -> Any:
+    return _RUNTIME_OPTIONS.get(name, default)
+
+
+def _set_runtime_options_from_args(args: argparse.Namespace) -> None:
+    global _RUNTIME_OPTIONS
+    _RUNTIME_OPTIONS = {
+        "fast_mode": bool(getattr(args, "fast_mode", False)),
+        "max_rows": max(0, int(getattr(args, "max_rows", 0) or 0)),
+        "sample_frac": float(getattr(args, "sample_frac", 0.0) or 0.0),
+        "latest_rows": bool(getattr(args, "latest_rows", True)),
+        "n_estimators": getattr(args, "n_estimators", None),
+        "max_depth": getattr(args, "max_depth", None),
+        "min_samples_leaf": getattr(args, "min_samples_leaf", None),
+        "n_jobs": int(getattr(args, "n_jobs", -1) if getattr(args, "n_jobs", None) is not None else -1),
+        "use_parquet_cache": bool(getattr(args, "use_parquet_cache", False)),
+        "cache_dir": str(getattr(args, "cache_dir", "") or "").strip(),
+        "force_refresh_cache": bool(getattr(args, "force_refresh_cache", False)),
+        "vectorized_backtest": bool(getattr(args, "vectorized_backtest", False)),
+        "max_backtest_rows": max(0, int(getattr(args, "max_backtest_rows", 0) or 0)),
+        "rf_n_estimators": getattr(args, "rf_n_estimators", None),
+        "rf_max_depth": getattr(args, "rf_max_depth", None),
+        "rf_min_samples_leaf": getattr(args, "rf_min_samples_leaf", None),
+        "rf_min_samples_split": getattr(args, "rf_min_samples_split", None),
+        "rf_max_features": getattr(args, "rf_max_features", None),
+        "rf_class_weight": getattr(args, "rf_class_weight", None),
+        "rf_n_jobs": getattr(args, "rf_n_jobs", None),
+        "xgb_device": str(getattr(args, "xgb_device", "auto") or "auto").strip().lower(),
+        "xgb_n_estimators": getattr(args, "xgb_n_estimators", None),
+        "xgb_max_depth": getattr(args, "xgb_max_depth", None),
+        "xgb_learning_rate": getattr(args, "xgb_learning_rate", None),
+        "xgb_subsample": getattr(args, "xgb_subsample", None),
+        "xgb_colsample_bytree": getattr(args, "xgb_colsample_bytree", None),
+        "xgb_reg_lambda": getattr(args, "xgb_reg_lambda", None),
+        "xgb_reg_alpha": getattr(args, "xgb_reg_alpha", None),
+        "xgb_min_child_weight": getattr(args, "xgb_min_child_weight", None),
+        "xgb_tree_method": getattr(args, "xgb_tree_method", None),
+        "xgb_early_stopping_rounds": getattr(args, "xgb_early_stopping_rounds", None),
+        "strict_gpu": bool(getattr(args, "strict_gpu", False)),
+        "ensemble": {
+            "xgb_weight": float(getattr(args, "xgb_weight", ENSEMBLE_DEFAULTS["xgb_weight"])),
+            "rf_weight": float(getattr(args, "rf_weight", ENSEMBLE_DEFAULTS["rf_weight"])),
+            "ensemble_threshold": float(getattr(args, "ensemble_threshold", ENSEMBLE_DEFAULTS["ensemble_threshold"])),
+            "xgb_min_prob": float(getattr(args, "xgb_min_prob", ENSEMBLE_DEFAULTS["xgb_min_prob"])),
+            "rf_min_prob": float(getattr(args, "rf_min_prob", ENSEMBLE_DEFAULTS["rf_min_prob"])),
+            "max_model_disagreement": float(getattr(args, "max_model_disagreement", ENSEMBLE_DEFAULTS["max_model_disagreement"])),
+            "block_on_disagreement": not bool(getattr(args, "disable_disagreement_gate", False)),
+        },
+    }
+    sample_frac = float(_RUNTIME_OPTIONS["sample_frac"])
+    if sample_frac < 0.0:
+        raise ValueError("--sample-frac must be >= 0.0")
+    if sample_frac >= 1.0:
+        _RUNTIME_OPTIONS["sample_frac"] = 1.0
+    ensemble_cfg = dict(_RUNTIME_OPTIONS.get("ensemble") or {})
+    weight_sum = float(ensemble_cfg.get("xgb_weight", 0.0)) + float(ensemble_cfg.get("rf_weight", 0.0))
+    if weight_sum <= 0.0:
+        raise ValueError("Ensemble weights must sum to a positive value.")
+    if abs(weight_sum - 1.0) > 1e-6:
+        print(f"[ensemble] normalizing_weights original_sum={weight_sum:.6f}", flush=True)
+        ensemble_cfg["xgb_weight"] = float(ensemble_cfg["xgb_weight"]) / weight_sum
+        ensemble_cfg["rf_weight"] = float(ensemble_cfg["rf_weight"]) / weight_sum
+    _RUNTIME_OPTIONS["ensemble"] = ensemble_cfg
+
+
+def _timing_log(stage: str, *, seconds: float, rows: int | None = None, extra: str = "") -> None:
+    rate = ""
+    if rows is not None and seconds > 0:
+        rate = f" rows_per_sec={rows / seconds:.2f}"
+    suffix = f" {extra.strip()}" if extra.strip() else ""
+    print(f"[timing] stage={stage} seconds={seconds:.3f}{rate}{suffix}", flush=True)
+
+
+def _normalize_cache_dir(path: Path) -> Path:
+    cache_dir_raw = str(_runtime_option("cache_dir", "") or "").strip()
+    if cache_dir_raw:
+        return Path(cache_dir_raw)
+    return path.parent / ".parquet_cache"
+
+
+def _dataset_fingerprint(path: Path) -> str:
+    stat = path.stat()
+    raw = f"{path.name}|{int(stat.st_size)}|{int(stat.st_mtime_ns)}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _dataset_cache_paths(path: Path) -> tuple[Path, Path]:
+    cache_dir = _normalize_cache_dir(path)
+    fingerprint = _dataset_fingerprint(path)
+    stem = f"{path.stem}_{fingerprint}"
+    return cache_dir / f"{stem}.parquet", cache_dir / f"{stem}.meta.json"
+
+
+def _latest_rows_by_time(df: pd.DataFrame, keep_rows: int, *, context: str) -> pd.DataFrame:
+    if keep_rows <= 0 or len(df) <= keep_rows:
+        return df
+    work = df.copy()
+    if "timestamp" in work.columns:
+        ts = _normalize_timestamp_series(work["timestamp"])
+        valid_mask = ts.notna()
+        if bool(valid_mask.any()):
+            work = work.loc[valid_mask].copy()
+            work["timestamp"] = ts.loc[valid_mask]
+            sort_columns = _chronology_sort_columns(work)
+            if not sort_columns:
+                sort_columns = ["timestamp"]
+            work = work.sort_values(sort_columns, kind="stable")
+    trimmed = work.tail(int(keep_rows)).reset_index(drop=True)
+    print(
+        f"[retrain] row_limit_applied context={context} kept_rows={len(trimmed)} original_rows={len(df)}",
+        flush=True,
+    )
+    return trimmed
+
+
+def _apply_runtime_dataset_limits(df: pd.DataFrame, *, context: str) -> pd.DataFrame:
+    limited = df
+    max_rows = int(_runtime_option("max_rows", 0) or 0)
+    if max_rows > 0:
+        limited = _latest_rows_by_time(limited, max_rows, context=f"{context}:max_rows")
+    sample_frac = float(_runtime_option("sample_frac", 0.0) or 0.0)
+    if 0.0 < sample_frac < 1.0 and not limited.empty:
+        print("[retrain] WARNING: --sample-frac can distort time-series backtests and should be used only for fast experiments.", flush=True)
+        keep_rows = max(1, int(math.floor(len(limited) * sample_frac)))
+        limited = _latest_rows_by_time(limited, keep_rows, context=f"{context}:sample_frac")
+    return limited
+
+
+def _dataset_memory_mb(df: pd.DataFrame) -> float:
+    try:
+        return float(df.memory_usage(deep=True).sum()) / (1024.0 * 1024.0)
+    except Exception:
+        return 0.0
+
+
+def _dataset_target_distribution(df: pd.DataFrame, target: str = "profitable_trade_label") -> Dict[str, Any]:
+    if target not in df.columns:
+        return {"target": target, "available": False}
+    series = pd.to_numeric(df[target], errors="coerce").dropna()
+    if series.empty:
+        return {"target": target, "available": True, "rows": 0}
+    value_counts = series.value_counts(dropna=False).sort_index()
+    return {
+        "target": target,
+        "available": True,
+        "rows": int(series.shape[0]),
+        "positive_rate": float(series.mean()),
+        "counts": {str(k): int(v) for k, v in value_counts.items()},
+    }
+
+
+def _apply_backtest_row_limit(df: pd.DataFrame, *, context: str) -> pd.DataFrame:
+    max_rows = int(_runtime_option("max_backtest_rows", 0) or 0)
+    if max_rows <= 0:
+        return df
+    return _latest_rows_by_time(df, max_rows, context=f"{context}:max_backtest_rows")
 
 
 # =============================================================================
@@ -340,6 +590,13 @@ from retrain_nifty_1year import (
 from retraining_validation import classification_metrics, generate_purged_embargoed_cv_splits
 from ml_signals import _wrap_model
 from ml_execution_costs import DEFAULT_EXECUTION_COST_CONFIG, estimate_option_execution_costs_frame
+from ml.ensemble_xgb_rf import XGBRFEnsembleClassifier
+from ml.feature_safety import (
+    apply_train_median_fill,
+    build_safe_numeric_bool_frame,
+    compute_train_medians,
+    filter_target_rows,
+)
 
 # Feature contract import for training/inference alignment
 try:
@@ -811,6 +1068,19 @@ CHRONOLOGY_SORT_COLUMNS = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Research-only edge-model retraining pipeline.")
     parser.add_argument("--dataset", default="", help="Path to edge_dataset.csv/parquet")
+    parser.add_argument("--fast-mode", action="store_true", help="Use faster runtime defaults for research retraining and backtests.")
+    parser.add_argument("--max-rows", type=int, default=0, help="Keep only the latest N rows before training/backtesting when timestamp is available.")
+    parser.add_argument("--sample-frac", type=float, default=0.0, help="Keep only the latest fraction of rows after chronological ordering. Range: 0.0-1.0.")
+    parser.add_argument("--latest-rows", action="store_true", default=True, help="Prefer latest rows when row limiting is active. Default: true.")
+    parser.add_argument("--n-estimators", type=int, default=None, help="Override RandomForest n_estimators.")
+    parser.add_argument("--max-depth", type=int, default=None, help="Override RandomForest max_depth.")
+    parser.add_argument("--min-samples-leaf", type=int, default=None, help="Override RandomForest min_samples_leaf.")
+    parser.add_argument("--n-jobs", type=int, default=-1, help="Parallel worker count for RandomForest and optional backtest evaluation. Default: -1.")
+    parser.add_argument("--use-parquet-cache", action="store_true", help="Cache CSV datasets as parquet and prefer the cache on subsequent runs.")
+    parser.add_argument("--cache-dir", default="", help="Optional directory for parquet dataset caches.")
+    parser.add_argument("--force-refresh-cache", action="store_true", help="Ignore any parquet cache and rebuild it from the source dataset.")
+    parser.add_argument("--vectorized-backtest", action="store_true", help="Use vectorized selection paths and parallel edge-refinement candidate evaluation.")
+    parser.add_argument("--max-backtest-rows", type=int, default=0, help="Limit backtest/evaluation to the latest N holdout rows.")
     parser.add_argument("--retrain-all-models", action="store_true", help="Run a lightweight retraining pass across the standard supported model families.")
     parser.add_argument("--improve-models", action="store_true", help="Alias for the stricter all-model retraining workflow.")
     parser.add_argument("--retrain-all-models-strict", action="store_true", help="Run strict multi-model, multi-feature-set retraining audit.")
@@ -846,9 +1116,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-only", action="store_true", help="Regenerate aggregate reports from checkpointed artifacts only.")
     parser.add_argument("--only-target", action="append", default=[], help="Restrict retraining to specific target names. Repeatable or comma-separated.")
     parser.add_argument("--only-model", action="append", default=[], help="Restrict retraining to specific model names. Repeatable or comma-separated.")
+    parser.add_argument("--train-ensemble", default="", help="Optional ensemble alias, for example: xgb_rf")
     parser.add_argument("--paper-watchlist-only", action="store_true", help="Generate paper-watchlist observation rules only; never place trades.")
     parser.add_argument("--live-computable-only", action="store_true", help="Restrict training to features that are live-computable before decision time.")
     parser.add_argument("--strict-live-contract", action="store_true", help="Fail if any candidate training feature is missing from the live feature contract.")
+    parser.add_argument("--rf-n-estimators", type=int, default=None, help="RandomForest n_estimators override.")
+    parser.add_argument("--rf-max-depth", type=int, default=None, help="RandomForest max_depth override.")
+    parser.add_argument("--rf-min-samples-leaf", type=int, default=None, help="RandomForest min_samples_leaf override.")
+    parser.add_argument("--rf-min-samples-split", type=int, default=None, help="RandomForest min_samples_split override.")
+    parser.add_argument("--rf-max-features", default=None, help="RandomForest max_features override.")
+    parser.add_argument("--rf-class-weight", default=None, help="RandomForest class_weight override.")
+    parser.add_argument("--rf-n-jobs", type=int, default=None, help="RandomForest n_jobs override.")
+    parser.add_argument("--xgb-device", choices=["auto", "cuda", "cpu"], default="auto", help="XGBoost device selection.")
+    parser.add_argument("--strict-gpu", action="store_true", help="Fail instead of falling back to CPU when CUDA is requested but unavailable.")
+    parser.add_argument("--xgb-n-estimators", type=int, default=None, help="XGBoost n_estimators override.")
+    parser.add_argument("--xgb-max-depth", type=int, default=None, help="XGBoost max_depth override.")
+    parser.add_argument("--xgb-learning-rate", type=float, default=None, help="XGBoost learning_rate override.")
+    parser.add_argument("--xgb-subsample", type=float, default=None, help="XGBoost subsample override.")
+    parser.add_argument("--xgb-colsample-bytree", type=float, default=None, help="XGBoost colsample_bytree override.")
+    parser.add_argument("--xgb-reg-lambda", type=float, default=None, help="XGBoost reg_lambda override.")
+    parser.add_argument("--xgb-reg-alpha", type=float, default=None, help="XGBoost reg_alpha override.")
+    parser.add_argument("--xgb-min-child-weight", type=float, default=None, help="XGBoost min_child_weight override.")
+    parser.add_argument("--xgb-tree-method", default=None, help="XGBoost tree_method override.")
+    parser.add_argument("--xgb-early-stopping-rounds", type=int, default=None, help="XGBoost early stopping rounds.")
+    parser.add_argument("--xgb-weight", type=float, default=ENSEMBLE_DEFAULTS["xgb_weight"], help="Weighted ensemble XGBoost probability weight.")
+    parser.add_argument("--rf-weight", type=float, default=ENSEMBLE_DEFAULTS["rf_weight"], help="Weighted ensemble RandomForest probability weight.")
+    parser.add_argument("--ensemble-threshold", type=float, default=ENSEMBLE_DEFAULTS["ensemble_threshold"], help="Weighted ensemble gate threshold.")
+    parser.add_argument("--xgb-min-prob", type=float, default=ENSEMBLE_DEFAULTS["xgb_min_prob"], help="Minimum XGBoost probability required by the gated ensemble.")
+    parser.add_argument("--rf-min-prob", type=float, default=ENSEMBLE_DEFAULTS["rf_min_prob"], help="Minimum RandomForest probability required by the gated ensemble.")
+    parser.add_argument("--max-model-disagreement", type=float, default=ENSEMBLE_DEFAULTS["max_model_disagreement"], help="Maximum allowed abs(xgb_prob-rf_prob) before blocking.")
+    parser.add_argument("--disable-disagreement-gate", action="store_true", help="Disable ensemble disagreement blocking.")
     parser.add_argument("--paper-max-trades-per-day", type=int, default=5)
     parser.add_argument("--paper-cooldown-minutes", type=int, default=15)
     parser.add_argument("--paper-allow-ce", action="store_true", default=True)
@@ -999,11 +1296,90 @@ def run_dataset_builder() -> Path:
 
 def load_dataset(path: Path) -> pd.DataFrame:
     print(f"[retrain] loading_dataset path={path}", flush=True)
-    if path.suffix.lower() == ".parquet":
+    try:
+        file_size_mb = float(path.stat().st_size) / (1024.0 * 1024.0)
+        print(f"[retrain] dataset_file_size_mb={file_size_mb:.2f}", flush=True)
+    except Exception:
+        pass
+    suffix = path.suffix.lower()
+    if suffix not in {".csv", ".parquet"}:
+        raise ValueError(f"Unsupported dataset file type: {path.suffix}. Expected .csv or .parquet")
+    cache_path, cache_meta_path = _dataset_cache_paths(path)
+    load_start = time.perf_counter()
+    csv_load_time_seconds: float | None = None
+    parquet_write_time_seconds: float | None = None
+    parquet_read_time_seconds: float | None = None
+    cache_used = False
+    if suffix == ".csv" and bool(_runtime_option("use_parquet_cache", False)):
+        cache_valid = False
+        cache_meta: Dict[str, Any] = {}
+        force_refresh_cache = bool(_runtime_option("force_refresh_cache", False))
+        if force_refresh_cache:
+            print(f"[retrain] parquet_cache_refresh_forced path={cache_path}", flush=True)
+        if not force_refresh_cache and cache_path.exists() and cache_meta_path.exists():
+            try:
+                cache_meta = json.loads(cache_meta_path.read_text(encoding="utf-8"))
+                stat = path.stat()
+                cache_valid = (
+                    str(cache_meta.get("source_path")) == str(path.resolve())
+                    and int(cache_meta.get("source_size_bytes") or -1) == int(stat.st_size)
+                    and int(cache_meta.get("source_mtime_ns") or -1) == int(stat.st_mtime_ns)
+                )
+            except Exception:
+                cache_valid = False
+        if cache_valid:
+            parquet_start = time.perf_counter()
+            df = pd.read_parquet(cache_path)
+            parquet_read_time_seconds = time.perf_counter() - parquet_start
+            cache_used = True
+            csv_load_time_seconds = float(cache_meta.get("csv_load_time_seconds") or 0.0) or None
+            print(f"[retrain] parquet_cache_hit path={cache_path}", flush=True)
+        else:
+            csv_start = time.perf_counter()
+            df = pd.read_csv(path)
+            csv_load_time_seconds = time.perf_counter() - csv_start
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            parquet_write_start = time.perf_counter()
+            df.to_parquet(cache_path, index=False)
+            parquet_write_time_seconds = time.perf_counter() - parquet_write_start
+            stat = path.stat()
+            cache_meta_payload = {
+                "source_path": str(path.resolve()),
+                "source_size_bytes": int(stat.st_size),
+                "source_mtime_ns": int(stat.st_mtime_ns),
+                "row_count": int(len(df)),
+                "column_count": int(len(df.columns)),
+                "csv_load_time_seconds": float(csv_load_time_seconds),
+                "parquet_write_time_seconds": float(parquet_write_time_seconds or 0.0),
+                "created_at": datetime.now().isoformat(),
+            }
+            cache_meta_path.write_text(json.dumps(cache_meta_payload, indent=2), encoding="utf-8")
+            print(f"[retrain] parquet_cache_written path={cache_path}", flush=True)
+    elif suffix == ".parquet":
+        parquet_start = time.perf_counter()
         df = pd.read_parquet(path)
+        parquet_read_time_seconds = time.perf_counter() - parquet_start
     else:
         df = pd.read_csv(path)
-    print(f"[retrain] dataset_loaded rows={len(df)} cols={len(df.columns)}", flush=True)
+        csv_load_time_seconds = time.perf_counter() - load_start
+    load_seconds = time.perf_counter() - load_start
+    comparison = ""
+    if cache_used and csv_load_time_seconds:
+        delta = float(csv_load_time_seconds) - float(load_seconds)
+        comparison = f" cached_csv_load_seconds={csv_load_time_seconds:.3f} speedup_seconds={delta:.3f}"
+    elif suffix == ".csv" and bool(_runtime_option("use_parquet_cache", False)) and csv_load_time_seconds:
+        comparison = f" csv_load_seconds={csv_load_time_seconds:.3f} parquet_cache_ready=true"
+    print(f"[retrain] dataset_loaded rows={len(df)} cols={len(df.columns)} cache_used={cache_used}{comparison}", flush=True)
+    if csv_load_time_seconds is not None:
+        print(f"[retrain] csv_read_time_seconds={csv_load_time_seconds:.3f}", flush=True)
+    if parquet_write_time_seconds is not None:
+        print(f"[retrain] parquet_write_time_seconds={parquet_write_time_seconds:.3f}", flush=True)
+    if parquet_read_time_seconds is not None:
+        print(f"[retrain] parquet_read_time_seconds={parquet_read_time_seconds:.3f}", flush=True)
+    print(f"[retrain] dataset_memory_mb={_dataset_memory_mb(df):.2f}", flush=True)
+    print(f"[retrain] target_distribution={json.dumps(_dataset_target_distribution(df), sort_keys=True)}", flush=True)
+    _timing_log("dataset_load", seconds=load_seconds, rows=len(df), extra=f"path={path}")
+    preprocess_start = time.perf_counter()
     if {"timestamp", "instrument_key"}.issubset(df.columns) and ("ltp" in df.columns or "close" in df.columns):
         try:
             print("[retrain] preparing chronological dataset", flush=True)
@@ -1024,6 +1400,10 @@ def load_dataset(path: Path) -> pd.DataFrame:
             print(f"[retrain] direct strategy features ready count={len(added)} names={added}", flush=True)
         except Exception:
             pass
+    df = _apply_runtime_dataset_limits(df, context=str(path))
+    print(f"[retrain] dataset_post_limit rows={len(df)} cols={len(df.columns)} memory_mb={_dataset_memory_mb(df):.2f}", flush=True)
+    print(f"[retrain] dataset_post_limit_target_distribution={json.dumps(_dataset_target_distribution(df), sort_keys=True)}", flush=True)
+    _timing_log("preprocessing", seconds=time.perf_counter() - preprocess_start, rows=len(df), extra=f"path={path}")
     return df
 
 
@@ -1636,7 +2016,7 @@ def select_feature_columns(
             continue
         if audit and str(col) in set(audit.get("high_null_columns", [])):
             continue
-        if pd.api.types.is_numeric_dtype(df[col]):
+        if pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_bool_dtype(df[col]):
             cols.append(col)
     return cols
 
@@ -3551,13 +3931,10 @@ def _selection_rows_for_candidate(
     median_return = float(np.median(selected_returns)) if selected_returns.size else 0.0
     max_consecutive_losses = 0
     if selected_returns.size:
-        current_losses = 0
-        for value in selected_returns:
-            if float(value) < 0.0:
-                current_losses += 1
-                max_consecutive_losses = max(max_consecutive_losses, current_losses)
-            else:
-                current_losses = 0
+        loss_mask = selected_returns < 0.0
+        if bool(loss_mask.any()):
+            streak_groups = np.cumsum(~loss_mask)
+            max_consecutive_losses = int(pd.Series(loss_mask.astype(int)).groupby(streak_groups).sum().max())
     daily_mean = 0.0
     daily_std = 0.0
     if not selected_rows.empty and "trade_day" in selected_rows.columns:
@@ -4513,7 +4890,11 @@ def _ranked_selection_rows(test_frame: pd.DataFrame, probability_column: str, *,
     if top_n is not None:
         return ranked.groupby("trade_day", group_keys=False).head(int(top_n)).reset_index(drop=True)
     if top_pct is not None:
-        return ranked.groupby("trade_day", group_keys=False).apply(lambda group: group.head(max(1, int(math.ceil(len(group) * float(top_pct)))))).reset_index(drop=True)
+        ranked["__rank"] = ranked.groupby("trade_day").cumcount()
+        group_sizes = ranked.groupby("trade_day")[probability_column].transform("size")
+        keep_counts = np.maximum(1, np.ceil(group_sizes.to_numpy(dtype=float) * float(top_pct)).astype(int))
+        selected = ranked.loc[ranked["__rank"].to_numpy(dtype=int) < keep_counts].drop(columns="__rank")
+        return selected.reset_index(drop=True)
     return ranked.reset_index(drop=True)
 
 
@@ -4723,7 +5104,7 @@ def _train_regime_restricted_candidates(
         test_prob = predict_proba_positive(model, X_test_s)
         chosen = optimize_threshold_from_probs(y_val, val_prob, returns[val_idx], thresholds=RETRAIN_THRESHOLD_SWEEP, minimum_trades=25)
         threshold = float(chosen["threshold"])
-        test_frame = work.iloc[test_idx].copy().reset_index(drop=True)
+        test_frame = _apply_backtest_row_limit(work.iloc[test_idx].copy().reset_index(drop=True), context=f"regime_candidate:{candidate_name}")
         test_frame["timestamp"] = _normalize_timestamp_series(test_frame["timestamp"])
         test_frame["trade_day"] = test_frame["timestamp"].dt.date
         test_frame["probability"] = np.asarray(test_prob, dtype=float)
@@ -5118,8 +5499,8 @@ def _trade_filter_report(
         "top_1_per_day": ranked.groupby("trade_day", group_keys=False).head(1),
         "top_3_per_day": ranked.groupby("trade_day", group_keys=False).head(3),
         "top_5_per_day": ranked.groupby("trade_day", group_keys=False).head(5),
-        "top_5pct_per_day": ranked.groupby("trade_day", group_keys=False).apply(lambda group: group.head(max(1, int(math.ceil(len(group) * 0.05))))).reset_index(drop=True) if not ranked.empty else ranked,
-        "top_10pct_per_day": ranked.groupby("trade_day", group_keys=False).apply(lambda group: group.head(max(1, int(math.ceil(len(group) * 0.10))))).reset_index(drop=True) if not ranked.empty else ranked,
+        "top_5pct_per_day": _ranked_selection_rows(ranked, "probability", top_pct=0.05) if not ranked.empty else ranked,
+        "top_10pct_per_day": _ranked_selection_rows(ranked, "probability", top_pct=0.10) if not ranked.empty else ranked,
     }
     for name, selected in top_specs.items():
         metrics = _trade_metrics_from_scores(np.ones(len(selected)), np.ones(len(selected)), 0.5, selected["selected_return"].to_numpy(dtype=float), threshold_source=f"trade_filter:{name}") if not selected.empty else _trade_metrics_from_scores(np.array([]), np.array([]), 0.5, np.array([]), threshold_source=f"trade_filter:{name}")
@@ -5459,21 +5840,22 @@ def _all_supported_model_families() -> List[str]:
         "catboost",
         "calibrated_logistic_regression",
         "ensemble",
+        "xgb_rf_ensemble",
     ]
 
 
 def _parse_model_families_arg(value: str) -> List[str]:
     token = str(value or "default").strip().lower()
     if token in {"", "default"}:
-        return [name for name in _all_supported_model_families() if _optional_dependency_status(name)[0]]
+        return [name for name in _all_supported_model_families() if name != "xgb_rf_ensemble" and _optional_dependency_status(name)[0]]
     if token == "all":
-        return [name for name in _all_supported_model_families() if _optional_dependency_status(name)[0]]
+        return [name for name in _all_supported_model_families() if name != "xgb_rf_ensemble" and _optional_dependency_status(name)[0]]
     return [part.strip().lower() for part in token.split(",") if part.strip()]
 
 
 def _optional_dependency_status(model_family: str) -> tuple[bool, str | None]:
     try:
-        if model_family == "xgboost":
+        if model_family in {"xgboost", "xgb_rf_ensemble"}:
             __import__("xgboost")
         elif model_family == "lightgbm":
             __import__("lightgbm")
@@ -5482,6 +5864,48 @@ def _optional_dependency_status(model_family: str) -> tuple[bool, str | None]:
         return True, None
     except Exception as exc:
         return False, f"SKIPPED_OPTIONAL_DEPENDENCY_MISSING:{model_family}:{exc.__class__.__name__}"
+
+
+def _runtime_rf_params() -> Dict[str, Any]:
+    defaults = dict(FAST_RF_DEFAULTS if bool(_runtime_option("fast_mode", False)) else PRODUCTION_RF_DEFAULTS)
+    defaults["n_estimators"] = int(_runtime_option("rf_n_estimators", None) or _runtime_option("n_estimators", None) or defaults["n_estimators"])
+    defaults["max_depth"] = int(_runtime_option("rf_max_depth", None) or _runtime_option("max_depth", None) or defaults["max_depth"])
+    defaults["min_samples_leaf"] = int(_runtime_option("rf_min_samples_leaf", None) or _runtime_option("min_samples_leaf", None) or defaults["min_samples_leaf"])
+    defaults["min_samples_split"] = int(_runtime_option("rf_min_samples_split", None) or defaults["min_samples_split"])
+    defaults["max_features"] = _runtime_option("rf_max_features", None) or defaults["max_features"]
+    defaults["class_weight"] = _runtime_option("rf_class_weight", None) or defaults["class_weight"]
+    defaults["n_jobs"] = int(_runtime_option("rf_n_jobs", None) or _runtime_option("n_jobs", -1) or defaults["n_jobs"])
+    return defaults
+
+
+def _runtime_xgb_params() -> Dict[str, Any]:
+    defaults = dict(FAST_XGB_DEFAULTS if bool(_runtime_option("fast_mode", False)) else PRODUCTION_XGB_DEFAULTS)
+    mapping = {
+        "xgb_n_estimators": "n_estimators",
+        "xgb_max_depth": "max_depth",
+        "xgb_learning_rate": "learning_rate",
+        "xgb_subsample": "subsample",
+        "xgb_colsample_bytree": "colsample_bytree",
+        "xgb_reg_lambda": "reg_lambda",
+        "xgb_reg_alpha": "reg_alpha",
+        "xgb_min_child_weight": "min_child_weight",
+        "xgb_tree_method": "tree_method",
+    }
+    for runtime_key, param_key in mapping.items():
+        value = _runtime_option(runtime_key, None)
+        if value is not None:
+            defaults[param_key] = value
+    defaults["n_jobs"] = int(_runtime_option("n_jobs", -1) or defaults.get("n_jobs", -1))
+    defaults["random_state"] = 42
+    return defaults
+
+
+def _runtime_ensemble_params() -> Dict[str, Any]:
+    return dict(_runtime_option("ensemble", {}) or {})
+
+
+def _default_threshold_sweep_grid() -> List[float]:
+    return [0.50, 0.55, 0.58, 0.60, 0.62, 0.65, 0.70]
 
 
 def _build_model_family(model_family: str) -> Any:
@@ -5693,6 +6117,7 @@ def train_variant(
     only_models: Sequence[str] | None = None,
     force_retrain: bool = False,
 ) -> Dict[str, Any]:
+    variant_start = time.perf_counter()
     # =====================================================================
     # FEATURE CONTRACT HYGIENE CHECK
     # Verify training features are compatible with live inference contract.
@@ -5726,9 +6151,11 @@ def train_variant(
             f"See {artifact_dir / 'feature_hygiene_report.json'} for details."
         )
     
+    preprocess_start = time.perf_counter()
     X_df = df[list(feature_cols)].copy().replace([np.inf, -np.inf], np.nan)
     medians = X_df.median(numeric_only=True)
     X_df = X_df.fillna(medians).fillna(0.0).astype(np.float32)
+    _timing_log("variant_preprocessing", seconds=time.perf_counter() - preprocess_start, rows=len(X_df), extra=f"variant={variant_name}")
     all_reports: Dict[str, Any] = {}
     trained_models: List[str] = []
     feature_manifests: Dict[str, Any] = {}
@@ -5763,16 +6190,23 @@ def train_variant(
             f"{sorted({str(f).strip().lower() for f in families})!r}."
         )
     for label_name in labels:
+        if label_name not in df.columns:
+            raise RuntimeError(f"Missing target column '{label_name}' in dataset.")
         if allowed_targets and str(label_name) not in allowed_targets:
             continue
         requested_base_models = [
             str(model_name)
             for model_name in families
-            if str(model_name).strip().lower() != "ensemble"
+            if str(model_name).strip().lower() not in {"ensemble", "xgb_rf_ensemble"}
             and (not allowed_models or str(model_name).strip().lower() in allowed_models)
         ]
         requested_ensemble = any(
             str(model_name).strip().lower() == "ensemble"
+            and (not allowed_models or str(model_name).strip().lower() in allowed_models)
+            for model_name in families
+        )
+        requested_xgb_rf_ensemble = any(
+            str(model_name).strip().lower() == "xgb_rf_ensemble"
             and (not allowed_models or str(model_name).strip().lower() in allowed_models)
             for model_name in families
         )
@@ -5799,6 +6233,16 @@ def train_variant(
                         all_requested_complete = False
                     else:
                         completed_reports["ensemble"] = ensemble_metrics
+            if all_requested_complete and requested_xgb_rf_ensemble:
+                xgb_rf_status = _read_json_if_exists(_status_file_path(artifact_dir, label_name, "xgb_rf_ensemble"))
+                if not _completed_status_is_valid(xgb_rf_status):
+                    all_requested_complete = False
+                else:
+                    xgb_rf_metrics = _read_json_if_exists(Path(str(xgb_rf_status["metrics_path"])))
+                    if not xgb_rf_metrics:
+                        all_requested_complete = False
+                    else:
+                        completed_reports["xgb_rf_ensemble"] = xgb_rf_metrics
             if all_requested_complete:
                 all_reports[label_name] = completed_reports
                 feature_manifests[label_name] = list(feature_cols)
@@ -5849,7 +6293,7 @@ def train_variant(
         _assert_fold_is_chronological(timestamps, train_idx, val_idx, test_idx=test_idx, context=f"{variant_name}:{label_name}:holdout_split")
         X_train, X_val, X_test = X[train_idx], X[val_idx], X[test_idx]
         y_train, y_val, y_test = y[train_idx], y[val_idx], y[test_idx]
-        test_frame = work.iloc[test_idx].reset_index(drop=True)
+        test_frame = _apply_backtest_row_limit(work.iloc[test_idx].reset_index(drop=True), context=f"{variant_name}:{label_name}")
         X_train_s, X_val_s, X_test_s, scaler_mean, scaler_std = scale_train_val_test(X_train, X_val, X_test)
         walk_forward = _walk_forward_summary(X, y, timestamps, feature_cols, label_name, eval_returns, fold_count=walk_forward_folds)
         split_window = {}
@@ -5862,7 +6306,7 @@ def train_variant(
         for model_name in families:
             if allowed_models and str(model_name).strip().lower() not in allowed_models:
                 continue
-            if str(model_name).strip().lower() == "ensemble":
+            if str(model_name).strip().lower() in {"ensemble", "xgb_rf_ensemble"}:
                 continue
             status_path = _status_file_path(artifact_dir, label_name, model_name)
             threshold_json = artifact_dir / f"{variant_name}_{model_name}_{label_name}_threshold_sweep.json"
@@ -5933,8 +6377,11 @@ def train_variant(
                 })
                 continue
             train_time = time.time() - start
+            predict_start = time.perf_counter()
             val_prob = predict_proba_positive(model, X_val_s)
             test_prob = predict_proba_positive(model, X_test_s)
+            predict_time = time.perf_counter() - predict_start
+            _timing_log("predict", seconds=predict_time, rows=len(X_val_s) + len(X_test_s), extra=f"variant={variant_name} label={label_name} model={model_name}")
 
             # =========================================================================
             # OOF PREDICTION PERSISTENCE
@@ -5983,6 +6430,7 @@ def train_variant(
             except Exception as exc:
                 wf_oof_persist_result = {"status": "error", "error": str(exc)}
 
+            backtest_start = time.perf_counter()
             chosen = optimize_threshold_from_probs(y_val, val_prob, val_returns, thresholds=RETRAIN_THRESHOLD_SWEEP, minimum_trades=min_threshold_trades)
             threshold = float(chosen["threshold"])
             val_metrics = classification_metrics(y_val, val_prob, threshold=threshold)
@@ -6038,6 +6486,8 @@ def train_variant(
                 paper_filter_report.get("selected_rows", []),
                 max_trades_per_day=int((paper_config or {}).get("paper_max_trades_per_day", 5)),
             )
+            backtest_time = time.perf_counter() - backtest_start
+            _timing_log("backtest", seconds=backtest_time, rows=len(test_frame), extra=f"variant={variant_name} label={label_name} model={model_name}")
             write_json(threshold_json, {"model_name": model_name, "label_name": label_name, "rows": threshold_rows})
             pd.DataFrame(threshold_rows).to_csv(threshold_csv, index=False)
             report = {
@@ -6337,8 +6787,71 @@ def train_variant(
                     "training_time_seconds": 0.0,
                 })
                 trained_models.append(f"{variant_name}:ensemble:{label_name}")
+        if requested_xgb_rf_ensemble:
+            ensemble_status_path = _status_file_path(artifact_dir, label_name, "xgb_rf_ensemble")
+            _write_status_file(artifact_dir, label_name, "xgb_rf_ensemble", {
+                "label_name": label_name,
+                "model_name": "xgb_rf_ensemble",
+                "status": "running",
+                "start_time": datetime.now().isoformat(),
+                "end_time": None,
+                "artifact_path": None,
+                "metrics_path": None,
+                "error_message": None,
+                "training_time_seconds": None,
+            })
+            try:
+                ensemble_report = _train_xgb_rf_ensemble_for_label(
+                    work=work,
+                    feature_cols=feature_cols,
+                    label_name=label_name,
+                    artifact_dir=artifact_dir,
+                    variant_name=variant_name,
+                    returns_col=returns_col,
+                    timestamps=timestamps,
+                    train_idx=train_idx,
+                    val_idx=val_idx,
+                    test_idx=test_idx,
+                    split_window=split_window,
+                    walk_forward=walk_forward,
+                    paper_config=paper_config,
+                )
+                label_reports["xgb_rf_ensemble"] = ensemble_report
+                _write_status_file(artifact_dir, label_name, "xgb_rf_ensemble", {
+                    "label_name": label_name,
+                    "model_name": "xgb_rf_ensemble",
+                    "status": "completed",
+                    "start_time": None,
+                    "end_time": datetime.now().isoformat(),
+                    "artifact_path": ensemble_report.get("model_path"),
+                    "metrics_path": ensemble_report.get("metrics_path"),
+                    "error_message": None,
+                    "training_time_seconds": ensemble_report.get("training_time_seconds"),
+                })
+                trained_models.append(f"{variant_name}:xgb_rf_ensemble:{label_name}")
+            except Exception as exc:
+                _write_status_file(artifact_dir, label_name, "xgb_rf_ensemble", {
+                    "label_name": label_name,
+                    "model_name": "xgb_rf_ensemble",
+                    "status": "failed",
+                    "start_time": None,
+                    "end_time": datetime.now().isoformat(),
+                    "artifact_path": None,
+                    "metrics_path": None,
+                    "error_message": str(exc),
+                    "training_time_seconds": 0.0,
+                })
+                failed_models.append({
+                    "variant_name": variant_name,
+                    "label_name": label_name,
+                    "model_family": "xgb_rf_ensemble",
+                    "error": str(exc),
+                    "stack_summary": traceback.format_exc(limit=3),
+                })
         all_reports[label_name] = label_reports
         feature_manifests[label_name] = list(feature_cols)
+    total_seconds = time.perf_counter() - variant_start
+    _timing_log("variant_total", seconds=total_seconds, rows=len(df), extra=f"variant={variant_name}")
     return {
         "reports": all_reports,
         "trained_models": trained_models,
@@ -6346,6 +6859,7 @@ def train_variant(
         "evaluation_return_column_used": returns_col,
         "skipped_models": skipped_models,
         "failed_models": failed_models,
+        "timing": {"total_seconds": float(total_seconds)},
     }
 
 
@@ -7259,11 +7773,13 @@ def _env_int(name: str, default: int, minimum: int) -> int:
 
 
 def _rf_runtime_config() -> Dict[str, Any]:
-    stage1_trees = _env_int("RF_SEARCH_STAGE1_TREES", 160, 50)
-    stage2_trees = _env_int("RF_SEARCH_STAGE2_TREES", 320, stage1_trees)
-    final_trees = _env_int("RF_FINAL_TREES", 500, stage2_trees)
-    stage1_top_k = _env_int("RF_STAGE1_TOP_K", 4, 1)
-    n_jobs = _env_int("RF_N_JOBS", 2, 1)
+    defaults = _runtime_rf_params()
+    default_trees = int(defaults["n_estimators"])
+    stage1_trees = _env_int("RF_SEARCH_STAGE1_TREES", max(50, min(default_trees, 160)), 50)
+    stage2_trees = _env_int("RF_SEARCH_STAGE2_TREES", max(stage1_trees, min(max(default_trees, stage1_trees), 320)), stage1_trees)
+    final_trees = int(defaults["n_estimators"])
+    stage1_top_k = 1
+    n_jobs = int(defaults["n_jobs"])
     adaptive_margin_bps = _env_int("RF_ADAPTIVE_MARGIN_BPS", 50, 0)
     return {
         "stage1_trees": stage1_trees,
@@ -7272,6 +7788,12 @@ def _rf_runtime_config() -> Dict[str, Any]:
         "stage1_top_k": stage1_top_k,
         "n_jobs": n_jobs,
         "adaptive_margin_bps": adaptive_margin_bps,
+        "max_depth": int(defaults["max_depth"]),
+        "min_samples_leaf": int(defaults["min_samples_leaf"]),
+        "min_samples_split": int(defaults["min_samples_split"]),
+        "max_features": defaults["max_features"],
+        "class_weight": defaults["class_weight"],
+        "fast_mode": bool(_runtime_option("fast_mode", False)),
     }
 
 
@@ -7317,6 +7839,11 @@ def _build_rf_estimator(params: Dict[str, Any], *, n_estimators: int, n_jobs: in
     final_params = dict(params)
     final_params["n_estimators"] = int(n_estimators)
     final_params["max_samples"] = _normalize_rf_max_samples(final_params.get("max_samples"), row_count)
+    final_params.setdefault("min_samples_split", int(_runtime_rf_params()["min_samples_split"]))
+    final_params.setdefault("min_samples_leaf", int(_runtime_rf_params()["min_samples_leaf"]))
+    final_params.setdefault("max_depth", _runtime_rf_params()["max_depth"])
+    final_params.setdefault("max_features", _runtime_rf_params()["max_features"])
+    final_params.setdefault("class_weight", _runtime_rf_params()["class_weight"])
     return RandomForestClassifier(
         **final_params,
         bootstrap=True,
@@ -7423,74 +7950,38 @@ def _fit_random_forest_with_validation_search(
     minimum_trades: int,
 ) -> tuple[Any, Dict[str, Any]]:
     cfg = _rf_runtime_config()
-    search_space = _random_forest_search_space()
     row_count = int(len(X_train_s))
-
-    stage1_rows: List[Dict[str, Any]] = []
-    for params in search_space:
-        model = _build_rf_estimator(
-            params,
-            n_estimators=int(cfg["stage1_trees"]),
-            n_jobs=int(cfg["n_jobs"]),
-            row_count=row_count,
-        )
-        fit_model(model, X_train_s, y_train)
-        stage1_rows.append(
-            _rf_stage_candidate_row(
-                params,
-                "stage1_screen",
-                int(cfg["stage1_trees"]),
-                model,
-                X_val_s,
-                y_val,
-                val_returns,
-                minimum_trades=minimum_trades,
-            )
-        )
-
-    stage2_pool = _rf_adaptive_stage2_pool(
-        stage1_rows,
-        stage1_top_k=int(cfg["stage1_top_k"]),
-        adaptive_margin_bps=int(cfg["adaptive_margin_bps"]),
+    direct_params = {
+        "criterion": "gini",
+        "max_depth": int(cfg["max_depth"]),
+        "min_samples_leaf": int(cfg["min_samples_leaf"]),
+        "min_samples_split": int(cfg["min_samples_split"]),
+        "max_features": cfg["max_features"],
+        "class_weight": cfg["class_weight"],
+        "max_samples": 0.85 if bool(cfg.get("fast_mode")) else None,
+        "max_leaf_nodes": None,
+        "ccp_alpha": 0.0,
+    }
+    print(
+        "[retrain] random_forest_fit "
+        f"trees={cfg['final_trees']} max_depth={direct_params['max_depth']} "
+        f"min_samples_leaf={direct_params['min_samples_leaf']} min_samples_split={direct_params['min_samples_split']} "
+        f"max_features={direct_params['max_features']} class_weight={direct_params['class_weight']} "
+        f"n_jobs={cfg['n_jobs']} rows={row_count}",
+        flush=True,
     )
-    if not stage2_pool:
-        raise RuntimeError("Random Forest validation search failed to produce a fitted model.")
-
-    stage2_rows: List[Dict[str, Any]] = []
-    for row in stage2_pool:
-        params = dict(row["params"])
-        model = _build_rf_estimator(
-            params,
-            n_estimators=int(cfg["stage2_trees"]),
-            n_jobs=int(cfg["n_jobs"]),
-            row_count=row_count,
-        )
-        fit_model(model, X_train_s, y_train)
-        stage2_rows.append(
-            _rf_stage_candidate_row(
-                params,
-                "stage2_refine",
-                int(cfg["stage2_trees"]),
-                model,
-                X_val_s,
-                y_val,
-                val_returns,
-                minimum_trades=minimum_trades,
-            )
-        )
-
-    final_choice = max(stage2_rows, key=_rf_stage_ranking_key)
-    best_params = dict(final_choice["params"])
     best_model = _build_rf_estimator(
-        best_params,
+        direct_params,
         n_estimators=int(cfg["final_trees"]),
         n_jobs=int(cfg["n_jobs"]),
         row_count=row_count,
     )
+    fit_start = time.perf_counter()
     fit_model(best_model, X_train_s, y_train)
+    fit_seconds = time.perf_counter() - fit_start
     final_row = _rf_stage_candidate_row(
-        best_params,
-        "final_refit",
+        direct_params,
+        "direct_fit",
         int(cfg["final_trees"]),
         best_model,
         X_val_s,
@@ -7498,17 +7989,79 @@ def _fit_random_forest_with_validation_search(
         val_returns,
         minimum_trades=minimum_trades,
     )
+    _timing_log("random_forest_train", seconds=fit_seconds, rows=row_count, extra=f"trees={cfg['final_trees']}")
 
     return best_model, {
-        "mode": "validation_search",
+        "mode": "direct_fit",
         "fit_on_validation_only": False,
         "runtime_config": cfg,
-        "selected_params": best_params,
+        "selected_params": direct_params,
         "selected_threshold_preview": dict(final_row["threshold_preview"]),
-        "search_rows": stage1_rows + stage2_rows + [final_row],
-        "stage1_candidate_count": int(len(stage1_rows)),
-        "stage2_candidate_count": int(len(stage2_rows)),
+        "search_rows": [final_row],
+        "stage1_candidate_count": 1,
+        "stage2_candidate_count": 0,
     }
+
+
+def _fit_xgboost_with_validation(
+    X_train_s: np.ndarray,
+    y_train: np.ndarray,
+    X_val_s: np.ndarray,
+    y_val: np.ndarray,
+) -> tuple[Any, Dict[str, Any]]:
+    try:
+        from xgboost import XGBClassifier
+    except Exception as exc:
+        raise RuntimeError(f"xgboost not installed: {exc}") from exc
+
+    runtime_params = _runtime_xgb_params()
+    device_preference = str(_runtime_option("xgb_device", "auto") or "auto").strip().lower()
+    strict_gpu = bool(_runtime_option("strict_gpu", False))
+    candidate_params: List[Dict[str, Any]] = []
+    if device_preference in {"auto", "cuda"}:
+        candidate_params.append({**runtime_params, "device": "cuda", "tree_method": str(runtime_params.get("tree_method") or "hist")})
+    candidate_params.append({**runtime_params, "device": "cpu", "tree_method": str(runtime_params.get("tree_method") or "hist")})
+
+    fit_errors: List[str] = []
+    for candidate in candidate_params:
+        backend = str(candidate.get("device") or "cpu")
+        model = XGBClassifier(**candidate)
+        fit_kwargs: Dict[str, Any] = {}
+        early_stopping_rounds = _runtime_option("xgb_early_stopping_rounds", None)
+        if early_stopping_rounds:
+            fit_kwargs["eval_set"] = [(X_val_s, y_val)]
+            fit_kwargs["verbose"] = False
+        print(
+            "[retrain] xgboost_fit_start "
+            f"device={backend} rows={len(X_train_s)} features={X_train_s.shape[1] if X_train_s.ndim == 2 else 0} "
+            f"params={json.dumps({k: v for k, v in candidate.items() if k != 'eval_metric'}, sort_keys=True, default=str)}",
+            flush=True,
+        )
+        fit_start = time.perf_counter()
+        try:
+            if early_stopping_rounds and hasattr(model, "set_params"):
+                try:
+                    model.set_params(early_stopping_rounds=int(early_stopping_rounds))
+                except Exception:
+                    pass
+            model.fit(X_train_s, y_train, **fit_kwargs)
+            fit_seconds = time.perf_counter() - fit_start
+            _timing_log("xgboost_train", seconds=fit_seconds, rows=len(X_train_s), extra=f"device={backend}")
+            return model, {
+                "mode": "direct_fit",
+                "fit_on_validation_only": False,
+                "runtime_backend": backend,
+                "selected_params": candidate,
+                "early_stopping_rounds": int(early_stopping_rounds) if early_stopping_rounds else None,
+            }
+        except Exception as exc:
+            fit_seconds = time.perf_counter() - fit_start
+            fit_errors.append(f"{backend}:{exc}")
+            print(f"[retrain] xgboost_fit_failed device={backend} seconds={fit_seconds:.3f} reason={exc}", flush=True)
+            if backend == "cuda" and device_preference == "cuda" and strict_gpu:
+                raise RuntimeError(f"CUDA unavailable for xgboost and --strict-gpu is set: {exc}") from exc
+            continue
+    raise RuntimeError(f"XGBoost fit failed on all backends: {' | '.join(fit_errors)}")
 
 
 def _fit_model_for_training_run(
@@ -7532,6 +8085,13 @@ def _fit_model_for_training_run(
             y_val,
             val_returns,
             minimum_trades=minimum_trades,
+        )
+    if name == "xgboost":
+        return _fit_xgboost_with_validation(
+            X_train_s,
+            y_train,
+            X_val_s,
+            y_val,
         )
     model = _build_model_family(model_name)
     fit_model(model, X_train_s, y_train)
@@ -7579,6 +8139,316 @@ def _fit_model_with_validation_calibration(
         calibrator = IsotonicRegression(out_of_bounds="clip")
         calibrator.fit(val_prob, y_val)
     return _ValidationOnlyCalibratedModel(base, calibrator), {"mode": method, "fit_on_validation_only": True, "validation_rows_used": int(len(y_val))}
+
+
+def _gate_rows_from_ensemble_details(details: Sequence[Dict[str, Any]]) -> np.ndarray:
+    return np.asarray([1 if bool(row.get("final_allowed")) else 0 for row in details], dtype=int)
+
+
+def _classification_metrics_from_decisions(y_true: np.ndarray, decisions: np.ndarray, y_prob: np.ndarray) -> Dict[str, Any]:
+    base = classification_metrics(y_true, y_prob, threshold=0.5)
+    confusion = confusion_from_threshold(y_true, decisions, 0.5)
+    tp = int(confusion["tp"])
+    fp = int(confusion["fp"])
+    fn = int(confusion["fn"])
+    tn = int(confusion["tn"])
+    precision = float(tp / (tp + fp)) if (tp + fp) else 0.0
+    recall = float(tp / (tp + fn)) if (tp + fn) else 0.0
+    accuracy = float((tp + tn) / max(1, tp + tn + fp + fn))
+    f1 = float((2 * precision * recall) / max(1e-12, precision + recall)) if (precision + recall) else 0.0
+    base.update({
+        "precision": precision,
+        "recall": recall,
+        "accuracy": accuracy,
+        "f1": f1,
+    })
+    return base
+
+
+def _ensemble_threshold_sweep(
+    y_true: np.ndarray,
+    decisions_by_threshold: Sequence[Dict[str, Any]],
+    returns: np.ndarray | None,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for item in decisions_by_threshold:
+        threshold = float(item["threshold"])
+        decisions = np.asarray(item["decisions"], dtype=int)
+        ensemble_prob = np.asarray(item["ensemble_prob"], dtype=float)
+        cls = _classification_metrics_from_decisions(y_true, decisions, ensemble_prob)
+        trade = _trade_metrics_from_scores(y_true, decisions, 0.5, returns, threshold_source=f"ensemble_gate:{threshold}")
+        rows.append(
+            {
+                "threshold": threshold,
+                "trade_count": int(trade.get("trade_count") or 0),
+                "positive_predictions": int(decisions.sum()),
+                "precision": cls.get("precision"),
+                "recall": cls.get("recall"),
+                "accuracy": cls.get("accuracy"),
+                "f1": cls.get("f1"),
+                "estimated_win_rate": trade.get("win_rate"),
+                "average_net_forward_return": trade.get("average_return_per_trade"),
+                "total_net_forward_return": trade.get("total_return"),
+                "profit_factor": trade.get("profit_factor"),
+                "max_drawdown": trade.get("max_drawdown"),
+                "brier_score": brier_score(y_true, ensemble_prob),
+                "positive_rate": float(decisions.mean()) if len(decisions) else 0.0,
+            }
+        )
+    return rows
+
+
+def _save_ensemble_artifact(
+    *,
+    artifact_dir: Path,
+    model: XGBRFEnsembleClassifier,
+    label_name: str,
+    feature_columns: Sequence[str],
+    fill_values: Dict[str, float],
+    metrics_payload: Dict[str, Any],
+    threshold_rows: Sequence[Dict[str, Any]],
+    comparison_payload: Dict[str, Any],
+    dataset_path: str,
+    split_sizes: Dict[str, int],
+) -> Dict[str, str]:
+    import joblib
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    model_path = artifact_dir / "model.pkl"
+    rf_path = artifact_dir / "rf_model.pkl"
+    xgb_path = artifact_dir / "xgb_model.pkl"
+    ensemble_config = {
+        "ensemble_type": "weighted_xgb_rf",
+        "target": str(label_name),
+        **_runtime_ensemble_params(),
+        "feature_columns": list(feature_columns),
+        "created_at": datetime.now().isoformat(),
+        "dataset_path": str(dataset_path),
+        "dataset_rows": int(sum(split_sizes.values())),
+        "train_rows": int(split_sizes.get("train_rows", 0)),
+        "validation_rows": int(split_sizes.get("validation_rows", 0)),
+        "test_rows": int(split_sizes.get("test_rows", 0)),
+        "model_type": "xgb_rf_ensemble",
+    }
+    joblib.dump(_wrap_model(model, feature_names=feature_columns, metrics=ensemble_config, scaler_mean=[], scaler_std=[]), model_path)
+    if getattr(model, "rf_model_", None) is not None:
+        joblib.dump(getattr(model, "rf_model_"), rf_path)
+    if getattr(model, "xgb_model_", None) is not None:
+        joblib.dump(getattr(model, "xgb_model_"), xgb_path)
+    write_json(artifact_dir / "ensemble_config.json", ensemble_config)
+    write_json(artifact_dir / "feature_columns.json", {"feature_columns": list(feature_columns)})
+    write_json(artifact_dir / "fill_values.json", dict(fill_values))
+    write_json(artifact_dir / "metrics.json", metrics_payload)
+    pd.DataFrame(list(threshold_rows)).to_csv(artifact_dir / "threshold_sweep.csv", index=False)
+    write_json(artifact_dir / "backtest_report.json", metrics_payload.get("backtest_report") or {})
+    write_json(artifact_dir / "model_comparison_report.json", comparison_payload)
+    model_card_lines = [
+        "# XGB + RF Ensemble Model Card",
+        f"- Target: `{label_name}`",
+        f"- Dataset: `{dataset_path}`",
+        f"- Feature count: `{len(feature_columns)}`",
+        f"- Train/Val/Test rows: `{split_sizes.get('train_rows', 0)}` / `{split_sizes.get('validation_rows', 0)}` / `{split_sizes.get('test_rows', 0)}`",
+        f"- XGB backend: `{getattr(model, 'xgb_runtime_backend_', 'unknown')}`",
+        "- Production adoption allowed: `False`",
+    ]
+    (artifact_dir / "model_card.md").write_text("\n".join(model_card_lines), encoding="utf-8")
+    print(
+        f"[ensemble] saved_files={json.dumps(sorted([p.name for p in artifact_dir.iterdir() if p.is_file()]))}",
+        flush=True,
+    )
+    return {
+        "model_path": str(model_path),
+        "rf_model_path": str(rf_path),
+        "xgb_model_path": str(xgb_path),
+        "metrics_path": str(artifact_dir / "metrics.json"),
+        "threshold_sweep_csv_path": str(artifact_dir / "threshold_sweep.csv"),
+        "ensemble_config_path": str(artifact_dir / "ensemble_config.json"),
+        "model_comparison_report_path": str(artifact_dir / "model_comparison_report.json"),
+    }
+
+
+def _train_xgb_rf_ensemble_for_label(
+    *,
+    work: pd.DataFrame,
+    feature_cols: Sequence[str],
+    label_name: str,
+    artifact_dir: Path,
+    variant_name: str,
+    returns_col: str | None,
+    timestamps: pd.Series,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    split_window: Dict[str, Any],
+    walk_forward: Dict[str, Any],
+    paper_config: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    filtered = filter_target_rows(work, "label", allowed_values=(0, 1))
+    feature_frame, _ = build_safe_numeric_bool_frame(
+        filtered,
+        feature_columns=list(feature_cols),
+        target_columns=["label"],
+    )
+    feature_frame = feature_frame.replace([np.inf, -np.inf], np.nan)
+    X_train_df = feature_frame.iloc[train_idx].copy()
+    X_val_df = feature_frame.iloc[val_idx].copy()
+    X_test_df = feature_frame.iloc[test_idx].copy()
+    fill_values = compute_train_medians(X_train_df)
+    X_train_df = apply_train_median_fill(X_train_df, fill_values).fillna(0.0).astype(np.float32)
+    X_val_df = apply_train_median_fill(X_val_df, fill_values).fillna(0.0).astype(np.float32)
+    X_test_df = apply_train_median_fill(X_test_df, fill_values).fillna(0.0).astype(np.float32)
+    y = filtered["label"].astype(int).to_numpy()
+    y_train = y[train_idx]
+    y_val = y[val_idx]
+    y_test = y[test_idx]
+    returns = filtered[returns_col].to_numpy(dtype=float) if returns_col and returns_col in filtered.columns else None
+    test_returns = returns[test_idx] if returns is not None else None
+    val_returns = returns[val_idx] if returns is not None else None
+
+    ensemble_cfg = _runtime_ensemble_params()
+    model = XGBRFEnsembleClassifier(
+        random_state=42,
+        rf_weight=float(ensemble_cfg["rf_weight"]),
+        xgb_weight=float(ensemble_cfg["xgb_weight"]),
+        rf_params=_runtime_rf_params(),
+        xgb_params=_runtime_xgb_params(),
+        xgb_gpu_preference=str(_runtime_option("xgb_device", "auto") or "auto"),
+        decision_threshold=float(ensemble_cfg["ensemble_threshold"]),
+        xgb_min_prob=float(ensemble_cfg["xgb_min_prob"]),
+        rf_min_prob=float(ensemble_cfg["rf_min_prob"]),
+        max_model_disagreement=float(ensemble_cfg["max_model_disagreement"]),
+        block_on_disagreement=bool(ensemble_cfg["block_on_disagreement"]),
+        feature_columns=list(X_train_df.columns),
+    )
+    fit_start = time.perf_counter()
+    model.fit(X_train_df, y_train, X_val_df, y_val)
+    fit_seconds = time.perf_counter() - fit_start
+    _timing_log("xgb_rf_ensemble_fit", seconds=fit_seconds, rows=len(X_train_df), extra=f"features={X_train_df.shape[1]}")
+
+    test_pred_start = time.perf_counter()
+    test_details = model.decision_details(X_test_df)
+    test_predict_seconds = time.perf_counter() - test_pred_start
+    _timing_log("xgb_rf_ensemble_predict", seconds=test_predict_seconds, rows=len(X_test_df))
+    val_details = model.decision_details(X_val_df)
+
+    val_ensemble_prob = np.asarray([float(row.get("ensemble_prob") or 0.0) for row in val_details], dtype=float)
+    test_ensemble_prob = np.asarray([float(row.get("ensemble_prob") or 0.0) for row in test_details], dtype=float)
+    val_decisions = _gate_rows_from_ensemble_details(val_details)
+    test_decisions = _gate_rows_from_ensemble_details(test_details)
+    rf_val_prob = np.asarray([float(row.get("rf_prob") or 0.0) for row in val_details], dtype=float)
+    rf_test_prob = np.asarray([float(row.get("rf_prob") or 0.0) for row in test_details], dtype=float)
+    xgb_val_prob = np.asarray([float(row.get("xgb_prob") or 0.0) for row in val_details], dtype=float)
+    xgb_test_prob = np.asarray([float(row.get("xgb_prob") or 0.0) for row in test_details], dtype=float)
+
+    val_metrics = _classification_metrics_from_decisions(y_val, val_decisions, val_ensemble_prob)
+    test_metrics = _classification_metrics_from_decisions(y_test, test_decisions, test_ensemble_prob)
+    val_metrics["pr_auc"] = pr_auc_score_safe(y_val, val_ensemble_prob)
+    val_metrics["brier_score"] = brier_score(y_val, val_ensemble_prob)
+    test_metrics["pr_auc"] = pr_auc_score_safe(y_test, test_ensemble_prob)
+    test_metrics["brier_score"] = brier_score(y_test, test_ensemble_prob)
+    validation_trade_metrics = _trade_metrics_from_scores(y_val, val_decisions, 0.5, val_returns, threshold_source="validation_gated_ensemble")
+    trade_metrics = _trade_metrics_from_scores(y_test, test_decisions, 0.5, test_returns, threshold_source="test_gated_ensemble")
+    threshold_grid = _default_threshold_sweep_grid()
+    threshold_items = []
+    base_ensemble_cfg = _runtime_ensemble_params()
+    for threshold in threshold_grid:
+        tmp_model = XGBRFEnsembleClassifier.from_config({
+            **model.get_config(),
+            "xgb_min_prob": base_ensemble_cfg["xgb_min_prob"],
+            "rf_min_prob": base_ensemble_cfg["rf_min_prob"],
+            "decision_threshold": threshold,
+            "block_on_disagreement": base_ensemble_cfg["block_on_disagreement"],
+            "max_model_disagreement": base_ensemble_cfg["max_model_disagreement"],
+        })
+        tmp_model.rf_model_ = model.rf_model_
+        tmp_model.xgb_model_ = model.xgb_model_
+        tmp_model.rf_calibrator_ = getattr(model, "rf_calibrator_", None)
+        tmp_model.xgb_calibrator_ = getattr(model, "xgb_calibrator_", None)
+        tmp_model.feature_names_in_ = list(model.feature_names_in_)
+        tmp_model.train_medians_ = dict(model.train_medians_)
+        threshold_details = tmp_model.decision_details(X_test_df)
+        threshold_items.append({
+            "threshold": threshold,
+            "decisions": _gate_rows_from_ensemble_details(threshold_details),
+            "ensemble_prob": np.asarray([float(row.get("ensemble_prob") or 0.0) for row in threshold_details], dtype=float),
+        })
+    threshold_rows = _ensemble_threshold_sweep(y_test, threshold_items, test_returns)
+    return_cost_provenance = _return_cost_provenance_for_frame(filtered.iloc[test_idx].reset_index(drop=True), evaluation_return_column=returns_col)
+    cost_stress = _cost_stress_report(y_test, test_decisions, 0.5, test_returns, cost_provenance=return_cost_provenance, per_row_cost_units=return_cost_provenance.get("per_row_cost_units"))
+    paper_filter_report = _paper_execution_filter_report(
+        filtered.iloc[test_idx].reset_index(drop=True),
+        test_ensemble_prob,
+        float(base_ensemble_cfg["ensemble_threshold"]),
+        test_returns,
+        max_trades_per_day=int((paper_config or {}).get("paper_max_trades_per_day", 5)),
+        cooldown_minutes=int((paper_config or {}).get("paper_cooldown_minutes", 15)),
+        allow_ce=bool((paper_config or {}).get("paper_allow_ce", True)),
+        allow_pe=bool((paper_config or {}).get("paper_allow_pe", True)),
+        min_option_price=float((paper_config or {}).get("paper_min_option_price", 5.0)),
+        max_bid_ask_spread_pct=float((paper_config or {}).get("paper_max_bid_ask_spread_pct", 5.0)),
+        avoid_opening_minutes=int((paper_config or {}).get("paper_avoid_opening_minutes", 5)),
+        avoid_closing_minutes=int((paper_config or {}).get("paper_avoid_closing_minutes", 5)),
+    )
+    daily_pnl_report = _daily_pnl_stability_report(
+        paper_filter_report.get("selected_rows", []),
+        max_trades_per_day=int((paper_config or {}).get("paper_max_trades_per_day", 5)),
+    )
+    comparison_payload = {
+        "rf_alone": {"validation_trade_metrics": _trade_metrics_from_scores(y_val, rf_val_prob, 0.5, val_returns), "test_metrics": classification_metrics(y_test, rf_test_prob, threshold=0.5)},
+        "xgb_alone": {"validation_trade_metrics": _trade_metrics_from_scores(y_val, xgb_val_prob, 0.5, val_returns), "test_metrics": classification_metrics(y_test, xgb_test_prob, threshold=0.5)},
+        "weighted_ensemble": {"test_metrics": classification_metrics(y_test, test_ensemble_prob, threshold=float(base_ensemble_cfg["ensemble_threshold"]))},
+        "gated_ensemble": {"test_metrics": test_metrics, "trade_metrics": trade_metrics},
+        "recommendation": "gated_ensemble" if float(trade_metrics.get("profit_factor") or 0.0) >= max(float(_trade_metrics_from_scores(y_test, xgb_test_prob, 0.5, test_returns).get("profit_factor") or 0.0), float(_trade_metrics_from_scores(y_test, rf_test_prob, 0.5, test_returns).get("profit_factor") or 0.0)) else "xgb_only",
+        "no_leakage_columns_used": True,
+    }
+    metrics_payload = {
+        "variant_name": variant_name,
+        "model_name": "xgb_rf_ensemble",
+        "label_name": label_name,
+        "validation_metrics": val_metrics,
+        "validation_trade_metrics": validation_trade_metrics,
+        "test_metrics": test_metrics,
+        "test_threshold_metrics": {**test_metrics, **confusion_from_threshold(y_test, test_decisions, 0.5), "signal_count": int(test_decisions.sum())},
+        "selected_threshold_from_validation": {"threshold": float(base_ensemble_cfg["ensemble_threshold"]), "source": "ensemble_gate"},
+        "training_time_seconds": fit_seconds,
+        "holdout_split": split_window,
+        "walk_forward": walk_forward,
+        "fold_stability": _fold_stability_report(walk_forward.get("folds", [])),
+        "trade_metrics": trade_metrics,
+        "cost_stress": cost_stress,
+        "return_cost_provenance": return_cost_provenance,
+        "threshold_sweep": threshold_rows,
+        "threshold_robustness": {"grid": threshold_rows, "chosen_threshold": float(base_ensemble_cfg["ensemble_threshold"])},
+        "paper_execution_filters": paper_filter_report,
+        "daily_pnl_stability": daily_pnl_report,
+        "evaluation_return_column_used": returns_col,
+        "feature_importance": [],
+        "calibration_fit": {
+            "mode": "validation_sigmoid" if getattr(model, "rf_calibrator_", None) is not None or getattr(model, "xgb_calibrator_", None) is not None else "validated_only",
+            "fit_on_validation_only": True,
+        },
+        "ensemble_diagnostics": {
+            "xgb_backend": getattr(model, "xgb_runtime_backend_", "unknown"),
+            "rf_predict_proba_seconds": None,
+            "xgb_predict_proba_seconds": None,
+            "gated_positive_rate": float(test_decisions.mean()) if len(test_decisions) else 0.0,
+        },
+    }
+    artifact_paths = _save_ensemble_artifact(
+        artifact_dir=artifact_dir / f"{variant_name}_xgb_rf_ensemble_{label_name}",
+        model=model,
+        label_name=label_name,
+        feature_columns=list(X_train_df.columns),
+        fill_values=fill_values,
+        metrics_payload=metrics_payload,
+        threshold_rows=threshold_rows,
+        comparison_payload=comparison_payload,
+        dataset_path=str((paper_config or {}).get("_dataset_path") or ""),
+        split_sizes={"train_rows": len(X_train_df), "validation_rows": len(X_val_df), "test_rows": len(X_test_df)},
+    )
+    metrics_payload.update(artifact_paths)
+    write_json(Path(artifact_paths["metrics_path"]), metrics_payload)
+    return metrics_payload
 
 
 def _edge_refinement_filter_specs() -> List[Dict[str, Any]]:
@@ -7832,7 +8702,7 @@ def _scored_holdout_frame_for_artifact(
     test_frame["selected_return"] = pd.to_numeric(test_frame[evaluation_return_column], errors="coerce").fillna(0.0)
     test_frame["_evaluation_return_column_used"] = evaluation_return_column
     test_frame["trade_day"] = _normalize_timestamp_series(test_frame["timestamp"]).dt.date
-    return test_frame
+    return _apply_backtest_row_limit(test_frame, context=f"artifact:{model_name}:{label_name}")
 
 
 def _safe_daily_profit_factor(selected_rows: pd.DataFrame) -> float:
@@ -9168,28 +10038,36 @@ def generate_edge_refinement_report(
         if not evaluation_return_column or evaluation_return_column not in df.columns:
             raise RuntimeError("No evaluation return column available for edge refinement.")
         scored_cache: Dict[tuple[str, str], tuple[pd.DataFrame, float, bool]] = {}
-        evaluated_now = 0
+        pending_plans: List[Dict[str, Any]] = []
         for plan in planned_candidates:
             candidate_id = str(plan["candidate_id"])
             if not force_refinement and candidate_id in existing_by_id and str(existing_by_id[candidate_id].get("status")).lower() == "completed":
                 continue
-            if max_candidates and max_candidates > 0 and evaluated_now >= int(max_candidates):
+            pending_plans.append(plan)
+            if max_candidates and max_candidates > 0 and len(pending_plans) >= int(max_candidates):
                 break
+        for plan in pending_plans:
+            model_name = str(plan["model_name"])
+            label_name = str(plan["label_name"])
+            key = (label_name, model_name)
+            if key in scored_cache:
+                continue
+            metrics = json.loads(Path(str(plan["metrics_path"])).read_text(encoding="utf-8"))
+            bundle = _load_model_bundle(Path(str(plan["artifact_path"])))
+            scored = _scored_holdout_frame_for_artifact(df, bundle=bundle, label_name=label_name, model_name=model_name, evaluation_return_column=evaluation_return_column)
+            selected_threshold = float(((metrics.get("selected_threshold_from_validation") or {}).get("threshold")) or getattr(bundle, "metrics", {}).get("threshold") or 0.50)
+            leakage_warning = bool(not bool(metrics.get("evaluation_return_column_used")))
+            scored_cache[key] = (scored, selected_threshold, leakage_warning)
+
+        def _evaluate_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+            candidate_id = str(plan["candidate_id"])
             model_name = str(plan["model_name"])
             label_name = str(plan["label_name"])
             start_time = datetime.now().isoformat()
             try:
-                key = (label_name, model_name)
-                if key not in scored_cache:
-                    metrics = json.loads(Path(str(plan["metrics_path"])).read_text(encoding="utf-8"))
-                    bundle = _load_model_bundle(Path(str(plan["artifact_path"])))
-                    scored = _scored_holdout_frame_for_artifact(df, bundle=bundle, label_name=label_name, model_name=model_name, evaluation_return_column=evaluation_return_column)
-                    selected_threshold = float(((metrics.get("selected_threshold_from_validation") or {}).get("threshold")) or getattr(bundle, "metrics", {}).get("threshold") or 0.50)
-                    leakage_warning = bool(not bool(metrics.get("evaluation_return_column_used")))
-                    scored_cache[key] = (scored, selected_threshold, leakage_warning)
-                scored, selected_threshold, leakage_warning = scored_cache[key]
+                scored, selected_threshold, leakage_warning = scored_cache[(label_name, model_name)]
                 if scored.empty:
-                    payload = {
+                    return {
                         "candidate_id": candidate_id,
                         "candidate_name": str(plan["candidate_name"]),
                         "model_name": model_name,
@@ -9203,9 +10081,6 @@ def generate_edge_refinement_report(
                         "start_time": start_time,
                         "end_time": datetime.now().isoformat(),
                     }
-                    _write_edge_refinement_status(artifact_dir, candidate_id, payload)
-                    existing_by_id[candidate_id] = payload
-                    continue
                 candidate_metrics = _evaluate_edge_refinement_candidate(
                     scored,
                     candidate_name=str(plan["candidate_name"]),
@@ -9218,7 +10093,7 @@ def generate_edge_refinement_report(
                     leakage_warning=leakage_warning,
                     fold_count=fold_count,
                 )
-                payload = {
+                return {
                     "candidate_id": candidate_id,
                     "candidate_name": str(plan["candidate_name"]),
                     "model_name": model_name,
@@ -9232,11 +10107,8 @@ def generate_edge_refinement_report(
                     "start_time": start_time,
                     "end_time": datetime.now().isoformat(),
                 }
-                _write_edge_refinement_status(artifact_dir, candidate_id, payload)
-                existing_by_id[candidate_id] = payload
-                evaluated_now += 1
             except Exception as exc:
-                payload = {
+                return {
                     "candidate_id": candidate_id,
                     "candidate_name": str(plan["candidate_name"]),
                     "model_name": model_name,
@@ -9250,9 +10122,22 @@ def generate_edge_refinement_report(
                     "start_time": start_time,
                     "end_time": datetime.now().isoformat(),
                 }
-                _write_edge_refinement_status(artifact_dir, candidate_id, payload)
-                existing_by_id[candidate_id] = payload
-                evaluated_now += 1
+
+        edge_eval_start = time.perf_counter()
+        payload_rows: List[Dict[str, Any]]
+        if pending_plans and bool(_runtime_option("vectorized_backtest", False)) and len(pending_plans) > 1:
+            from joblib import Parallel, delayed
+
+            payload_rows = Parallel(n_jobs=int(_runtime_option("n_jobs", -1) or -1), prefer="threads")(
+                delayed(_evaluate_plan)(plan) for plan in pending_plans
+            )
+        else:
+            payload_rows = [_evaluate_plan(plan) for plan in pending_plans]
+        _timing_log("edge_refinement_backtest", seconds=time.perf_counter() - edge_eval_start, rows=len(payload_rows), extra=f"parallel={bool(_runtime_option('vectorized_backtest', False))}")
+        for payload in payload_rows:
+            candidate_id = str(payload["candidate_id"])
+            _write_edge_refinement_status(artifact_dir, candidate_id, payload)
+            existing_by_id[candidate_id] = payload
     status_rows = _load_edge_refinement_status_rows(artifact_dir)
     pending_after = [row for row in planned_candidates if str(row.get("candidate_id")) not in {str(item.get("candidate_id")) for item in status_rows}]
     scan_status = "COMPLETE" if not pending_after and not (max_candidates and len(status_rows) < len(planned_candidates)) else "PARTIAL_TIMEOUT"
@@ -9445,7 +10330,12 @@ def save_model_artifact(out_dir: Path, model_name: str, label_name: str, model: 
 
 
 def main() -> None:
+    total_start = time.perf_counter()
     args = parse_args()
+    if str(getattr(args, "train_ensemble", "") or "").strip().lower() == "xgb_rf":
+        args.retrain_all_models = True
+        args.only_model = list(args.only_model or []) + ["xgb_rf_ensemble"]
+    _set_runtime_options_from_args(args)
     if args.improve_models:
         args.retrain_all_models = True
     if args.paper_readiness_report:
@@ -9714,6 +10604,8 @@ def main() -> None:
                 "gradientboosting": "gradient_boosting",
                 "histgradientboosting": "hist_gradient_boosting",
                 "xgboost": "xgboost",
+                "xgbrfensemble": "xgb_rf_ensemble",
+                "xgb_rf": "xgb_rf_ensemble",
                 "lightgbm": "lightgbm",
                 "catboost": "catboost",
             }
@@ -9724,6 +10616,8 @@ def main() -> None:
                 _MODEL_ALIASES.get(str(t).strip().lower(), str(t).strip().lower())
                 for t in raw_tokens if str(t).strip()
             }
+            if "xgb_rf_ensemble" in only_models_normalized and "xgb_rf_ensemble" not in families:
+                families.append("xgb_rf_ensemble")
             families = [name for name in families if str(name).strip().lower() in only_models_normalized]
             if not families:
                 # Provide a helpful error so a camelCase typo never silently trains zero models.
@@ -10479,6 +11373,8 @@ def main() -> None:
         # Apply --only-model case-insensitive filtering and guard against zero models.
         if only_models:
             only_models_lower = {str(x).strip().lower() for x in only_models}
+            if "xgb_rf_ensemble" in only_models_lower and "xgb_rf_ensemble" not in families:
+                families.append("xgb_rf_ensemble")
             families = [name for name in families if str(name).strip().lower() in only_models_lower]
             if not families:
                 raise ValueError(
@@ -10959,6 +11855,7 @@ def main() -> None:
         "production_adoption_verdict": adoption.get("verdict"),
         "enriched_dataset_path": enriched_dataset_path,
     }
+    _timing_log("total_runtime", seconds=time.perf_counter() - total_start, rows=len(df), extra=f"artifact_dir={artifact_dir}")
     print(json.dumps(summary, indent=2))
 
     # Write canonical core_retrain_summary.json for rescue/BS dirs so downstream

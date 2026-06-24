@@ -1426,7 +1426,8 @@ def route_candidate_decision(
             cdir = _P(candidate_dir) / str(cid)
             for candp in [cdir, _P(candidate_dir)]:
                 for cand in candp.glob("*.pkl"):
-                    if "metrics" not in cand.name.lower() and "ensemble" not in cand.name.lower():
+                    low_name = cand.name.lower()
+                    if all(tok not in low_name for tok in ("metrics", "ensemble_weight", "threshold", "report", "summary")):
                         model_pkl = str(cand)
                         break
                 if model_pkl:

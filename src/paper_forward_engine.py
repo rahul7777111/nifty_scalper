@@ -917,6 +917,14 @@ class PaperForwardCandidateRuntimeState:
         self.missing_features: List[str] = []
         self.last_action = ""
         self.raw_reason = ""
+        self.ensemble_prob: Optional[float] = None
+        self.xgb_prob: Optional[float] = None
+        self.rf_prob: Optional[float] = None
+        self.block_reason = ""
+        self.allowed: Optional[bool] = None
+        self.model_type = ""
+        self.feature_missing_count = 0
+        self.feature_invalid_count = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return self.__dict__.copy()
@@ -3164,6 +3172,43 @@ class PaperForwardEngine:
         cs.data_quality = decision.get("debug", {}).get("data_quality_status", "") or decision.get("data_quality_status", cs.data_quality)
         cs.missing_features = decision.get("missing_features", cs.missing_features)
         cs.last_action = decision.get("simulated_action", decision.get("paper_action", cs.last_action))
+        cs.block_reason = str(
+            decision.get("block_reason")
+            or decision.get("no_trade_reason")
+            or decision.get("reason_code")
+            or cs.block_reason
+            or ""
+        )
+        if "allowed" in decision:
+            try:
+                cs.allowed = bool(decision.get("allowed"))
+            except Exception:
+                cs.allowed = None
+        if "model_type" in decision:
+            cs.model_type = str(decision.get("model_type") or cs.model_type or "")
+        if "feature_missing_count" in decision:
+            try:
+                cs.feature_missing_count = int(decision.get("feature_missing_count") or 0)
+            except Exception:
+                cs.feature_missing_count = 0
+        elif decision.get("missing_features") is not None:
+            try:
+                cs.feature_missing_count = len(decision.get("missing_features") or [])
+            except Exception:
+                cs.feature_missing_count = 0
+        if "feature_invalid_count" in decision:
+            try:
+                cs.feature_invalid_count = int(decision.get("feature_invalid_count") or 0)
+            except Exception:
+                cs.feature_invalid_count = 0
+        for attr_name in ("ensemble_prob", "xgb_prob", "rf_prob"):
+            if attr_name not in decision:
+                continue
+            raw_val = decision.get(attr_name)
+            try:
+                setattr(cs, attr_name, None if raw_val in (None, "") else float(raw_val))
+            except Exception:
+                setattr(cs, attr_name, None)
 
         # paper pos / pnl from decision or state
         if "position_status" in decision:
@@ -3259,6 +3304,14 @@ class PaperForwardEngine:
         st["losses"] = cs.losses
         st["win_rate"] = cs.win_rate
         st["max_drawdown"] = cs.max_drawdown
+        st["ensemble_prob"] = cs.ensemble_prob
+        st["xgb_prob"] = cs.xgb_prob
+        st["rf_prob"] = cs.rf_prob
+        st["block_reason"] = cs.block_reason
+        st["allowed"] = cs.allowed
+        st["model_type"] = cs.model_type
+        st["feature_missing_count"] = cs.feature_missing_count
+        st["feature_invalid_count"] = cs.feature_invalid_count
 
         pf_log(
             "DEBUG",
@@ -4041,6 +4094,11 @@ class PaperForwardEngine:
                         "predict_attempted": False,
                         "simulated_action": "NONE",
                         "route_error": False,
+                        "block_reason": reason,
+                        "allowed": False,
+                        "model_type": str(cand.get("model_name") or "unknown"),
+                        "feature_missing_count": len(missing or []),
+                        "feature_invalid_count": int(feature_debug.get("feature_invalid_count") or feature_debug.get("feature_nan_count") or 0),
                         "_skip_eval_count": reason in (
                             "token_not_verified",
                             "session_expired",
@@ -4155,6 +4213,24 @@ class PaperForwardEngine:
                     scaler_ap = bool(pdbg.get("scaler_applied", dec.get("debug", {}).get("scaler_applied", False)))
                     cal_ap = bool(pdbg.get("calibrator_applied", dec.get("debug", {}).get("calibrator_applied", False)))
                     conf_val = dec.get("confidence")
+                    dec.setdefault("block_reason", dec.get("no_trade_reason") or dec.get("reason_code") or "")
+                    if "allowed" not in dec:
+                        dec["allowed"] = all(
+                            dec.get(flag_name) is not False
+                            for flag_name in (
+                                "allowed_by_model",
+                                "allowed_by_side_policy",
+                                "allowed_by_liquidity",
+                                "allowed_by_cost",
+                                "allowed_by_risk",
+                            )
+                        )
+                    dec.setdefault("model_type", str(cand.get("model_name") or model_type or "unknown"))
+                    dec.setdefault("feature_missing_count", len(missing or []))
+                    dec.setdefault(
+                        "feature_invalid_count",
+                        int(feature_debug.get("feature_invalid_count") or feature_debug.get("feature_nan_count") or 0),
+                    )
                     predict_ms += (time.perf_counter() - pred_t0) * 1000.0
                     log_paper_fwd_predict(
                         candidate_id=cid,
@@ -5159,6 +5235,14 @@ class PaperForwardEngine:
                 "last_mark_time": st.get("last_mark_time", ""),
                 "cost_quality": st.get("cost_quality", "APPROX"),
                 "synthetic_mode": bool(st.get("synthetic_mode")),
+                "ensemble_prob": st.get("ensemble_prob"),
+                "xgb_prob": st.get("xgb_prob"),
+                "rf_prob": st.get("rf_prob"),
+                "block_reason": st.get("block_reason") or st.get("last_no_trade_reason"),
+                "allowed": st.get("allowed"),
+                "model_type": st.get("model_type") or c.get("model_name", ""),
+                "feature_missing_count": st.get("feature_missing_count", len(st.get("missing_features") or [])),
+                "feature_invalid_count": st.get("feature_invalid_count", 0),
                 "unrealized_pnl": round(st.get("unrealized_pnl", 0.0), 2),
                 "realized_pnl": round(st.get("realized_pnl", 0.0), 2),
                 "total_trades": st.get("total_trades", 0),
@@ -5222,6 +5306,14 @@ class PaperForwardEngine:
                 ),
                 "final_signal": st.get("last_signal"),
                 "reason": st.get("last_no_trade_reason"),
+                "ensemble_prob": st.get("ensemble_prob"),
+                "xgb_prob": st.get("xgb_prob"),
+                "rf_prob": st.get("rf_prob"),
+                "block_reason": st.get("block_reason") or st.get("last_no_trade_reason"),
+                "allowed": st.get("allowed"),
+                "model_type": st.get("model_type") or c.get("model_name"),
+                "feature_missing_count": st.get("feature_missing_count", len(st.get("missing_features") or [])),
+                "feature_invalid_count": st.get("feature_invalid_count", 0),
                 "selected_strike": st.get("selected_strike"),
                 "selected_option_type": st.get("selected_option_type"),
                 "selected_symbol": st.get("selected_symbol"),

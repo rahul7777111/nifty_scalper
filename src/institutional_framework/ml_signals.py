@@ -38,7 +38,7 @@ class DynamicConsensusEnsemble:
             'min_samples_leaf': 20,
             'max_features': 'sqrt',
             'bootstrap': True,
-            'n_jobs': 2,
+            'n_jobs': -1,
             'random_state': 42
         }
         self.xgb_params = {

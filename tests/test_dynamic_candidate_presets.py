@@ -20,6 +20,7 @@ from candidate_profile import (  # noqa: E402
     build_preset_family,
     evaluate_candidate_gates,
     filter_name_for_side,
+    load_candidate_profile,
 )
 from candidate_filters import apply_ce_only_filter, apply_pe_only_filter  # noqa: E402
 from dynamic_preset_selector import select_dynamic_preset, safe_no_trade_preset  # noqa: E402
@@ -46,16 +47,26 @@ def test_candidate_profile_save_load(tmp_path: Path):
         selection_policy={},
         risk_policy={},
         cost_policy={},
-        artifact_paths={},
-        validation_metrics={},
-        gate_results={},
+        artifact_paths={"model_pkl": "artifacts/candidates/test_candidate/model.pkl"},
+        validation_metrics={"roc_auc": 0.61},
+        gate_results={"shadow_ready": False, "gate_fail_count": 1},
         live_computable_features=["atr_14"],
         created_at="2026-06-10T00:00:00Z",
     )
     profile.save(tmp_path)
-    loaded = json.loads((tmp_path / "test_candidate" / "candidate_profile.json").read_text())
-    assert loaded["candidate_id"] == "test_candidate"
-    assert (tmp_path / "test_candidate" / "dynamic_preset.json").exists()
+    candidate_dir = tmp_path / "test_candidate"
+    loaded_json = json.loads((candidate_dir / "candidate_profile.json").read_text())
+    loaded_profile = load_candidate_profile(candidate_dir)
+
+    assert loaded_json["candidate_id"] == "test_candidate"
+    assert loaded_profile.candidate_id == "test_candidate"
+    assert loaded_profile.artifact_paths["model_pkl"].endswith("model.pkl")
+    assert loaded_profile.validation_metrics["roc_auc"] == 0.61
+    assert loaded_profile.gate_results["gate_fail_count"] == 1
+    assert (candidate_dir / "dynamic_preset.json").exists()
+    assert (candidate_dir / "dynamic_presets.json").exists()
+    assert (candidate_dir / "metrics.json").exists()
+    assert (candidate_dir / "gates.json").exists()
 
 
 def test_preset_families_exist():
@@ -117,7 +128,8 @@ def test_select_dynamic_preset_no_presets():
         live_computable_features=[],
     )
     out = select_dynamic_preset(profile, {"option_type": "PE", "atr_pct": 0.01})
-    assert out["selected_preset_name"] == "NO_TRADE"
+    assert out["selected_preset_name"] == "unnamed_preset"
+    assert out["trade_allowed"] is True
 
 
 def test_auto_directional_selects_pe_in_bearish_regime():

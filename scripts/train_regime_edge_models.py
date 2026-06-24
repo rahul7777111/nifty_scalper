@@ -91,7 +91,7 @@ def build_model(family: str, random_state: int = 42):
             max_depth=10,
             min_samples_leaf=100,
             class_weight="balanced",
-            n_jobs=4,
+            n_jobs=-1,
             random_state=random_state,
         )
     elif family == "hist_gradient_boosting":

@@ -754,6 +754,7 @@ def walk_forward_backtest(
                 random_state=42,
                 min_samples_leaf=2,
                 class_weight="balanced_subsample",
+                n_jobs=-1,
             )
 
     folds: List[Dict[str, Any]] = []

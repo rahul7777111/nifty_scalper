@@ -61,6 +61,19 @@ MAX_NAN_RATIO = _env_float("PAPER_FORWARD_MAX_FEATURE_NAN_RATIO", 0.02)
 MAX_ZERO_RATIO = _env_float("PAPER_FORWARD_MAX_FEATURE_ZERO_RATIO", 0.90)
 MAX_CONSTANT_FEATURES = int(_env_float("PAPER_FORWARD_MAX_CONSTANT_FEATURES", 120))
 
+_ENSEMBLE_COMPONENT_KEYS = {
+    "xgb": ("xgb_model", "xgb_model_", "xgboost_model", "xgboost_model_"),
+    "rf": ("rf_model", "rf_model_", "random_forest_model", "random_forest_model_"),
+}
+
+
+def _looks_like_model_pickle(path: Path) -> bool:
+    name = path.name.lower()
+    if path.suffix.lower() != ".pkl":
+        return False
+    blocked = ("metric", "threshold", "ensemble_weight", "oof", "report", "summary")
+    return not any(tok in name for tok in blocked)
+
 
 def _find_positive_class_index(model: Any) -> Optional[int]:
     """Locate positive class (label=1) index in model.classes_."""
@@ -244,11 +257,170 @@ def _infer_xgb_probability(model: Any, X: Any, feature_names: List[str] | None) 
     raise RuntimeError("no_supported_predict_method")
 
 
+def _extract_named_component(container: Any, keys: tuple[str, ...]) -> Any:
+    if container is None:
+        return None
+    if isinstance(container, dict):
+        for key in keys:
+            if container.get(key) is not None:
+                return container.get(key)
+    for key in keys:
+        if hasattr(container, key):
+            try:
+                value = getattr(container, key)
+            except Exception:
+                continue
+            if value is not None:
+                return value
+    return None
+
+
+def _extract_component_weight(container: Any, family: str) -> float | None:
+    family_key = "rf" if family == "rf" else "xgb"
+    direct_keys = (
+        f"{family_key}_weight",
+        f"{family_key}_model_weight",
+        f"{family_key}_probability_weight",
+    )
+    weights_obj = None
+    if isinstance(container, dict):
+        weights_obj = container.get("weights") or container.get("model_weights")
+        for key in direct_keys:
+            if container.get(key) not in (None, ""):
+                try:
+                    return float(container.get(key))
+                except Exception:
+                    return None
+    else:
+        for attr in ("weights", "model_weights"):
+            if hasattr(container, attr):
+                try:
+                    weights_obj = getattr(container, attr)
+                    break
+                except Exception:
+                    pass
+        for key in direct_keys:
+            if hasattr(container, key):
+                try:
+                    return float(getattr(container, key))
+                except Exception:
+                    return None
+    if isinstance(weights_obj, dict):
+        aliases = [family_key, family, "random_forest" if family_key == "rf" else "xgboost"]
+        for key in aliases:
+            if weights_obj.get(key) not in (None, ""):
+                try:
+                    return float(weights_obj.get(key))
+                except Exception:
+                    return None
+    return None
+
+
+def _extract_xgb_rf_components(container: Any) -> tuple[Any, Any, float, float] | None:
+    xgb_model = _extract_named_component(container, _ENSEMBLE_COMPONENT_KEYS["xgb"])
+    rf_model = _extract_named_component(container, _ENSEMBLE_COMPONENT_KEYS["rf"])
+    if xgb_model is None or rf_model is None:
+        return None
+    xgb_weight = _extract_component_weight(container, "xgb")
+    rf_weight = _extract_component_weight(container, "rf")
+    if xgb_weight is None and rf_weight is None:
+        xgb_weight = 0.5
+        rf_weight = 0.5
+    elif xgb_weight is None:
+        rf_weight = float(rf_weight)
+        xgb_weight = max(0.0, 1.0 - rf_weight)
+    elif rf_weight is None:
+        xgb_weight = float(xgb_weight)
+        rf_weight = max(0.0, 1.0 - xgb_weight)
+    return xgb_model, rf_model, float(xgb_weight), float(rf_weight)
+
+
+def _infer_xgb_rf_ensemble_probability(
+    container: Any,
+    X: Any,
+    feature_names: List[str] | None,
+) -> Tuple[float, float, str]:
+    components = _extract_xgb_rf_components(container)
+    if components is None:
+        raise RuntimeError("xgb_rf_ensemble_components_missing")
+    xgb_model, rf_model, xgb_weight, rf_weight = components
+    total_weight = xgb_weight + rf_weight
+    if total_weight <= 0:
+        xgb_weight = 0.5
+        rf_weight = 0.5
+        total_weight = 1.0
+    _, xgb_prob, _ = _infer_xgb_probability(xgb_model, X, feature_names)
+    _, rf_prob, _ = _extract_probability(rf_model, X)
+    prob = ((xgb_prob * xgb_weight) + (rf_prob * rf_weight)) / total_weight
+    prob = float(max(0.0, min(1.0, prob)))
+    return prob, prob, "xgb_rf_ensemble_predict_proba"
+
+
+def _infer_xgb_rf_ensemble_details(
+    container: Any,
+    X: Any,
+    feature_names: List[str] | None,
+) -> Dict[str, Any]:
+    details_fn = getattr(container, "decision_details", None)
+    if callable(details_fn):
+        try:
+            rows = details_fn(X)
+            row0 = rows[0] if rows else {}
+            if isinstance(row0, dict):
+                ensemble_prob = row0.get("ensemble_prob", row0.get("combined_probability"))
+                xgb_prob = row0.get("xgb_prob")
+                rf_prob = row0.get("rf_prob")
+                return {
+                    "raw": float(ensemble_prob) if ensemble_prob is not None else None,
+                    "prob": float(ensemble_prob) if ensemble_prob is not None else None,
+                    "method": "xgb_rf_ensemble_decision_details",
+                    "ensemble_prob": None if ensemble_prob is None else float(ensemble_prob),
+                    "xgb_prob": None if xgb_prob is None else float(xgb_prob),
+                    "rf_prob": None if rf_prob is None else float(rf_prob),
+                    "model_disagreement": None if row0.get("model_disagreement") is None else float(row0.get("model_disagreement")),
+                    "allowed": bool(row0.get("final_allowed")),
+                    "block_reason": row0.get("block_reason"),
+                }
+        except Exception:
+            pass
+
+    raw, prob, method = _infer_xgb_rf_ensemble_probability(container, X, feature_names)
+    components = _extract_xgb_rf_components(container)
+    xgb_prob = None
+    rf_prob = None
+    disagreement = None
+    if components is not None:
+        xgb_model, rf_model, _, _ = components
+        try:
+            _, xgb_prob, _ = _infer_xgb_probability(xgb_model, X, feature_names)
+        except Exception:
+            xgb_prob = None
+        try:
+            _, rf_prob, _ = _extract_probability(rf_model, X)
+        except Exception:
+            rf_prob = None
+        if xgb_prob is not None and rf_prob is not None:
+            disagreement = abs(float(xgb_prob) - float(rf_prob))
+    return {
+        "raw": raw,
+        "prob": prob,
+        "method": method,
+        "ensemble_prob": prob,
+        "xgb_prob": xgb_prob,
+        "rf_prob": rf_prob,
+        "model_disagreement": disagreement,
+        "allowed": None,
+        "block_reason": None,
+    }
+
+
 def _merge_predict_out(base: Dict[str, Any], debug: Dict[str, Any]) -> Dict[str, Any]:
     err = base.get("error")
     preserve = {
         "raw", "prob", "confidence", "predict_method", "decision", "error",
         "missing_features", "classes_", "artifact_path", "model_present", "X_shape",
+        "ensemble_prob", "xgb_prob", "rf_prob", "model_disagreement", "allowed", "block_reason",
+        "feature_missing_count", "feature_invalid_count", "model_type",
     }
     merged = dict(debug)
     merged.update(base)
@@ -538,7 +710,7 @@ def predict_confidence_from_artifact(
                 pkl_path = mp
                 break
             for f in candp.glob("*.pkl"):
-                if "metric" not in f.name.lower() and "ensemble" not in f.name.lower():
+                if _looks_like_model_pickle(f):
                     pkl_path = f
                     break
             if pkl_path:
@@ -714,8 +886,30 @@ def predict_confidence_from_artifact(
             pass
 
     try:
+        ensemble_components = _extract_xgb_rf_components(inner_model) or _extract_xgb_rf_components(bundle)
         is_xgb = "xgb" in str(type(est)).lower() or str(getattr(est, "__module__", "")).startswith("xgboost")
-        if is_xgb:
+        if ensemble_components is not None:
+            debug["model_class"] = type(inner_model).__name__ if not isinstance(inner_model, dict) else "xgb_rf_ensemble"
+            ensemble_details = _infer_xgb_rf_ensemble_details(
+                inner_model if ensemble_components is not None and _extract_xgb_rf_components(inner_model) is not None else bundle,
+                X,
+                fo if fo else None,
+            )
+            raw = ensemble_details.get("raw")
+            prob = ensemble_details.get("prob")
+            method = str(ensemble_details.get("method") or "xgb_rf_ensemble_predict_proba")
+            debug.update(
+                {
+                    "ensemble_prob": ensemble_details.get("ensemble_prob"),
+                    "xgb_prob": ensemble_details.get("xgb_prob"),
+                    "rf_prob": ensemble_details.get("rf_prob"),
+                    "model_disagreement": ensemble_details.get("model_disagreement"),
+                    "allowed": ensemble_details.get("allowed"),
+                    "block_reason": ensemble_details.get("block_reason"),
+                    "model_type": "xgb_rf_ensemble",
+                }
+            )
+        elif is_xgb:
             raw, prob, method = _infer_xgb_probability(est, X, fo if fo else None)
         else:
             raw, prob, method = _extract_probability(est if calibrator is None else inner_model, X)
@@ -748,6 +942,15 @@ def predict_confidence_from_artifact(
                 "classes_": list(classes_) if classes_ is not None else None,
                 "X_shape": feat_debug.get("X_shape"),
                 "missing_features": [],
+                "feature_missing_count": 0,
+                "feature_invalid_count": 0,
+                "ensemble_prob": debug.get("ensemble_prob"),
+                "xgb_prob": debug.get("xgb_prob"),
+                "rf_prob": debug.get("rf_prob"),
+                "model_disagreement": debug.get("model_disagreement"),
+                "allowed": debug.get("allowed"),
+                "block_reason": debug.get("block_reason"),
+                "model_type": debug.get("model_type", debug.get("model_class")),
             },
             debug,
         )

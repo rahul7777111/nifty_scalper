@@ -1058,6 +1058,165 @@ def _model_is_predictable(obj: Any) -> bool:
     return obj is not None and any(hasattr(obj, attr) for attr in ("predict_proba", "decision_function", "predict"))
 
 
+class _XgbRfEnsembleAdapter:
+    def __init__(
+        self,
+        *,
+        xgb_model: Any,
+        rf_model: Any,
+        xgb_weight: float = 0.5,
+        rf_weight: float = 0.5,
+        feature_names: Optional[List[str]] = None,
+    ) -> None:
+        self.xgb_model = xgb_model
+        self.rf_model = rf_model
+        self.xgb_weight = float(xgb_weight)
+        self.rf_weight = float(rf_weight)
+        self.feature_names_in_ = list(feature_names or [])
+        self.classes_ = [0, 1]
+
+    def _predict_positive_prob(self, model: Any, X: Any) -> Any:
+        import numpy as np
+
+        X_input = X
+        if hasattr(model, "feature_names_in_") and not hasattr(X, "columns"):
+            try:
+                import pandas as pd
+
+                X_input = pd.DataFrame(X, columns=self.feature_names_in_ or list(getattr(model, "feature_names_in_", [])))
+            except Exception:
+                X_input = X
+        if hasattr(model, "predict_proba"):
+            probs = np.asarray(model.predict_proba(X_input), dtype=float)
+            if probs.ndim != 2:
+                raise RuntimeError("predict_proba returned invalid shape")
+            classes = list(getattr(model, "classes_", []))
+            if 1 in classes:
+                idx = classes.index(1)
+            else:
+                idx = 1 if probs.shape[1] > 1 else 0
+            return probs[:, idx]
+        if hasattr(model, "decision_function"):
+            raw = np.asarray(model.decision_function(X_input), dtype=float).reshape(-1)
+            return 1.0 / (1.0 + np.exp(-raw))
+        if hasattr(model, "predict"):
+            raw = np.asarray(model.predict(X_input), dtype=float).reshape(-1)
+            return np.clip(raw, 0.0, 1.0)
+        raise RuntimeError("ensemble component has no predict method")
+
+    def predict_proba(self, X: Any) -> Any:
+        import numpy as np
+
+        X_input = X
+        if hasattr(X, "loc"):
+            X_input = X.loc[:, self.feature_names_in_] if self.feature_names_in_ else X
+        total_weight = self.xgb_weight + self.rf_weight
+        if total_weight <= 0:
+            total_weight = 1.0
+            xgb_weight = 0.5
+            rf_weight = 0.5
+        else:
+            xgb_weight = self.xgb_weight
+            rf_weight = self.rf_weight
+        xgb_probs = self._predict_positive_prob(self.xgb_model, X_input)
+        rf_probs = self._predict_positive_prob(self.rf_model, X_input)
+        positive = ((xgb_probs * xgb_weight) + (rf_probs * rf_weight)) / total_weight
+        positive = np.clip(np.asarray(positive, dtype=float).reshape(-1), 0.0, 1.0)
+        return np.column_stack([1.0 - positive, positive])
+
+    def predict(self, X: Any) -> Any:
+        import numpy as np
+
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+    def decision_function(self, X: Any) -> Any:
+        return self.predict_proba(X)[:, 1] - 0.5
+
+
+def _extract_named_component(container: Any, keys: Iterable[str]) -> Any:
+    if container is None:
+        return None
+    if isinstance(container, dict):
+        for key in keys:
+            if container.get(key) is not None:
+                return container.get(key)
+    for key in keys:
+        if hasattr(container, key):
+            try:
+                value = getattr(container, key)
+            except Exception:
+                continue
+            if value is not None:
+                return value
+    return None
+
+
+def _extract_component_weight(container: Any, family: str) -> float | None:
+    family_key = "rf" if family == "rf" else "xgb"
+    direct_keys = (
+        f"{family_key}_weight",
+        f"{family_key}_model_weight",
+        f"{family_key}_probability_weight",
+    )
+    weights_obj = None
+    if isinstance(container, dict):
+        weights_obj = container.get("weights") or container.get("model_weights")
+        for key in direct_keys:
+            if container.get(key) not in (None, ""):
+                try:
+                    return float(container.get(key))
+                except Exception:
+                    return None
+    else:
+        for attr in ("weights", "model_weights"):
+            if hasattr(container, attr):
+                try:
+                    weights_obj = getattr(container, attr)
+                    break
+                except Exception:
+                    pass
+        for key in direct_keys:
+            if hasattr(container, key):
+                try:
+                    return float(getattr(container, key))
+                except Exception:
+                    return None
+    if isinstance(weights_obj, dict):
+        aliases = [family_key, family, "random_forest" if family_key == "rf" else "xgboost"]
+        for key in aliases:
+            if weights_obj.get(key) not in (None, ""):
+                try:
+                    return float(weights_obj.get(key))
+                except Exception:
+                    return None
+    return None
+
+
+def _extract_xgb_rf_ensemble_estimator(obj: Any, feature_cols: Optional[List[str]] = None) -> Any:
+    xgb_model = _extract_named_component(obj, ("xgb_model", "xgb_model_", "xgboost_model", "xgboost_model_"))
+    rf_model = _extract_named_component(obj, ("rf_model", "rf_model_", "random_forest_model", "random_forest_model_"))
+    if xgb_model is None or rf_model is None:
+        return None
+    xgb_weight = _extract_component_weight(obj, "xgb")
+    rf_weight = _extract_component_weight(obj, "rf")
+    if xgb_weight is None and rf_weight is None:
+        xgb_weight = 0.5
+        rf_weight = 0.5
+    elif xgb_weight is None:
+        rf_weight = float(rf_weight)
+        xgb_weight = max(0.0, 1.0 - rf_weight)
+    elif rf_weight is None:
+        xgb_weight = float(xgb_weight)
+        rf_weight = max(0.0, 1.0 - xgb_weight)
+    return _XgbRfEnsembleAdapter(
+        xgb_model=xgb_model,
+        rf_model=rf_model,
+        xgb_weight=float(xgb_weight),
+        rf_weight=float(rf_weight),
+        feature_names=list(feature_cols or []),
+    )
+
+
 def _find_predictable_model(obj: Any, depth: int = 0) -> Any:
     if obj is None or depth > 5:
         return None
@@ -1372,9 +1531,18 @@ def _normalize_loaded_artifact(
     use_candidate_thresholds: bool,
 ) -> LoadedCandidateModel:
     introspection = extract_model_feature_order(obj, artifact_path)
+    feature_cols = [str(x) for x in (introspection.get("feature_order") or [])]
     estimator = introspection.get("model")
+    if estimator is None or not _model_is_predictable(estimator):
+        ensemble_estimator = _extract_xgb_rf_ensemble_estimator(obj, feature_cols=feature_cols)
+        if ensemble_estimator is not None:
+            estimator = ensemble_estimator
     if not _model_is_predictable(estimator):
         estimator = _extract_first(obj, ESTIMATOR_KEYS)
+    if estimator is not None and not _model_is_predictable(estimator):
+        ensemble_estimator = _extract_xgb_rf_ensemble_estimator(estimator, feature_cols=feature_cols)
+        if ensemble_estimator is not None:
+            estimator = ensemble_estimator
     if estimator is None and _model_is_predictable(obj):
         estimator = obj
     if estimator is None:
@@ -1388,7 +1556,6 @@ def _normalize_loaded_artifact(
                 estimator = Pipeline([("scaler", scaler), ("model", estimator)])
             except Exception:
                 pass
-    feature_cols = [str(x) for x in (introspection.get("feature_order") or [])]
     threshold_val = _extract_first(obj, THRESHOLD_KEYS)
     if threshold_val is not None and use_candidate_thresholds:
         th = _safe_float(threshold_val, _candidate_threshold(cand, fallback_threshold, use_candidate_thresholds=True))
@@ -1396,6 +1563,11 @@ def _normalize_loaded_artifact(
             th /= 100.0
     else:
         th = _candidate_threshold(cand, fallback_threshold, use_candidate_thresholds=use_candidate_thresholds)
+    resolved_model_type = str(introspection.get("model_type") or "")
+    if isinstance(estimator, _XgbRfEnsembleAdapter):
+        resolved_model_type = "xgb_rf_ensemble"
+    elif not resolved_model_type or resolved_model_type == "dict":
+        resolved_model_type = type(estimator).__name__
     return LoadedCandidateModel(
         candidate_id=str(cand.get("candidate_id") or cand.get("id") or artifact_path.stem),
         artifact_path=artifact_path,
@@ -1404,7 +1576,7 @@ def _normalize_loaded_artifact(
         threshold=float(th),
         metadata={**_extract_metadata(obj), **(introspection.get("metadata") or {})},
         feature_source=str(introspection.get("feature_source") or ""),
-        model_type=str(introspection.get("model_type") or type(estimator).__name__),
+        model_type=resolved_model_type,
         option_type_filter=_candidate_option_types(cand),
         filters=cand.get("filters") or cand.get("entry_filters") or {},
         preset=cand.get("preset") if isinstance(cand.get("preset"), dict) else {},

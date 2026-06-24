@@ -55,6 +55,22 @@ def test_embedded_score_backtest_generates_trades(tmp_path: Path) -> None:
     assert result.summary["total_trades"] > 0
     assert result.summary["selected_score_column"] == "pred_proba"
     assert result.summary["rows_above_threshold"] > 0
+    trades = pd.read_csv(result.output_paths["trades_csv"])
+    assert {
+        "candidate_id",
+        "entry_ts",
+        "exit_ts",
+        "symbol",
+        "option_type",
+        "entry_price",
+        "exit_price",
+        "gross_pnl",
+        "cost",
+        "net_pnl",
+        "exit_reason",
+        "model_score",
+        "bars_held",
+    }.issubset(trades.columns)
 
 
 def test_threshold_parsed_from_candidate_id() -> None:

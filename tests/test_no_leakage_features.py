@@ -299,6 +299,37 @@ def test_safe_features_included() -> None:
     # Note: columns with 'return' in name (like return_5m_past) are blocked by design
 
 
+def test_select_feature_columns_retains_numeric_and_bool_but_not_object_columns() -> None:
+    """Safe numeric/bool columns should survive feature selection; object columns should not."""
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-06-01 09:15:00", periods=5, freq="min"),
+            "ltp": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "volume": [1000, 1001, 1002, 1003, 1004],
+            "regime_volatile": pd.Series([True, False, True, False, True], dtype=bool),
+            "is_opening_session": pd.Series([True, True, False, False, False], dtype="boolean"),
+            "option_type": ["CE", "PE", "CE", "PE", "CE"],
+            "symbol": ["NIFTY"] * 5,
+            "profitable_trade_label": [1, 0, 1, 0, 1],
+            "future_close": [105.0, 106.0, 107.0, 108.0, 109.0],
+            "realized_pnl_flag": pd.Series([True, False, True, False, True], dtype=bool),
+        }
+    )
+
+    groups = retrain.detect_column_groups(df)
+    features = set(groups["input_features"])
+
+    assert "ltp" in features
+    assert "volume" in features
+    assert "regime_volatile" in features
+    assert "is_opening_session" in features
+    assert "option_type" not in features
+    assert "symbol" not in features
+    assert "profitable_trade_label" not in features
+    assert "future_close" not in features
+    assert "realized_pnl_flag" not in features
+
+
 def test_return_column_candidates_detected() -> None:
     """Return column candidates should be detected."""
     df = _make_leakage_test_dataset()

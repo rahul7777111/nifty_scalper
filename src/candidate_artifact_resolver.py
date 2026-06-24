@@ -16,6 +16,7 @@ CANDIDATES_SUBDIR = "artifacts/candidates"
 MODEL_FILENAME = "model.pkl"
 
 KNOWN_MODEL_FAMILIES = (
+    "xgb_rf_ensemble",
     "calibrated_logistic_regression",
     "logistic_regression",
     "elasticnet",

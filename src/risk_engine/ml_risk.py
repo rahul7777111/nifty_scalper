@@ -103,7 +103,7 @@ class MLRiskEngine:
         X_feats = X[feature_cols]
 
         # Train Failure Classifier (Random Forest)
-        rf_fail = RandomForestClassifier(n_estimators=50, random_state=42)
+        rf_fail = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
         rf_fail.fit(X_feats, y_fail)
 
         # Train Drawdown Classifier (Gradient Boosting)
