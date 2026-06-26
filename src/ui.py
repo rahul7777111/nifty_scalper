@@ -3,7 +3,10 @@ from __future__ import annotations
 import builtins
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
+SRC_DIR = Path(__file__).parent
+REPO_ROOT = SRC_DIR.parent
+sys.path.insert(0, str(SRC_DIR))
+sys.path.insert(0, str(REPO_ROOT))
 
 
 def _safe_print(*args, **kwargs):
@@ -149,7 +152,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from collections import deque
 from typing import Any, Dict, List, Optional
@@ -173,74 +176,15 @@ from dhan_auth import (
 from config import load_api_config, load_persisted_env, load_strategy_config, persist_settings_env
 from ml_model_registry import MLModelRegistry
 from ml_paper_risk_manager import MLPaperRiskManager
-from paper_forward_engine import (
-    PaperForwardEngine,
-    PaperForwardDataStatus,
-    PaperForwardAuthState,
-    PaperForwardRuntime,
-    _compute_option_pnl,
-    format_paper_forward_confidence,
-)  # PHASE for multi paper forward monitor
-from synthetic_option_chain import (
-    CHAIN_SOURCE as BS_CHAIN_SOURCE,
-    build_spot_candle_fallback,
-    generate_synthetic_option_chain,
-    infer_paper_forward_data_quality,
-    is_synthetic_chain_enabled,
-    map_paper_forward_reason,
-    load_bs_config,
-)
-from paper_forward_spot import (
-    resolve_live_spot_for_paper_forward,
-    resolve_paper_forward_candles,
-    write_spot_cache,
-    fetch_mstock_nifty_spot_ltp,
-)
-from ml.ensemble_auto_router import (
-    EnsembleAutoRouter,
-    EnsemblePaperTrader,
-    decision_to_dict,
-    load_config as load_ensemble_auto_config,
-    selected_option_state_row,
-)
-try:
-    from pf_logging import log_gui_perf, log_pf_data, pf_log
-except ImportError:
-    def log_gui_perf(**kwargs):  # type: ignore[misc]
-        pass
-
-    def log_pf_data(**kwargs):  # type: ignore[misc]
-        pass
-
-    def pf_log(level, msg, **kwargs):  # type: ignore[misc]
-        print(msg)
-from paper_forward_spot_integrity import (
-    apply_resolved_spot_to_option_row,
-    derive_spot_from_option_chain_payload,
-    is_valid_nifty_underlying_spot,
-    log_option_row_check,
-    option_premium_from_row,
-    validate_and_log_spot_integrity,
-)
 from ml_runtime import MLRuntimeEngine, paper_mode_allowed
 from candidate_lifecycle import (
     Candidate,
-    CandidateLifecycleStatus,
-    evaluate_candidate_rows,
-    load_paper_forward_candidate_rows,
-    lifecycle_row_tag,
-    lifecycle_status_visible,
-    load_shadow_candidates,
     load_live_whitelist,
     save_live_whitelist,
     promote_candidate,
-    write_lifecycle_report,
-    STATUS_PAPER_FORWARD,
-    STATUS_SHADOW,
     STATUS_LIVE_DRY_RUN,
     STATUS_LIVE_1_LOT,
 )
-from shadow_engine import ShadowEngine
 from live_order_dryrun import is_live_dry_run_active, execute_dry_run_if_requested
 from mstock_client import MStockTypeBClient
 from strategy import NiftyScalper, TradeLogEvent
@@ -250,10 +194,143 @@ from rf_gui_backtest import (
     materialize_ensemble_dynamic_candidate,
     resolve_dataset_path,
 )
+from chart import OptionChainIVSmilePlugin, TimeSeriesMultiLinePlugin
+try:
+    from synthetic_option_chain import (
+        CHAIN_SOURCE as BS_CHAIN_SOURCE,
+    )
+except Exception:
+    BS_CHAIN_SOURCE = "BLACK_SCHOLES_SYNTHETIC"
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+
+@dataclass
+class CandidateLifecycleStatus:
+    candidate_id: str = ""
+    current_stage: str = "candidate"
+    next_stage: str = "-"
+    can_advance: bool = False
+    block_reason: str = ""
+    missing_requirements: list[str] = field(default_factory=list)
+    artifact_status: str = "-"
+    data_status: str = "-"
+    confidence_health: str = "-"
+    trades: int = 0
+    days: int = 0
+
 CONFIG_DIR = REPO_ROOT / "config"
 LOGS_DIR = REPO_ROOT / "logs"
+
+
+def _spot_state_dict(obj: object) -> dict[str, object]:
+    try:
+        return object.__getattribute__(obj, "__dict__")
+    except Exception:
+        return {}
+
+
+def is_valid_nifty_underlying_spot(value: object) -> bool:
+    try:
+        px = float(value)
+    except Exception:
+        return False
+    return 1000.0 <= px <= 1000000.0
+
+
+def option_premium_from_row(row: object) -> float | None:
+    if not isinstance(row, dict):
+        return None
+    for key in (
+        "option_ltp",
+        "ltp",
+        "last_price",
+        "last_traded_price",
+        "lastPrice",
+        "close",
+        "ctx_option_price",
+        "mid",
+        "bid",
+        "ask",
+    ):
+        try:
+            value = row.get(key)
+            if value in (None, ""):
+                continue
+            price = float(value)
+            if price > 0:
+                return price
+        except Exception:
+            continue
+    return None
+
+
+def apply_resolved_spot_to_option_row(row: dict[str, object], spot_value: float, *, option_ltp: float | None = None) -> dict[str, object]:
+    out = dict(row)
+    out["spot"] = float(spot_value)
+    out["underlying"] = float(spot_value)
+    out["underlying_price"] = float(spot_value)
+    out["underlying_ltp"] = float(spot_value)
+    out["underlyingValue"] = float(spot_value)
+    out["underlying_value"] = float(spot_value)
+    if option_ltp is not None and option_ltp > 0:
+        out["ltp"] = float(option_ltp)
+        out["option_ltp"] = float(option_ltp)
+        out["ctx_option_price"] = float(option_ltp)
+        out.setdefault("last_price", float(option_ltp))
+    return out
+
+
+def derive_spot_from_option_chain_payload(payload: object) -> tuple[float | None, str]:
+    rows: list[dict[str, object]] = []
+    if isinstance(payload, dict):
+        payload = payload.get("option_chain") or payload.get("data") or payload.get("rows") or payload.get("records") or [payload]
+    if isinstance(payload, (list, tuple)):
+        rows = [row for row in payload if isinstance(row, dict)]
+    for row in rows:
+        for key in ("spot", "underlying_ltp", "underlying_price", "underlyingValue", "underlying_value", "underlying"):
+            try:
+                value = row.get(key)
+                if is_valid_nifty_underlying_spot(value):
+                    return float(value), f"row.{key}"
+            except Exception:
+                continue
+    return None, ""
+
+
+def validate_and_log_spot_integrity(
+    *,
+    snapshot_spot: float | None,
+    chain_spot: float | None,
+    option_ltp: float | None = None,
+    row: dict[str, object] | None = None,
+) -> None:
+    if snapshot_spot is None:
+        return
+    try:
+        snap = float(snapshot_spot)
+    except Exception:
+        return
+    chain_text = "n/a"
+    if chain_spot is not None:
+        try:
+            chain_text = f"{float(chain_spot):.2f}"
+        except Exception:
+            chain_text = str(chain_spot)
+    print(
+        f"[PF-SPOT-CHECK] snapshot_spot={snap:.2f} chain_spot={chain_text} "
+        f"option_ltp={option_ltp if option_ltp is not None else 'n/a'} "
+        f"symbol={(row or {}).get('symbol', '') if isinstance(row, dict) else ''}"
+    )
+
+
+def log_option_row_check(row: dict[str, object], *, resolved_spot: float | None = None) -> None:
+    try:
+        print(
+            f"[OC-ROW-CHECK] symbol={row.get('symbol', '')} strike={row.get('strike', '')} "
+            f"type={row.get('option_type', '')} ltp={option_premium_from_row(row) or 'n/a'} "
+            f"spot={resolved_spot if resolved_spot is not None else row.get('spot', 'n/a')}"
+        )
+    except Exception:
+        pass
 
 
 @dataclass
@@ -309,7 +386,7 @@ def verify_mstock_token_read_only(client) -> AuthValidationResult:
     last_endpoint = ""
     last_error = ""
     for endpoint, fn in attempts:
-        print(f"[PAPER-FWD-AUTH] attempt endpoint={endpoint} token_present=true client_created=true")
+        print(f"[BROKER-AUTH] attempt endpoint={endpoint} token_present=true client_created=true")
         last_endpoint = endpoint
         try:
             result = fn()
@@ -319,15 +396,15 @@ def verify_mstock_token_read_only(client) -> AuthValidationResult:
                     spot = float(result)
             except Exception:
                 spot = None
-            print(f"[PAPER-FWD-AUTH] result status=AUTH_OK endpoint={endpoint}")
+            print(f"[BROKER-AUTH] result status=AUTH_OK endpoint={endpoint}")
             return AuthValidationResult(True, "AUTH_OK", endpoint, "", "", None, spot)
         except Exception as exc:
             status, code, msg = _classify_auth_failure(exc)
             last_error = msg
             if status == "SESSION_EXPIRED":
-                print(f"[PAPER-FWD-AUTH] result status=SESSION_EXPIRED endpoint={endpoint} error={msg}")
+                print(f"[BROKER-AUTH] result status=SESSION_EXPIRED endpoint={endpoint} error={msg}")
                 return AuthValidationResult(False, "SESSION_EXPIRED", endpoint, code, msg)
-            print(f"[PAPER-FWD-AUTH] result status=AUTH_FAILED endpoint={endpoint} error={msg}")
+            print(f"[BROKER-AUTH] result status=AUTH_FAILED endpoint={endpoint} error={msg}")
 
     status, code, msg = _classify_auth_failure(last_error or "no read-only validation endpoint succeeded")
     return AuthValidationResult(False, status, last_endpoint or "none", code, msg)
@@ -424,325 +501,29 @@ def validate_option_chain_config_for_active_broker(broker: object = None) -> dic
     return validate_mstock_config()
 
 
-def diagnose_paper_forward_candidate_config(path: str | Path = "config/paper_forward_candidates.json") -> dict[str, object]:
-    cfg_path = Path(path)
-    out: dict[str, object] = {
-        "path": str(cfg_path),
-        "exists": cfg_path.exists(),
-        "candidates": 0,
-        "enabled": 0,
-        "active": 0,
-        "active_candidate_id": "",
-        "reason": "CONFIG_NOT_FOUND",
-    }
-    if not cfg_path.exists():
-        print(f"[PF-CONFIG] path={cfg_path} candidates=0 active=0 enabled=0 reason=CONFIG_NOT_FOUND")
-        return out
-    try:
-        candidates = _load_paper_forward_monitor_candidate_rows(cfg_path)
-    except Exception as exc:
-        out["reason"] = f"CONFIG_PARSE_ERROR:{type(exc).__name__}"
-        print(f"[PF-CONFIG] path={cfg_path} candidates=0 active=0 enabled=0 reason={out['reason']}")
-        return out
-    enabled = [
-        c for c in candidates
-        if bool(c.get("enabled", False)) or bool(c.get("active", False)) or bool(c.get("selected", False))
-    ]
-    active = [
-        c for c in candidates
-        if bool(c.get("active", False))
-        or bool(c.get("selected", False))
-        or str(c.get("candidate_id") or "") == str(os.getenv("ACTIVE_CANDIDATE_ID", os.getenv("MSTOCK_ACTIVE_CANDIDATE_ID", "")) or "")
-    ]
-    active_candidate = (active[0] if active else (enabled[0] if enabled else None))
-    out.update(
-        {
-            "candidates": len(candidates),
-            "enabled": len(enabled),
-            "active": 1 if active_candidate else 0,
-            "active_candidate_id": str(active_candidate.get("candidate_id") or "") if active_candidate else "",
-        }
-    )
-    repo_root = Path(__file__).resolve().parent.parent
-    if active_candidate:
-        reason = str(active_candidate.get("disabled_reason") or active_candidate.get("reason") or "ACTIVE_CANDIDATE_OK")
-        artifact_dir = str(active_candidate.get("artifact_dir") or "")
-        if artifact_dir:
-            art_path = Path(artifact_dir)
-            if not art_path.is_absolute():
-                art_path = (repo_root / art_path).resolve()
-            if not art_path.exists():
-                reason = "ARTIFACT_NOT_FOUND"
-            elif bool(active_candidate.get("enabled", False)):
-                reason = "ACTIVE_CANDIDATE_OK"
-        out["reason"] = reason
-    elif enabled:
-        out["reason"] = "ACTIVE_CANDIDATE_OK"
-    elif candidates and all(str(c.get("disabled_reason") or "").upper() == "ARTIFACT_NOT_FOUND" for c in candidates):
-        out["reason"] = "ARTIFACT_NOT_FOUND"
-    elif candidates:
-        out["reason"] = "ROUTER_DISABLED_NO_ACTIVE_CANDIDATE"
-    print(
-        f"[PF-CONFIG] path={cfg_path} candidates={out['candidates']} "
-        f"active={out['active']} enabled={out['enabled']} reason={out['reason']}"
-    )
-    return out
+def get_option_chain_status_text(raw_status: object, broker: object = None) -> str:
+    normalized = str(raw_status or "").strip().upper()
+    if normalized == "MISSING_CONFIG":
+        return "Config missing - entries paused"
+    if normalized == "FETCH_FAILED":
+        return "Fetch failed"
+    if normalized == "EMPTY":
+        return "Empty chain"
+    if normalized == "OK":
+        return "Ready"
+    cfg = validate_option_chain_config_for_active_broker(broker)
+    if not bool(cfg.get("ok")):
+        return "Config missing - entries paused"
+    return "Waiting for data"
 
 
-def _paper_forward_candidate_config_path() -> Path:
-    explicit = str(os.getenv("MSTOCK_PAPER_FORWARD_CANDIDATE_FILE", "") or "").strip()
-    if explicit:
-        return Path(explicit)
-    financial_best = Path("config/paper_forward_candidates_financial_best.json")
-    if financial_best.exists() and str(os.getenv("MSTOCK_USE_FINANCIAL_RATIO_PAPER_FORWARD_CANDIDATES", "false")).strip().lower() in {"1", "true", "yes", "y"}:
-        return financial_best
-    eligible = Path("config/paper_forward_candidates_eligible.json")
-    if eligible.exists() and str(os.getenv("MSTOCK_USE_ELIGIBLE_PAPER_FORWARD_CANDIDATES", "false")).strip().lower() in {"1", "true", "yes", "y"}:
-        return eligible
-    return Path("config/paper_forward_candidates.json")
-
-
-def _paper_forward_candidate_config_label() -> str:
-    path = _paper_forward_candidate_config_path()
-    if path.name == "paper_forward_candidates_financial_best.json":
-        print(f"Loaded financial-ratio selected paper-forward candidates from {path}")
-        try:
-            payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            message = str(payload.get("selection_message") or "").strip()
-            if message:
-                print(message)
-        except Exception:
-            pass
-    if path.name == "paper_forward_candidates_eligible.json":
-        print(f"Loaded eligible paper-forward candidates from {path}")
-    return str(path)
-
-
-def _is_paper_forward_monitor_candidate(row: dict[str, object]) -> bool:
-    status = str(row.get("status") or "").strip().upper()
-    classification = str(row.get("classification") or "").strip().lower()
-    allowed_modes = row.get("allowed_modes") or []
-    if isinstance(allowed_modes, str):
-        allowed_modes = [allowed_modes]
-    allowed = {str(mode).strip().lower() for mode in allowed_modes if str(mode).strip()}
-    return (
-        bool(row.get("paper_forward_only"))
-        or classification == "paper_forward_only"
-        or status in {STATUS_PAPER_FORWARD, "PAPER_FORWARD", "PAPER_PASSED", "SHADOW", "SHADOW_PASSED"}
-        or "paper_forward" in allowed
-    )
-
-
-def _load_paper_forward_monitor_candidate_rows(path: str | Path | None = None) -> list[dict[str, object]]:
-    """Load rows that should appear in the Paper Forward Monitor.
-
-    The eligible/financial-best files are selector outputs and can legitimately
-    be empty after promotion. The monitor must still show promoted shadow rows
-    whose allowed modes include paper_forward.
-    """
-
-    primary = Path(path) if path is not None else _paper_forward_candidate_config_path()
-    rows = load_paper_forward_candidate_rows(primary)
-    if not rows and primary.name in {
-        "paper_forward_candidates_eligible.json",
-        "paper_forward_candidates_financial_best.json",
-    }:
-        rows = load_paper_forward_candidate_rows("config/paper_forward_candidates.json")
-
-    shadow_rows: list[dict[str, object]] = []
-    try:
-        shadow_rows = [c.to_dict() for c in load_shadow_candidates()]
-    except Exception:
-        shadow_rows = []
-
-    by_key: dict[str, dict[str, object]] = {}
-    for row in rows + shadow_rows:
-        if not isinstance(row, dict) or not _is_paper_forward_monitor_candidate(row):
-            continue
-        candidate_id = str(row.get("candidate_id") or "")
-        threshold = row.get("threshold")
-        if threshold in (None, ""):
-            threshold = row.get("selected_threshold") or row.get("entry_threshold") or ""
-        artifact_dir = str(row.get("artifact_dir") or row.get("artifact_path") or "")
-        identity_key = "|".join(
-            str(x or "")
-            for x in (
-                candidate_id,
-                artifact_dir,
-                row.get("model_name"),
-                row.get("preset_family"),
-                row.get("side_policy"),
-                threshold,
-            )
-        )
-        key = candidate_id or identity_key
-        if not key:
-            continue
-        existing = by_key.get(key)
-        if existing is None:
-            by_key[key] = dict(row)
-        elif not _flag_is_true(existing.get("enabled"), default=False) and _flag_is_true(row.get("enabled"), default=False):
-            merged = dict(existing)
-            for field, value in row.items():
-                if value not in (None, ""):
-                    merged[field] = value
-            by_key[key] = merged
-    return list(by_key.values())
-
-
-def _to_float_or_none(value: object) -> float | None:
-    try:
-        if value in (None, ""):
-            return None
-        out = float(value)
-        if out == 0.0 or math.isnan(out):
-            return None
-        return out
-    except Exception:
-        return None
-
-
-def _flag_is_true(value: object, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    normalized = str(value).strip().lower()
-    if normalized in {"1", "true", "yes", "y", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "n", "off", ""}:
-        return False
-    return default
-
-
-def format_money(value: object, *, decimals: int = 2) -> str:
+def format_money(value: object) -> str:
     try:
         amount = float(value or 0.0)
     except Exception:
         amount = 0.0
-    return f"Rs. {amount:,.{int(decimals)}f}"
-
-
-def _walk_dict_nodes(obj: object) -> list[dict[str, object]]:
-    nodes: list[dict[str, object]] = []
-    if isinstance(obj, dict):
-        nodes.append(obj)
-        for value in obj.values():
-            nodes.extend(_walk_dict_nodes(value))
-    elif isinstance(obj, (list, tuple)):
-        for item in obj:
-            nodes.extend(_walk_dict_nodes(item))
-    return nodes
-
-
-def verify_dhan_token_read_only(client) -> AuthValidationResult:
-    if client is None:
-        return AuthValidationResult(False, "BROKER_CLIENT_INIT_FAILED", "none", "NO_CLIENT", "Dhan client construction failed")
-    attempts = []
-    if hasattr(client, "login"):
-        attempts.append(("dhan_login", lambda: client.login(interactive=False)))
-    if hasattr(client, "get_option_chain"):
-        attempts.append(("dhan_option_chain:NIFTY", lambda: client.get_option_chain(os.getenv("DHAN_UNDERLYING", "NIFTY") or "NIFTY")))
-    if hasattr(client, "get_ltp"):
-        attempts.append(("dhan_ltp:NIFTY", lambda: client.get_ltp(os.getenv("DHAN_UNDERLYING", "NIFTY") or "NIFTY")))
-
-    last_endpoint = ""
-    last_error = ""
-    for endpoint, fn in attempts:
-        print(f"[PAPER-FWD-AUTH] attempt endpoint={endpoint} token_present=true client_created=true")
-        last_endpoint = endpoint
-        try:
-            result = fn()
-            spot = None
-            if endpoint.startswith("dhan_ltp"):
-                spot = _to_float_or_none(result)
-            elif endpoint.startswith("dhan_option_chain"):
-                spot, _ = derive_spot_from_option_chain_payload(result)
-            print(f"[PAPER-FWD-AUTH] result status=AUTH_OK endpoint={endpoint}")
-            return AuthValidationResult(True, "AUTH_OK", endpoint, "", "", None, spot)
-        except Exception as exc:
-            status, code, msg = _classify_auth_failure(exc)
-            last_error = msg
-            if status == "SESSION_EXPIRED":
-                print(f"[PAPER-FWD-AUTH] result status=SESSION_EXPIRED endpoint={endpoint} error={msg}")
-                return AuthValidationResult(False, "SESSION_EXPIRED", endpoint, code, msg)
-            print(f"[PAPER-FWD-AUTH] result status=AUTH_FAILED endpoint={endpoint} error={msg}")
-    status, code, msg = _classify_auth_failure(last_error or "no Dhan read-only validation endpoint succeeded")
-    return AuthValidationResult(False, status, last_endpoint or "none", code, msg)
-
-# Backtest harness for Live Harness tab
-try:
-    from backtest_harness import (
-        BacktestResult, MultiLegTrade, TransactionCosts,
-        simulate_multi_leg, simulate_with_exit_optimizer,
-        calculate_sharpe_ratio, calculate_sortino_ratio, calculate_max_drawdown
-    )
-except ImportError:
-    # Fallback for direct script execution
-    from src.backtest_harness import (
-        BacktestResult, MultiLegTrade, TransactionCosts,
-        simulate_multi_leg, simulate_with_exit_optimizer,
-        calculate_sharpe_ratio, calculate_sortino_ratio, calculate_max_drawdown
-    )
-
-# Optional analytics + GPT integrations (kept best-effort so UI stays usable
-# even if the user hasn't configured GPT keys yet).
-from market_data import Candle
-from indicators import adx, atr, ema, rsi, sma, supertrend, roc, choppiness_index, pivot_points
-from candlestick_patterns import (
-    is_dark_cloud_cover,
-    is_bearish_engulfing,
-    is_bullish_engulfing,
-    is_doji,
-    is_evening_star,
-    is_falling_three_methods,
-    is_hammer,
-    is_hanging_man,
-    is_inverted_hammer,
-    is_morning_star,
-    is_piercing_line,
-    is_shooting_star,
-    is_three_black_crows,
-    is_three_white_soldiers,
-    is_rising_three_methods,
-)
-from greeks import (
-    delta as bs_delta,
-    gamma as bs_gamma,
-    implied_volatility,
-    theta as bs_theta,
-    vega as bs_vega,
-)
-from gpt_advisor import analyze_market, health_check
-from chart import LiveChartPlugin, TimeSeriesMultiLinePlugin, OptionChainIVSmilePlugin
-from ui_live_chart_panels import wire_live_chart_panels, _refresh_live_chart_tab
-
-
-
-_GPT_STARTUP_ENV_KEYS: tuple[str, ...] = (
-    "MSTOCK_GPT_API_KEY",
-    "OPENAI_API_KEY",
-    "MSTOCK_GPT_API_BASE_URL",
-    "MSTOCK_GPT_MODEL",
-    "MSTOCK_GPT_ENABLE",
-    "MSTOCK_GPT_MODE",
-    "MSTOCK_GPT_TIMEOUT_SEC",
-)
-
-
-def merge_saved_broker_credentials(existing: dict[str, object], broker: str, updates: dict[str, object]) -> dict[str, object]:
-    merged: dict[str, object] = dict(existing or {})
-    normalized_broker = str(broker or "mstock").strip().lower() or "mstock"
-    merged["broker"] = normalized_broker if normalized_broker in {"mstock", "dhan"} else "mstock"
-    for key, value in (updates or {}).items():
-        if value is None:
-            continue
-        if isinstance(value, str) and value == "":
-            continue
-        merged[key] = value
-    return merged
+    sign = "-" if amount < 0 else ""
+    return f"{sign}Rs. {abs(amount):,.2f}"
 
 
 def calculate_intraday_charges(
@@ -756,9 +537,9 @@ def calculate_intraday_charges(
     """Calculate round-trip intraday charges.
 
     Brokerage per order:
-      - m.Stock options : â‚¹5 flat
-      - Dhan options    : â‚¹20 flat
-      - Equity (both)   : min(â‚¹20, 0.03% of value) per side
+      - m.Stock options : â'15 flat
+      - Dhan options    : â'120 flat
+      - Equity (both)   : min(â'120, 0.03% of value) per side
     """
     turnover = float((buy_price + sell_price) * quantity)
     buy_value = float(buy_price * quantity)
@@ -775,7 +556,7 @@ def calculate_intraday_charges(
         }
 
     if is_options:
-        # Brokerage differs by broker: â‚¹5 for m.Stock, â‚¹20 for Dhan
+        # Brokerage differs by broker: â'15 for m.Stock, â'120 for Dhan
         brokerage = 5.0 if str(broker or "mstock").strip().lower() == "mstock" else 20.0
     else:
         buy_brokerage = min(20.0, buy_value * 0.0003)
@@ -836,6 +617,14 @@ def _read_windows_registry_env(name: str, hive_name: str) -> str:
         return str(value or "").strip()
     except Exception:
         return ""
+
+
+_GPT_STARTUP_ENV_KEYS = (
+    "MSTOCK_GPT_API_KEY",
+    "OPENAI_API_KEY",
+    "MSTOCK_GPT_API_BASE_URL",
+    "MSTOCK_GPT_MODEL",
+)
 
 
 def _hydrate_startup_gpt_env() -> None:
@@ -1003,11 +792,7 @@ class _LoginState:
 
 
 _LAZY_MAIN_TAB_BUILDERS: dict[str, tuple[str, str]] = {
-    "Ensemble Auto Router": ("ensemble_auto_router_frame", "_build_ensemble_auto_router_tab"),
-    "Paper Forward Monitor": ("paper_forward_monitor_frame", "_build_paper_forward_monitor_tab"),
-    "Candidate Promotion / Deployment": ("candidate_promo_frame", "_build_candidate_promotion_tab"),
     "Historical ML Backtest Runner": ("ml_backtest_frame", "_build_historical_ml_backtest_tab"),
-    "Forward Validation": ("validation_frame", "_build_validation_tab"),
     "Telemetry & Diagnostics": ("telemetry_frame", "_build_telemetry_tab"),
 }
 _LAZY_ANALYTICS_TAB_BUILDERS: dict[str, tuple[str, str]] = {
@@ -1059,11 +844,11 @@ class ScalperUI(tk.Tk):
         self._dash_token_var = tk.StringVar(value="(set)" if self.access_token_var.get().strip() else "(not set)")
         self._app_status_var = tk.StringVar(value="Ready.")
         # [OPTION-CHAIN] UI status for option chain config
-        self._option_chain_status_var = tk.StringVar(value="Waiting for option chain...")
+        self._option_chain_status_var = tk.StringVar(value=get_option_chain_status_text(None))
         self._enable_adaptive_regimes_var = tk.BooleanVar(
             value=os.getenv("MSTOCK_ENABLE_ADAPTIVE_REGIMES", "false").lower() == "true"
         )
-        
+
         # Throttling intervals (in milliseconds) for adaptive API polling
         self._throttle_option_ltp = 250
         self._throttle_spot_ltp = 500
@@ -1075,8 +860,6 @@ class ScalperUI(tk.Tk):
             "Trade History",
             "Market Analytics",
             "Telemetry & Diagnostics",
-            "Ensemble Auto Router",
-            "Paper Forward Monitor",
         })
 
         try:
@@ -1093,7 +876,6 @@ class ScalperUI(tk.Tk):
         self._last_broker_success_ts = ""
         self._last_chart_update_ts = ""
         self._last_snapshot_update_ts = ""
-        self._last_pf_update_ts = ""
 
         self._log_q: queue.Queue[str] = queue.Queue()
         self._trade_q: queue.Queue[TradeLogEvent] = queue.Queue()
@@ -1108,7 +890,6 @@ class ScalperUI(tk.Tk):
         self._latest_option_chain_rows = []
         self._latest_option_chain_cache = []
         self._last_option_chain_rows = []
-        self._paper_forward_option_chain_rows = []
         self._last_option_chain_status = "EMPTY"
         self._last_option_chain_rows_count = 0
         self._last_option_chain_source = ""
@@ -1236,9 +1017,6 @@ class ScalperUI(tk.Tk):
         self._bt_last_ensemble_wrapper_dir: str = ""
         self._bt_last_ensemble_config: str = ""
         self._engine_diag_last_snapshot: dict[str, object] = {}
-        self._ensemble_router: EnsembleAutoRouter | None = None
-        self._ensemble_paper: EnsemblePaperTrader | None = None
-        self._ensemble_paper_running: bool = False
         # Live analytics snapshots (fed via Strategy on_tick callback).
         self._latest_candles: list[Candle] = []
         self._latest_candles_ts: float = 0.0
@@ -1422,7 +1200,7 @@ class ScalperUI(tk.Tk):
         """Schedule an APP-LEVEL Tk callback that persists even when bot stops.
 
         [SCHEDULER-REFACTOR] App-scope jobs: logs, trades, watchdog, diagnostics,
-        UI queue drain, portfolio/margin/status refresh â€” anything that only
+        UI queue drain, portfolio/margin/status refresh â€" anything that only
         displays existing state without placing/evaluating trades.
 
         These jobs continue running after Stop Bot and are not filtered by
@@ -1669,9 +1447,6 @@ class ScalperUI(tk.Tk):
             return False
 
     _GUI_TAB_AFTER_JOB_MAP = {
-        "paper_forward_monitor_update": ("paper_forward", "_pf_after_job"),
-        "pf_throttled_apply": ("paper_forward", "_pf_throttle_after_job"),
-        "pf_auto_start": ("paper_forward", "_pf_after_job"),
         "live_chart_refresh": ("chart", "_chart_after_job"),
         "chart_overlays": ("chart", "_chart_after_job"),
         "pump_engine_diag": ("telemetry", "_telemetry_after_job"),
@@ -2078,12 +1853,8 @@ class ScalperUI(tk.Tk):
             ("gpt_advisor", "_build_gpt_tab", "_on_gpt_event", "", "", 4, 0, "OK"),
             ("settings", "_build_settings_tab", "_sync_broker_ui", "", "", 6, 0, "OK"),
             ("backtest_runner", "_build_live_harness_tab", "_on_run_live_backtest", "", "_bt_thread", 5, 1, "OK"),
-            ("ml_backtest", "_build_historical_ml_backtest_tab", "_on_run_ml_backtest", "", "_bt_thread", 6, 0, "OK"),
+            ("ml_backtest", "_build_historical_ml_backtest_tab", "_on_run_ml_backtest", "", "_bt_thread", 8, 0, "OK"),
             ("telemetry", "_build_telemetry_tab", "_pump_engine_diagnostics", "pump_engine_diag", "", 3, 0, "OK"),
-            ("forward_validation", "_build_validation_tab", "_trigger_validation_refresh", "", "forward_validation", 1, 5, "OK"),
-            ("ensemble_auto_router", "_build_ensemble_auto_router_tab", "_ensemble_refresh_ui", "", "_ensemble_paper", 5, 2, "OK"),
-            ("paper_forward", "_build_paper_forward_monitor_tab", "_pf_apply_canonical_ui_update", "_pf_after_job", "_pf_engine_thread", 9, 1, "OK"),
-            ("candidate_promotion", "_build_candidate_promotion_tab", "_cp_refresh_table", "cp_refresh", "cp_shadow_thread", 8, 1, "OK"),
         )
         for tab, builder, refresh, after_job, worker, buttons, tables, status in audits:
             self._register_tab_audit(
@@ -2147,16 +1918,12 @@ class ScalperUI(tk.Tk):
             "tab_last_update_ts": dict(getattr(self, "_tab_last_update_ts", {}) or {}),
             "tab_audit_registry": dict(getattr(self, "_tab_audit_registry", {}) or {}),
             "gui_errors_recent": list(getattr(self, "_gui_errors", []) or [])[-20:],
-            "paper_forward": getattr(self, "_pf_gui_loop_diagnostics", lambda: {})(),
             "workers": {
                 "bot_thread_alive": bool(getattr(self, "_bot_thread", None) and self._bot_thread.is_alive()),
-                "pf_engine_alive": bool(getattr(self, "_pf_engine_thread", None) and self._pf_engine_thread.is_alive()),
-                "pf_poller_alive": bool(getattr(self, "_pf_data_poller_thread", None) and self._pf_data_poller_thread.is_alive()),
                 "bt_thread_alive": bool(getattr(self, "_bt_thread", None) and self._bt_thread.is_alive()),
                 "cp_shadow_alive": bool(getattr(self, "cp_shadow_thread", None) and self.cp_shadow_thread.is_alive()),
             },
             "tree_row_counts": {
-                "pf_tree": _tree_count("pf_tree"),
                 "trade_tree": _tree_count("trade_tree"),
                 "option_legs_tree": _tree_count("option_legs_tree"),
                 "managed_positions_tree": _tree_count("managed_positions_tree"),
@@ -2164,10 +1931,8 @@ class ScalperUI(tk.Tk):
                 "p1_tree": _tree_count("p1_tree"),
                 "p2_tree": _tree_count("p2_tree"),
             },
-            "broker_auth": str(getattr(getattr(self, "_pf_runtime", None), "auth", object()).status if getattr(self, "_pf_runtime", None) else ""),
             "chain_rows": len(getattr(self, "_latest_option_chain_rows", []) or []),
             "candle_rows": len(getattr(self, "_latest_candles", []) or []),
-            "candidate_count": len(getattr(self, "pf_candidates", []) or []),
             "active_positions_count": sum(
                 1 for _tid, st in (getattr(self, "_trade_state", {}) or {}).items()
                 if not self._is_closed_trade_state(_tid, st)
@@ -2239,16 +2004,7 @@ class ScalperUI(tk.Tk):
             client = getattr(self, "_client", None)
             opt_chain_status = getattr(client, "_option_chain_status", "UNKNOWN") if client else "NO_CLIENT"
             # [OPTION-CHAIN] Update UI status for option chain config
-            if opt_chain_status == "MISSING_CONFIG":
-                self._option_chain_status_var.set("Config missing â€” entries paused")
-            elif opt_chain_status == "FETCH_FAILED":
-                self._option_chain_status_var.set("Fetch failed")
-            elif opt_chain_status == "EMPTY":
-                self._option_chain_status_var.set("Empty chain")
-            elif opt_chain_status == "OK":
-                self._option_chain_status_var.set("")
-            else:
-                self._option_chain_status_var.set("")
+            self._option_chain_status_var.set(get_option_chain_status_text(opt_chain_status))
             broker_ip_mismatch = getattr(client, "_broker_ip_mismatch", False) if client else False
             last_fetch_ts = getattr(self, "_last_data_fetch_ts", 0.0)
             last_fetch_str = f"{now - last_fetch_ts:.0f}s ago" if last_fetch_ts else "NEVER"
@@ -2332,13 +2088,6 @@ class ScalperUI(tk.Tk):
             if "pump_signals" not in app_job_names:
                 self._safe_after_app("pump_signals", 2000, self._pump_signals_greeks)
                 restarted.append("pump_signals")
-            if (
-                "paper_forward_monitor_update" not in app_job_names
-                and self._ui_dict_get("pf_engine")
-                and not getattr(self, "_pf_after_job", None)
-            ):
-                self._pf_schedule_update(int(self._pf_dict_get("_pf_loop_generation", 0) or 0))
-                restarted.append("paper_forward_monitor_update")
             if "live_chart_refresh" not in app_job_names:
                 self._safe_after_app("live_chart_refresh", 2000, _refresh_live_chart_tab, self, False)
                 restarted.append("live_chart_refresh")
@@ -2389,10 +2138,6 @@ class ScalperUI(tk.Tk):
             if hasattr(self, "_runtime_chart_var"):
                 self._runtime_chart_var.set(
                     f"Last chart update: {getattr(self, '_last_chart_update_ts', '-') or '-'}"
-                )
-            if hasattr(self, "_runtime_pf_var"):
-                self._runtime_pf_var.set(
-                    f"Last paper-forward update: {getattr(self, '_last_pf_update_ts', '-') or '-'}"
                 )
             if hasattr(self, "_runtime_exception_var"):
                 self._runtime_exception_var.set(
@@ -2767,10 +2512,6 @@ class ScalperUI(tk.Tk):
                             if hasattr(self, "live_chart_plugin") and self.live_chart_plugin:
                                 self.live_chart_plugin.push_candles(norm)
                             print(f"[UI] Pushed {len(norm)} initial candles to live chart broker={broker}", flush=True)
-                            try:
-                                self._publish_market_snapshot_to_paper_forward()
-                            except Exception:
-                                pass
                             return
                     existing = getattr(self, "_latest_candles", None) or []
                     if existing:
@@ -3190,10 +2931,11 @@ class ScalperUI(tk.Tk):
         ml_frame = ttk.Labelframe(parent, text="Historical ML Backtest Runner", padding=10)
         ml_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        ttk.Label(ml_frame, text="Test/Backtest CSV:").grid(row=0, column=0, padx=5, pady=4, sticky=tk.W)
+        ttk.Label(ml_frame, text="Test/Backtest CSV/Parquet:").grid(row=0, column=0, padx=5, pady=4, sticky=tk.W)
         self.bt_csv_path_var = tk.StringVar(value="")
         ttk.Entry(ml_frame, textvariable=self.bt_csv_path_var, width=55).grid(row=0, column=1, padx=5, pady=4, sticky=tk.W)
         ttk.Button(ml_frame, text="Browse...", command=self._on_browse_bt_csv).grid(row=0, column=2, padx=5, pady=4)
+        ttk.Button(ml_frame, text="Auto-Find Dataset", command=self._bt_autofill_dataset_path).grid(row=0, column=3, padx=5, pady=4, sticky=tk.W)
 
         ttk.Label(ml_frame, text="Retrain dataset CSV:").grid(row=1, column=0, padx=5, pady=4, sticky=tk.W)
         self.bt_retrain_dataset_var = tk.StringVar(value="")
@@ -3204,7 +2946,7 @@ class ScalperUI(tk.Tk):
         self.bt_config_path_var = tk.StringVar(value="")
         ttk.Entry(ml_frame, textvariable=self.bt_config_path_var, width=55).grid(row=2, column=1, padx=5, pady=4, sticky=tk.W)
         ttk.Button(ml_frame, text="Browse...", command=self._on_browse_bt_config).grid(row=2, column=2, padx=5, pady=4)
-        hint = ttk.Label(ml_frame, text="Defaults tried if blank: config/paper_forward_candidates.json, config/ml_candidates.json, models/", font=("Segoe UI", 8), foreground="#666666")
+        hint = ttk.Label(ml_frame, text="Defaults tried if blank: config/ml_candidates.json, models/", font=("Segoe UI", 8), foreground="#666666")
         hint.grid(row=2, column=3, padx=5, pady=4, sticky=tk.W)
 
         ttk.Label(ml_frame, text="Output directory:").grid(row=3, column=0, padx=5, pady=4, sticky=tk.W)
@@ -3273,6 +3015,7 @@ class ScalperUI(tk.Tk):
         self.bt_ensemble_test_btn = ttk.Button(btns, text="Test Ensemble", command=self._on_test_ensemble)
         self.bt_ensemble_test_btn.pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="Open Output Folder", command=self._on_open_bt_output).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Auto-Find Config", command=self._bt_autofill_config_path).pack(side=tk.LEFT, padx=6)
 
         self.bt_status_var = tk.StringVar(value="IDLE")
         ttk.Label(ml_frame, text="Status:").grid(row=7, column=0, padx=5, pady=2, sticky=tk.W)
@@ -3328,7 +3071,7 @@ class ScalperUI(tk.Tk):
         self._bt_prime_ensemble_test_defaults()
 
     def _build_telemetry_tab(self) -> None:
-        """Create the layout for portfolio Greeks, system health metrics, 
+        """Create the layout for portfolio Greeks, system health metrics,
         position reconciliation status, and database metrics.
         """
         root = ttk.Frame(self.telemetry_frame)
@@ -3338,16 +3081,16 @@ class ScalperUI(tk.Tk):
         self.freeze_banner = tk.Frame(root, background="#e74c3c", height=50, bd=1, relief="ridge")
         self.freeze_banner.pack(fill=tk.X, expand=False, pady=(0, 10))
         self.freeze_banner.pack_propagate(False)
-        
+
         self.freeze_msg_lbl = tk.Label(
-            self.freeze_banner, 
-            text="ðŸš¨ EMERGENCY TRADING FREEZE ACTIVE: Position Reconciliation Mismatch! ðŸš¨", 
-            foreground="white", 
-            background="#e74c3c", 
+            self.freeze_banner,
+            text="ðŸš ̈ EMERGENCY TRADING FREEZE ACTIVE: Position Reconciliation Mismatch! ðŸš ̈",
+            foreground="white",
+            background="#e74c3c",
             font=("Segoe UI", 11, "bold")
         )
         self.freeze_msg_lbl.pack(side=tk.LEFT, padx=15, fill=tk.Y)
-        
+
         self.unfreeze_btn = tk.Button(
             self.freeze_banner,
             text="Acknowledge & Unfreeze Bot",
@@ -3361,7 +3104,7 @@ class ScalperUI(tk.Tk):
             cursor="hand2"
         )
         self.unfreeze_btn.pack(side=tk.RIGHT, padx=15, pady=6)
-        
+
         # Hide freeze banner by default
         self.freeze_banner.pack_forget()
 
@@ -3421,8 +3164,8 @@ class ScalperUI(tk.Tk):
                 logger.error(f"Failed to persist adaptive regimes setting: {e}")
 
         adaptive_cb = ttk.Checkbutton(
-            regime_lf, 
-            text="Enable Adaptive Preset Mode (Regime-Aware)", 
+            regime_lf,
+            text="Enable Adaptive Preset Mode (Regime-Aware)",
             variable=self._enable_adaptive_regimes_var,
             command=_on_adaptive_regimes_toggled
         )
@@ -3431,9 +3174,9 @@ class ScalperUI(tk.Tk):
         # Dynamic labels
         self.regime_lbl = ttk.Label(regime_lf, textvariable=self._active_regime_var, font=("Segoe UI", 10, "bold"), foreground="#d35400")
         self.regime_lbl.pack(anchor="w", pady=3)
-        
+
         ttk.Label(regime_lf, textvariable=self._regime_scores_var, font=("Segoe UI", 9)).pack(anchor="w", pady=3)
-        
+
         self.failsafe_lbl = ttk.Label(regime_lf, textvariable=self._failsafe_status_var, font=("Segoe UI", 9, "bold"), foreground="#27ae60")
         self.failsafe_lbl.pack(anchor="w", pady=3)
 
@@ -3477,7 +3220,6 @@ class ScalperUI(tk.Tk):
         self._runtime_broker_var = tk.StringVar(value="Broker status: disconnected")
         self._runtime_snapshot_var = tk.StringVar(value="Last data snapshot: n/a")
         self._runtime_chart_var = tk.StringVar(value="Last chart update: n/a")
-        self._runtime_pf_var = tk.StringVar(value="Last paper-forward update: n/a")
         self._runtime_exception_var = tk.StringVar(value="Last exception: none")
         for var in (
             self._runtime_ui_alive_var,
@@ -3486,7 +3228,6 @@ class ScalperUI(tk.Tk):
             self._runtime_broker_var,
             self._runtime_snapshot_var,
             self._runtime_chart_var,
-            self._runtime_pf_var,
             self._runtime_exception_var,
         ):
             ttk.Label(runtime_lf, textvariable=var, font=("Segoe UI", 9)).pack(anchor="w", pady=2)
@@ -3494,16 +3235,16 @@ class ScalperUI(tk.Tk):
         # --- AI ADVISORY & COMMENTARY ---
         ai_lf = ttk.LabelFrame(right_col, text="AI Advisory & Trade Commentary", padding=10)
         ai_lf.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
-        
+
         self._ppo_rating_var = tk.StringVar(value="PPO Advisory Rating: Awaiting open trade...")
         self._latest_gpt_commentary_var = tk.StringVar(value="Latest Commentary: Awaiting trade proposal...")
-        
+
         ttk.Label(ai_lf, textvariable=self._ppo_rating_var, font=("Segoe UI", 10, "bold"), foreground="#2980b9").pack(anchor="w", pady=3)
-        
+
         gpt_commentary_lbl = ttk.Label(
-            ai_lf, 
-            textvariable=self._latest_gpt_commentary_var, 
-            font=("Segoe UI", 9, "italic"), 
+            ai_lf,
+            textvariable=self._latest_gpt_commentary_var,
+            font=("Segoe UI", 9, "italic"),
             foreground="#7f8c8d",
             wraplength=350
         )
@@ -3517,10 +3258,10 @@ class ScalperUI(tk.Tk):
         recon_log_frame.pack(fill=tk.BOTH, expand=True)
 
         self.recon_listbox = tk.Listbox(
-            recon_log_frame, 
-            height=6, 
-            font=("Consolas", 9), 
-            background="#f8f9fa", 
+            recon_log_frame,
+            height=6,
+            font=("Consolas", 9),
+            background="#f8f9fa",
             foreground="#2c3e50"
         )
         self.recon_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -3528,11 +3269,11 @@ class ScalperUI(tk.Tk):
         recon_vsb = ttk.Scrollbar(recon_log_frame, orient="vertical", command=self.recon_listbox.yview)
         recon_vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.recon_listbox.configure(yscrollcommand=recon_vsb.set)
-        
+
         self.recon_listbox.insert(tk.END, "System started - Reconciliation monitor idle")
 
     def _unfreeze_bot(self) -> None:
-        """Acknowledge the mismatch freeze, reset status in reconciliation engine 
+        """Acknowledge the mismatch freeze, reset status in reconciliation engine
         and re-enable the strategy entries.
         """
         scalper = getattr(self, "_scalper", None)
@@ -3547,13 +3288,13 @@ class ScalperUI(tk.Tk):
                 recon.reconciliation_history.append(
                     f"{time.strftime('%H:%M:%S')} - MANUAL UNFREEZE: trading entries resumed"
                 )
-            
+
             # Hide the freeze banner
             try:
                 self.freeze_banner.pack_forget()
             except Exception:
                 pass
-            
+
             try:
                 messagebox.showinfo("Bot Unfrozen", "Manual unfreeze complete. Strategy entries are now resumed.")
             except Exception:
@@ -3816,6 +3557,192 @@ class ScalperUI(tk.Tk):
     def _bt_reset_progress(self) -> None:
         self._bt_set_progress(0.0, "Starting...")
 
+    def _bt_default_config_candidates(self) -> list[Path]:
+        candidates: list[Path] = []
+        seen: set[str] = set()
+
+        def add(path: object) -> None:
+            try:
+                p = Path(str(path)).expanduser()
+                if not p.is_absolute():
+                    p = (REPO_ROOT / p).resolve()
+                key = str(p).lower()
+                if key not in seen and p.exists():
+                    seen.add(key)
+                    candidates.append(p)
+            except Exception:
+                return
+
+        for attr in ("_bt_last_ensemble_config", "_bt_last_ensemble_artifact"):
+            value = str(getattr(self, attr, "") or "").strip()
+            if value:
+                add(value)
+        for rel in (
+            "config/ensemble_xgb_rf_dynamic_candidate.json",
+            "config/ml_candidates.json",
+            "models",
+        ):
+            add(rel)
+        try:
+            model_dirs = sorted(
+                (REPO_ROOT / "models").glob("*"),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+                reverse=True,
+            )
+            for model_dir in model_dirs[:12]:
+                add(model_dir)
+                for pattern in ("*.pkl", "*.joblib"):
+                    for model_file in sorted(model_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)[:3]:
+                        add(model_file)
+        except Exception:
+            pass
+        return candidates
+
+    def _bt_path_has_model_artifacts(self, path: Path) -> bool:
+        try:
+            if path.is_file():
+                if path.suffix.lower() in {".pkl", ".joblib"}:
+                    return True
+                if path.suffix.lower() == ".json":
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    rows = payload.get("candidates", payload.get("selected_candidates", payload.get("models", []))) if isinstance(payload, dict) else []
+                    return bool(rows)
+                return False
+            if path.is_dir():
+                return any(path.rglob("*.pkl")) or any(path.rglob("*.joblib")) or (path / "core_retrain_summary.json").exists()
+        except Exception:
+            return False
+        return False
+
+    def _bt_resolve_default_config_path(self) -> str:
+        for path in self._bt_default_config_candidates():
+            if self._bt_path_has_model_artifacts(path):
+                try:
+                    return str(path.relative_to(REPO_ROOT))
+                except Exception:
+                    return str(path)
+        return ""
+
+    def _bt_autofill_config_path(self) -> str:
+        path = self._bt_resolve_default_config_path()
+        if path:
+            try:
+                self.bt_config_path_var.set(path)
+            except Exception:
+                pass
+            self._bt_append_log(f"Auto-selected ML config/artifact path: {path}")
+        else:
+            self._bt_append_log("No ML config/artifact found. Leave config blank to use embedded CSV score columns.")
+        return path
+
+    def _bt_default_dataset_candidates(self) -> list[Path]:
+        candidates: list[Path] = []
+        seen: set[str] = set()
+
+        def add(path: object) -> None:
+            try:
+                p = Path(str(path)).expanduser()
+                if not p.is_absolute():
+                    p = (REPO_ROOT / p).resolve()
+                key = str(p).lower()
+                if key not in seen and p.exists() and p.is_file() and p.suffix.lower() in {".csv", ".parquet"}:
+                    seen.add(key)
+                    candidates.append(p)
+            except Exception:
+                return
+
+        for attr in ("bt_retrain_dataset_var", "bt_csv_path_var"):
+            var = getattr(self, attr, None)
+            if var is None:
+                continue
+            try:
+                raw = str(var.get() or "").strip()
+            except Exception:
+                raw = ""
+            if raw:
+                add(raw)
+
+        try:
+            target = self._bt_discover_ensemble_test_target()
+            for key in ("dataset_hint", "csv_path", "data_path", "dataset_path"):
+                value = str((target or {}).get(key) or "").strip()
+                if value:
+                    resolved = resolve_dataset_path(REPO_ROOT, value)
+                    add(resolved or value)
+        except Exception:
+            pass
+
+        search_roots = [
+            REPO_ROOT / "data" / "processed",
+            REPO_ROOT / "data",
+            REPO_ROOT / "models",
+        ]
+        found: list[Path] = []
+        for root in search_roots:
+            try:
+                if root.exists():
+                    found.extend([p for p in root.rglob("*.parquet") if p.is_file()])
+                    found.extend([p for p in root.rglob("*.csv") if p.is_file()])
+            except Exception:
+                continue
+        def _dataset_rank(path: Path) -> tuple[int, float]:
+            name = path.name.lower()
+            score = 0
+            if "option_chain" in name:
+                score += 100
+            if "processed" in str(path.parent).lower():
+                score += 50
+            if path.suffix.lower() == ".parquet":
+                score += 10
+            if "backtest_trades" in name or "threshold_sweep" in name or "report" in name:
+                score -= 100
+            try:
+                if path.stat().st_size < 512:
+                    score -= 20
+            except Exception:
+                pass
+            try:
+                mtime = path.stat().st_mtime
+            except Exception:
+                mtime = 0.0
+            return score, mtime
+
+        for path in sorted(found, key=_dataset_rank, reverse=True)[:25]:
+            add(path)
+        return candidates
+
+    def _bt_resolve_default_dataset_path(self) -> str:
+        for path in self._bt_default_dataset_candidates():
+            try:
+                return str(path.relative_to(REPO_ROOT))
+            except Exception:
+                return str(path)
+        return ""
+
+    def _bt_autofill_dataset_path(self) -> str:
+        path = self._bt_resolve_default_dataset_path()
+        if path:
+            try:
+                self.bt_csv_path_var.set(path)
+            except Exception:
+                pass
+            self._bt_append_log(f"Auto-selected historical dataset: {path}")
+        else:
+            self._bt_append_log("No historical CSV/Parquet dataset found under data/, data/processed/, or models/.")
+        return path
+
+    @staticmethod
+    def _bt_validate_date_text(value: str, label: str) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        try:
+            import pandas as pd
+
+            pd.to_datetime(text, errors="raise")
+        except Exception as exc:
+            raise ValueError(f"{label} must be a parseable date/time, got {text!r}") from exc
+
     def _bt_ensemble_retrain_progress_from_log(self, line: str) -> None:
         text = str(line or "").strip().lower()
         if not text:
@@ -3843,8 +3770,13 @@ class ScalperUI(tk.Tk):
 
     def _on_browse_bt_csv(self) -> None:
         fn = filedialog.askopenfilename(
-            title="Select historical options CSV",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Select historical options CSV/Parquet",
+            filetypes=[
+                ("Historical datasets", "*.csv *.parquet"),
+                ("CSV files", "*.csv"),
+                ("Parquet files", "*.parquet"),
+                ("All files", "*.*"),
+            ],
         )
         if fn:
             self.bt_csv_path_var.set(fn)
@@ -4157,11 +4089,11 @@ class ScalperUI(tk.Tk):
             except Exception as exc:
                 tb = traceback.format_exc()
 
-                def _fail() -> None:
+                def _fail(_exc=exc, _tb=tb) -> None:
                     self._bt_set_status("ENSEMBLE RETRAIN FAILED")
                     self._bt_set_progress(0.0, "Retrain failed")
-                    self._bt_append_log(f"ERROR: {exc}")
-                    last = (tb or "").strip().splitlines()[-1] if tb else ""
+                    self._bt_append_log(f"ERROR: {_exc}")
+                    last = (_tb or "").strip().splitlines()[-1] if _tb else ""
                     if last:
                         self._bt_append_log(last)
                     self._bt_set_action_buttons_enabled(True)
@@ -4248,11 +4180,16 @@ class ScalperUI(tk.Tk):
                 pass
             return
         csvp = str(self.bt_csv_path_var.get() or "").strip()
+        if not csvp:
+            csvp = self._bt_resolve_default_dataset_path()
+            if csvp:
+                self.bt_csv_path_var.set(csvp)
+                self._bt_append_log(f"Auto-selected historical dataset: {csvp}")
         if not csvp or not Path(csvp).exists():
-            messagebox.showerror("Backtest", "Please select a valid historical options CSV file.")
+            messagebox.showerror("Backtest", "Please select a valid historical options CSV/Parquet file.")
             return
-        if not csvp.lower().endswith(".csv"):
-            messagebox.showerror("Backtest", "Selected file must be a .csv")
+        if Path(csvp).suffix.lower() not in {".csv", ".parquet"}:
+            messagebox.showerror("Backtest", "Selected file must be a .csv or .parquet")
             return
 
         outd = str(self.bt_output_dir_var.get() or "reports/backtests").strip() or "reports/backtests"
@@ -4264,13 +4201,39 @@ class ScalperUI(tk.Tk):
 
         cfgp = str(self.bt_config_path_var.get() or "").strip()
         if not cfgp:
-            for cand in ("config/paper_forward_candidates.json", "config/paper_forward_candidates_latest.json", "config/ml_candidates.json", "models"):
-                if Path(cand).exists():
-                    cfgp = cand
-                    self.bt_config_path_var.set(cand)
-                    break
-        if cfgp and not Path(cfgp).exists():
+            cfgp = self._bt_resolve_default_config_path()
+            if cfgp:
+                self.bt_config_path_var.set(cfgp)
+                self._bt_append_log(f"Auto-selected ML config/artifact path: {cfgp}")
+            else:
+                self._bt_append_log("No ML config/artifact selected; using embedded CSV score columns if available.")
+        cfg_path_obj = Path(cfgp).expanduser() if cfgp else None
+        if cfg_path_obj is not None and not cfg_path_obj.is_absolute():
+            cfg_path_obj = (REPO_ROOT / cfg_path_obj).resolve()
+        if cfg_path_obj is not None and cfg_path_obj.is_dir():
+            static_ensemble_cfg = (REPO_ROOT / "config" / "ensemble_xgb_rf_dynamic_candidate.json").resolve()
+            models_root = (REPO_ROOT / "models").resolve()
+            raw_ensemble_dir = (REPO_ROOT / "models" / "all_combined_parquet_rf_xgb_ensemble").resolve()
+            try:
+                if cfg_path_obj.resolve() in {models_root, raw_ensemble_dir} and static_ensemble_cfg.is_file():
+                    cfg_path_obj = static_ensemble_cfg
+                    cfgp = str(static_ensemble_cfg)
+                    self.bt_config_path_var.set(cfgp)
+                    self._bt_append_log(
+                        f"Backtest path was a broad/raw model directory; switched to guarded ensemble config: {cfgp}"
+                    )
+            except Exception:
+                pass
+        if cfg_path_obj is not None and not cfg_path_obj.exists():
             messagebox.showerror("Backtest", f"ML candidate/config path does not exist:\n{cfgp}")
+            return
+        if cfg_path_obj is not None and not self._bt_path_has_model_artifacts(cfg_path_obj):
+            messagebox.showerror(
+                "Backtest",
+                "Selected ML config/artifact path does not contain usable candidates or model artifacts.\n\n"
+                f"Path: {cfgp}\n\n"
+                "Choose a candidate JSON, model .pkl/.joblib, artifact directory, or leave blank to use CSV score columns.",
+            )
             return
 
         try:
@@ -4279,6 +4242,12 @@ class ScalperUI(tk.Tk):
             sl = float(str(self.bt_sl_var.get() or "10").strip()) / 100.0
             hold = int(str(self.bt_hold_var.get() or "5").strip())
             maxd = int(str(self.bt_maxday_var.get() or "3").strip())
+            if not 0.0 <= thr <= 1.0:
+                raise ValueError("Threshold must be between 0 and 1")
+            if tgt <= 0 or sl <= 0:
+                raise ValueError("Target and SL percentages must be positive")
+            if hold <= 0 or maxd <= 0:
+                raise ValueError("Max hold bars and Max/day must be positive integers")
             debug = bool(self.bt_debug_var.get()) if hasattr(self, "bt_debug_var") else True
             use_candidate_thresholds = bool(self.bt_use_candidate_thresholds_var.get()) if hasattr(self, "bt_use_candidate_thresholds_var") else True
             ml_artifact_scoring = bool(self.bt_ml_artifact_scoring_var.get()) if hasattr(self, "bt_ml_artifact_scoring_var") else True
@@ -4296,11 +4265,18 @@ class ScalperUI(tk.Tk):
             max_candidates_raw = str(self.bt_max_candidates_var.get() or "").strip() if hasattr(self, "bt_max_candidates_var") else ""
             max_rows = int(max_rows_raw) if max_rows_raw else None
             max_candidates = int(max_candidates_raw) if max_candidates_raw else None
-        except Exception:
-            messagebox.showerror("Backtest", "Invalid numeric parameters (threshold/target/sl/hold/maxday).")
+            if max_rows is not None and max_rows <= 0:
+                raise ValueError("Rows must be positive when set")
+            if max_candidates is not None and max_candidates <= 0:
+                raise ValueError("Cands must be positive when set")
+            self._bt_validate_date_text(date_from, "From")
+            self._bt_validate_date_text(date_to, "To")
+        except Exception as exc:
+            messagebox.showerror("Backtest", f"Invalid backtest parameters: {exc}")
             return
 
         # Prep UI for run
+        self._bt_last_output_dir = outd
         self._bt_set_action_buttons_enabled(False)
         try:
             self.bt_stop_btn.configure(state=tk.NORMAL)
@@ -4326,7 +4302,10 @@ class ScalperUI(tk.Tk):
         def worker() -> None:
             try:
                 # Import here so GUI starts even if script has issues
-                from scripts.backtest_ml_models_from_csv import run_historical_ml_backtest
+                try:
+                    from scripts.backtest_ml_models_from_csv import run_historical_ml_backtest
+                except ModuleNotFoundError:
+                    from backtest_ml_models_from_csv import run_historical_ml_backtest
 
                 def _log_cb(line: str) -> None:
                     self._bt_append_log(line)
@@ -4427,7 +4406,7 @@ class ScalperUI(tk.Tk):
 
             except Exception as exc:
                 tb = traceback.format_exc()
-                def _fail() -> None:
+                def _fail(_exc=exc, _tb=tb) -> None:
                     self._bt_set_status("FAILED")
                     self._bt_set_progress(0.0, "Failed")
                     self._bt_set_action_buttons_enabled(True)
@@ -4435,8 +4414,8 @@ class ScalperUI(tk.Tk):
                         self.bt_stop_btn.configure(state=tk.DISABLED)
                     except Exception:
                         pass
-                    self._bt_append_log(f"ERROR: {exc}")
-                    last = (tb or "").strip().splitlines()[-1] if tb else ""
+                    self._bt_append_log(f"ERROR: {_exc}")
+                    last = (_tb or "").strip().splitlines()[-1] if _tb else ""
                     if last:
                         self._bt_append_log(last)
                     logger.exception("ML Backtest (CSV) failed")
@@ -4808,7 +4787,7 @@ class ScalperUI(tk.Tk):
                 except Exception:
                     pass
                 return
-            
+
             prices = [float(c.close) for c in candles]
             if len(prices) < 2:
                 try:
@@ -4816,7 +4795,7 @@ class ScalperUI(tk.Tk):
                 except Exception:
                     pass
                 return
-            
+
             # Compute a robust automated signal overlay (EMA Fast > EMA Slow crossover)
             signals = []
             try:
@@ -4824,29 +4803,29 @@ class ScalperUI(tk.Tk):
                 ema_slow = []
                 alpha_fast = 2.0 / (9.0 + 1.0)
                 alpha_slow = 2.0 / (20.0 + 1.0)
-                
+
                 curr_fast = prices[0]
                 curr_slow = prices[0]
-                
+
                 for p in prices:
                     curr_fast = p * alpha_fast + curr_fast * (1.0 - alpha_fast)
                     curr_slow = p * alpha_slow + curr_slow * (1.0 - alpha_slow)
                     ema_fast.append(curr_fast)
                     ema_slow.append(curr_slow)
-                    
+
                 for i in range(len(prices)):
                     signals.append(1 if ema_fast[i] > ema_slow[i] else 0)
             except Exception:
                 signals = [1 if i % 2 == 0 else 0 for i in range(len(prices))]
-                
+
             self._bt_series_var.set(",".join(f"{p:.2f}" for p in prices))
             self._bt_signals_var.set(",".join(str(s) for s in signals))
-            
+
             try:
                 messagebox.showinfo("Live Simulation", f"Successfully synced {len(prices)} live candles and generated EMA crossover signals dynamically from the broker connection!")
             except Exception:
                 pass
-            
+
             # Automatically run the unified backtest & optimization immediately!
             self._bt_run()
         except Exception as e:
@@ -5283,7 +5262,7 @@ class ScalperUI(tk.Tk):
 
             # Broker APIs sometimes report 0 required margin for BUY option legs.
             # In practice, long premium still requires cash outlay ~= premium * qty.
-            # Treat that as required margin so UI doesn't misleadingly show â‚¹0.00.
+            # Treat that as required margin so UI doesn't misleadingly show â'10.00.
             try:
                 mr_f = float(mr) if mr is not None else None
             except Exception:
@@ -5964,7 +5943,7 @@ class ScalperUI(tk.Tk):
                 legs_n = int(pr.get("legs_count") or 0)
             except Exception:
                 legs_n = 0
-            self._diag_risk_var.set(f"Risk: |Î”|={delta_abs:.1f} | Notional={notional:.0f} | Legs={legs_n}")
+            self._diag_risk_var.set(f"Risk: |Delta|={delta_abs:.1f} | Notional={notional:.0f} | Legs={legs_n}")
 
             p_req = snap.get("gpt_preset_request") if isinstance(snap.get("gpt_preset_request"), dict) else {}
             req = str(p_req.get("preset_request") or "").strip().lower()
@@ -5993,7 +5972,7 @@ class ScalperUI(tk.Tk):
                     exps_str = ", ".join(f"{k}: {v}" for k, v in expiry_conc.items())
                 else:
                     exps_str = "None"
-                
+
                 self._greeks_delta_var.set(f"Portfolio Delta: {delta:.2f}")
                 self._greeks_gamma_var.set(f"Portfolio Gamma: {gamma:.5f}")
                 self._greeks_theta_var.set(f"Portfolio Theta: {theta:.2f} / day")
@@ -6040,7 +6019,7 @@ class ScalperUI(tk.Tk):
                 # Update Adaptive Regime and Failsafes Readouts
                 active_regime = str(snap.get("active_regime", "chop")).strip().lower()
                 self._active_regime_var.set(f"Current Regime: {active_regime.upper()}")
-                
+
                 # Premium dynamic regime color coding
                 regime_colors = {
                     "trend": "#27ae60",         # Vibrant Green
@@ -6052,25 +6031,25 @@ class ScalperUI(tk.Tk):
                 color = regime_colors.get(active_regime, "#2980b9")
                 if hasattr(self, "regime_lbl"):
                     self.regime_lbl.configure(foreground=color)
-                
+
                 scores = snap.get("regime_scores") or {}
                 s_m = float(scores.get("S_M", 0.0) or 0.0)
                 s_v = float(scores.get("S_V", 0.0) or 0.0)
                 s_l = float(scores.get("S_L", 0.0) or 0.0)
                 s_h = float(scores.get("S_H", 0.0) or 0.0)
                 self._regime_scores_var.set(f"Scores: S_M={s_m:.2f}, S_V={s_v:.2f}, S_L={s_l:.2f}, S_H={s_h:.2f}")
-                
+
                 failsafes = snap.get("failsafes") or {}
                 event_lag = bool(failsafes.get("event_lag", False))
                 spread_shock = bool(failsafes.get("spread_shock", False))
                 slippage_breaker = bool(failsafes.get("slippage_breaker", False))
-                
+
                 self._failsafe_status_var.set(
                     f"Failsafes: Lag={'BLOCKED' if event_lag else 'OK'}, "
                     f"Spread={'BLOCKED' if spread_shock else 'OK'}, "
                     f"Slippage={'BLOCKED' if slippage_breaker else 'OK'}"
                 )
-                
+
                 # Active blocks highlight label in high-visibility red, else reassuring green
                 if event_lag or spread_shock or slippage_breaker:
                     failsafe_color = "#e74c3c"
@@ -6085,13 +6064,13 @@ class ScalperUI(tk.Tk):
                 # 4. Reconciliation Warnings & Log
                 recon_mismatch = bool(snap.get("reconciliation_mismatch", False))
                 recon_reason = str(snap.get("reconciliation_reason", "") or "")
-                
+
                 # Check emergency pause on strategy also
                 entries_paused = bool(snap.get("entries_paused", False))
-                
+
                 if recon_mismatch or entries_paused:
                     reason_msg = recon_reason or "Manual Entry Pause or Position Mismatch detected!"
-                    self.freeze_msg_lbl.configure(text=f"ðŸš¨ EMERGENCY TRADING FREEZE ACTIVE: {reason_msg} ðŸš¨")
+                    self.freeze_msg_lbl.configure(text=f"ðŸš ̈ EMERGENCY TRADING FREEZE ACTIVE: {reason_msg} ðŸš ̈")
                     # Pack the banner if not already packed
                     if not self.freeze_banner.winfo_ismapped():
                         self.freeze_banner.pack(fill=tk.X, expand=False, pady=(0, 10), before=self.freeze_banner.master.children[list(self.freeze_banner.master.children.keys())[1]])
@@ -6360,24 +6339,24 @@ class ScalperUI(tk.Tk):
                     running_pnl = sum(float(v) for v in pnl_ledger)
             except Exception:
                 pass
-            
+
             live_pnl_val = running_pnl + total_unrealized
-            
+
             if not hasattr(self, "pnl_series_history") or self.pnl_series_history is None:
                 self.pnl_series_history = {
                     "Realized P&L": [],
                     "Unrealized MTM": [],
                     "Live P&L": []
                 }
-            
+
             self.pnl_series_history["Realized P&L"].append((now_dt, running_pnl))
             self.pnl_series_history["Unrealized MTM"].append((now_dt, total_unrealized))
             self.pnl_series_history["Live P&L"].append((now_dt, live_pnl_val))
-            
+
             for key in self.pnl_series_history:
                 if len(self.pnl_series_history[key]) > 1000:
                     self.pnl_series_history[key] = self.pnl_series_history[key][-1000:]
-                    
+
             if hasattr(self, "pnl_chart_plugin") and self.pnl_chart_plugin is not None:
                 self.pnl_chart_plugin.update_series(self.pnl_series_history)
         except Exception:
@@ -7174,15 +7153,6 @@ class ScalperUI(tk.Tk):
     def _fast_ui_start_enabled(self) -> bool:
         return str(os.getenv("FAST_UI_START", "0")).strip().lower() in {"1", "true", "yes", "y"}
 
-    def _pf_autostart_disabled(self) -> bool:
-        return str(os.getenv("PF_DISABLE_STARTUP_AUTOSTART", "0")).strip().lower() in {"1", "true", "yes", "y"}
-
-    def _pf_autostart_delay_ms(self) -> int:
-        try:
-            return max(0, int(os.getenv("PF_AUTOSTART_DELAY_MS", "1500") or 1500))
-        except Exception:
-            return 1500
-
     def _startup_log_stage(self, stage: str) -> None:
         t0 = getattr(self, "_startup_t0", time.perf_counter())
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
@@ -7222,7 +7192,7 @@ class ScalperUI(tk.Tk):
         try:
             self._build_widgets_deferred()
         except Exception as exc:
-            self._safe_call("_post_first_paint_startup", lambda: (_ for _ in ()).throw(exc), tab="startup")
+            self._safe_call("_post_first_paint_startup", lambda _exc=exc: (_ for _ in ()).throw(_exc), tab="startup")
         try:
             self._register_all_tab_audits()
         except Exception:
@@ -7291,14 +7261,14 @@ class ScalperUI(tk.Tk):
         except Exception:
             pass
         self._startup_log_stage("before_load_candidates")
-        if not self._fast_ui_start_enabled():
-            self._start_worker("startup_candidate_metadata", self._load_candidate_config_metadata_worker)
-        else:
-            self._startup_log_stage("after_load_candidates")
-        self._startup_log_stage("before_pf_autostart")
-        if not self._fast_ui_start_enabled() and not self._pf_autostart_disabled():
-            self._safe_after_app("pf_auto_start", self._pf_autostart_delay_ms(), self._maybe_autostart_paper_forward)
-        self._startup_log_stage("after_pf_autostart")
+        self._candidate_config_metadata = {"loaded_n": 0}
+        self._candidate_artifacts_loaded = True
+        try:
+            if hasattr(self, "_startup_loading_var"):
+                self._startup_loading_var.set("")
+        except Exception:
+            pass
+        self._startup_log_stage("after_load_candidates")
         try:
             self.btn_start.configure(state=tk.NORMAL)
         except Exception:
@@ -7307,115 +7277,6 @@ class ScalperUI(tk.Tk):
             self._app_status_var.set("Ready.")
         except Exception:
             pass
-
-    def _load_candidate_config_metadata_worker(self) -> None:
-        result: dict[str, object] = {"error": None}
-        try:
-            env_pf = str(os.getenv("MSTOCK_PAPER_FORWARD_MULTI", "0")).strip().lower() in {"1", "true", "yes"}
-            act_id = os.getenv("MSTOCK_ACTIVE_CANDIDATE_ID", "") or os.getenv("MSTOCK_ACTIVE_CANDIDATE_IDS", "")
-            cand_file = _paper_forward_candidate_config_label()
-            file_exists = os.path.exists(cand_file)
-            loaded_n = 0
-            valid_n = 0
-            paper_cands: list[dict] = []
-            if file_exists:
-                try:
-                    _cfg = json.loads(Path(cand_file).read_text(encoding="utf-8"))
-                    paper_cands = [
-                        c for c in _cfg.get("candidates", [])
-                        if c.get("paper_forward_only") or c.get("classification") == "paper_forward_only"
-                    ]
-                    loaded_n = len(paper_cands)
-                    total = len(paper_cands)
-                    for idx, c in enumerate(paper_cands, start=1):
-                        try:
-                            self.after(0, lambda i=idx, t=total: self._startup_loading_var.set(
-                                f"Loading candidate artifacts {i}/{t}..."
-                            ) if hasattr(self, "_startup_loading_var") else None)
-                        except Exception:
-                            pass
-                        ad = c.get("artifact_dir") or ""
-                        ap = Path(ad)
-                        if not ap.is_absolute():
-                            ap = (Path.cwd() / ad).resolve()
-                        has_model = (ap / "model.pkl").exists() or bool(list(ap.glob("*.pkl")))
-                        has_meta = any((ap / f).exists() for f in ["candidate_manifest.json", "paper_forward_manifest.json", "candidate_profile.json"])
-                        fs_n = 0
-                        fsf = ap / "feature_schema.json"
-                        if fsf.exists():
-                            try:
-                                fsd = json.loads(fsf.read_text(encoding="utf-8"))
-                                if isinstance(fsd, list):
-                                    fs_n = len(fsd)
-                                elif isinstance(fsd, dict):
-                                    fs_n = len(fsd.get("features") or fsd.get("live_computable_features") or [])
-                            except Exception:
-                                pass
-                        is_ml = str(c.get("model_name", "")).lower() not in ("", "rule", "heuristic")
-                        if has_model and has_meta and (fs_n > 0 or not is_ml):
-                            valid_n += 1
-                except Exception as exc:
-                    result["error"] = str(exc)
-            pf_multi = env_pf or (file_exists and loaded_n > 0)
-            live_orders = str(os.getenv("MSTOCK_ENABLE_LIVE_ORDERS", "false")).lower() in {"1", "true", "yes"}
-            result.update({
-                "act_id": act_id,
-                "file_exists": file_exists,
-                "loaded_n": loaded_n,
-                "valid_n": valid_n,
-                "pf_multi": pf_multi,
-                "live_orders": live_orders,
-                "paper_cands": paper_cands,
-            })
-        except Exception as exc:
-            result["error"] = str(exc)
-        try:
-            self.after(0, lambda r=result: self._apply_candidate_config_metadata(r))
-        except Exception:
-            pass
-
-    def _apply_candidate_config_metadata(self, result: dict[str, object]) -> None:
-        self._startup_log_stage("after_load_candidates")
-        try:
-            act_id = str(result.get("act_id") or "")
-            file_exists = bool(result.get("file_exists"))
-            loaded_n = int(result.get("loaded_n") or 0)
-            valid_n = int(result.get("valid_n") or 0)
-            pf_multi = bool(result.get("pf_multi"))
-            live_orders = bool(result.get("live_orders"))
-            inv_n = max(0, loaded_n - valid_n)
-            print(
-                f"[CANDIDATE-CONFIG] active_candidate_id={act_id or '--'} active_candidate_ids={act_id or '--'} "
-                f"paper_forward_multi={pf_multi} candidate_file_exists={file_exists} loaded_candidates={loaded_n} "
-                f"live_orders_enabled={live_orders}",
-                flush=True,
-            )
-            if pf_multi and loaded_n > 0:
-                print(
-                    f"[CANDIDATE-CONFIG] paper_forward_multi=true enabled_valid_candidates={valid_n} "
-                    f"invalid_candidates={inv_n} reason=loaded_from_candidate_file",
-                    flush=True,
-                )
-            if live_orders:
-                print("[SAFETY-BLOCK] MSTOCK_ENABLE_LIVE_ORDERS=true — paper-forward monitor disabled", flush=True)
-            err = result.get("error")
-            if err:
-                print(f"[CANDIDATE-CONFIG] diag error: {err}", flush=True)
-            self._candidate_config_metadata = result
-            self._candidate_artifacts_loaded = True
-            try:
-                if hasattr(self, "_startup_loading_var"):
-                    n = int(result.get("loaded_n") or 0)
-                    self._startup_loading_var.set(f"Loaded {n} candidate configs")
-            except Exception:
-                pass
-        except Exception as exc:
-            print(f"[CANDIDATE-CONFIG] apply error: {exc}", flush=True)
-
-    def _maybe_autostart_paper_forward(self) -> None:
-        if self._pf_autostart_disabled() or self._fast_ui_start_enabled():
-            return
-        self._pf_ensure_paper_forward_running()
 
     def _deferred_mount_live_chart_tab(self) -> None:
         self._startup_log_stage("before_chart_mount")
@@ -7446,7 +7307,7 @@ class ScalperUI(tk.Tk):
                     self._safe_call(builder_name, builder, tab=tab_text)
             except Exception as exc:
                 self._lazy_main_tabs_built.discard(tab_text)
-                self._safe_call(builder_name, lambda: (_ for _ in ()).throw(exc), tab=tab_text)
+                self._safe_call(builder_name, lambda _exc=exc: (_ for _ in ()).throw(_exc), tab=tab_text)
 
         self._add_tab_loading_placeholder(frame, "Loading tab...")
         self.after(50, _build)
@@ -7466,7 +7327,7 @@ class ScalperUI(tk.Tk):
                     self._safe_call(spec[1], builder, tab=tab_text)
             except Exception as exc:
                 self._lazy_analytics_tabs_built.discard(tab_text)
-                self._safe_call(spec[1], lambda: (_ for _ in ()).throw(exc), tab=tab_text)
+                self._safe_call(spec[1], lambda _exc=exc: (_ for _ in ()).throw(_exc), tab=tab_text)
 
         frame = getattr(self, spec[0], None)
         if frame is not None:
@@ -7550,10 +7411,6 @@ class ScalperUI(tk.Tk):
         self.live_harness_frame = ttk.Frame(self.notebook)
         self.ml_backtest_frame = ttk.Frame(self.notebook)
         self.telemetry_frame = ttk.Frame(self.notebook)
-        self.validation_frame = ttk.Frame(self.notebook)
-        self.ensemble_auto_router_frame = ttk.Frame(self.notebook)
-        self.paper_forward_monitor_frame = ttk.Frame(self.notebook)
-        self.candidate_promo_frame = ttk.Frame(self.notebook)
         self.trade_frame = ttk.Frame(self.history_notebook)
         self.journal_frame = ttk.Frame(self.history_notebook)
         self.signals_frame = ttk.Frame(self.analytics_notebook)
@@ -7571,10 +7428,6 @@ class ScalperUI(tk.Tk):
         self.notebook.add(self.live_harness_frame, text="Backtest Runner")
         self.notebook.add(self.ml_backtest_frame, text="Historical ML Backtest Runner")
         self.notebook.add(self.telemetry_frame, text="Telemetry & Diagnostics")
-        self.notebook.add(self.validation_frame, text="Forward Validation")
-        self.notebook.add(self.ensemble_auto_router_frame, text="Ensemble Auto Router")
-        self.notebook.add(self.paper_forward_monitor_frame, text="Paper Forward Monitor")
-        self.notebook.add(self.candidate_promo_frame, text="Candidate Promotion / Deployment")
         self.history_notebook.add(self.trade_frame, text="Trade Logs")
         self.history_notebook.add(self.journal_frame, text="Trade Journal")
         self.analytics_notebook.add(self.signals_frame, text="Signals/Greeks")
@@ -7690,11 +7543,11 @@ class ScalperUI(tk.Tk):
                 return
             item = self.dash_opt_tree.item(selection[0])
             trade_id = item["values"][0] if item["values"] else None
-            
+
             # Navigate to Positions parent frame, then option legs sub-tab
             self.notebook.select(self.positions_notebook_frame)
             self.positions_notebook.select(self.option_legs_frame)
-            
+
             # Focus/select the corresponding trade leg in the detailed page
             if trade_id:
                 for child in self.option_legs_tree.get_children():
@@ -7714,11 +7567,11 @@ class ScalperUI(tk.Tk):
                 return
             item = self.dash_eq_tree.item(selection[0])
             symbol = item["values"][0] if item["values"] else None
-            
+
             # Navigate to Positions parent frame, then managed positions sub-tab
             self.notebook.select(self.positions_notebook_frame)
             self.positions_notebook.select(self.managed_positions_frame)
-            
+
             # Focus/select the corresponding equity in the detailed page
             if symbol:
                 for child in self.managed_positions_tree.get_children():
@@ -7773,12 +7626,7 @@ class ScalperUI(tk.Tk):
         try:
             chain = getattr(self, "_option_chain_data", None)
             candles = getattr(self, "_latest_candles", None)
-            candidates = (
-                getattr(self, "_pf_candidates", None)
-                or getattr(self, "pf_candidates", None)
-                or getattr(self, "_candidate_configs", None)
-                or []
-            )
+            candidates = getattr(self, "_candidate_configs", None) or []
             try:
                 active_candidates = len([c for c in candidates if not isinstance(c, dict) or c.get("enabled", True)])
             except Exception:
@@ -7835,7 +7683,7 @@ class ScalperUI(tk.Tk):
                 self._safe_after_app("pump_trades", 0, self._pump_trades)
                 self._safe_after_app("refresh_journal", 0, self._refresh_trade_journal)
         except Exception as exc:
-            self._safe_call("_on_sub_notebook_tab_changed", lambda: (_ for _ in ()).throw(exc), tab=sub)
+            self._safe_call("_on_sub_notebook_tab_changed", lambda _exc=exc: (_ for _ in ()).throw(_exc), tab=sub)
 
     def _refresh_active_tab_now(self, tab_text: str) -> None:
         if tab_text == "Live Dashboard":
@@ -7859,17 +7707,6 @@ class ScalperUI(tk.Tk):
             self._safe_after_app("pump_engine_diag", 0, self._pump_engine_diagnostics)
         elif tab_text == "Forward Validation":
             self._safe_call("_trigger_validation_refresh", self._trigger_validation_refresh, tab=tab_text)
-        elif tab_text == "Ensemble Auto Router":
-            self._safe_call("_ensemble_refresh_ui", self._ensemble_refresh_ui, tab=tab_text)
-        elif tab_text == "Paper Forward Monitor":
-            if not self._pf_dict_get("_pf_user_stopped"):
-                self._safe_call("_pf_ensure_paper_forward_running", self._pf_ensure_paper_forward_running, tab=tab_text)
-            self._safe_call("_pf_request_ui_update", self._pf_request_ui_update, source="tab_select", tab=tab_text)
-            if self._pf_dict_get("pf_engine") and not self._pf_dict_get("_pf_after_job"):
-                self._safe_call("_pf_schedule_update", self._pf_schedule_update, tab=tab_text)
-        elif tab_text == "Candidate Promotion / Deployment":
-            if tab_text in self._lazy_main_tabs_built and hasattr(self, "cp_tree"):
-                self._safe_after_app("cp_refresh", 0, self._cp_refresh_table)
 
     def _on_tab_changed(self, event=None) -> None:
         nb = event.widget if event is not None else self._ui_dict_get("notebook")
@@ -7905,11 +7742,6 @@ class ScalperUI(tk.Tk):
         if cached is not None:
             cached_mtime, cached_sm = cached
             if mtime is None or cached_mtime == mtime:
-                try:
-                    from pf_logging import log_scripmaster_cache
-                    log_scripmaster_cache(hit=True, key=path, rows=len(getattr(cached_sm, "_rows", []) or []))
-                except Exception:
-                    pass
                 return cached_sm
 
         try:
@@ -7918,7 +7750,7 @@ class ScalperUI(tk.Tk):
             sm = get_scripmaster_singleton(path)
             if sm is None:
                 sm = ScripMaster(path)
-            # Warm indexes once — avoid repeated full CSV scans in the live loop.
+            # Warm indexes once - avoid repeated full CSV scans in the live loop.
             sm._load()
             sm._build_tradingsymbol_index()
             sm._build_structured_index()
@@ -7928,25 +7760,6 @@ class ScalperUI(tk.Tk):
 
         self._scripmaster_cache[path] = (mtime, sm)
         return sm
-
-    def _pf_log_data_status(
-        self,
-        *,
-        spot: Any = None,
-        option_rows: int = 0,
-        candles: int = 0,
-        data_quality: str = "",
-        spot_source: str = "",
-        extra: str = "",
-    ) -> None:
-        log_pf_data(
-            spot=spot,
-            option_rows=option_rows,
-            candles=candles,
-            data_quality=data_quality,
-            spot_source=spot_source,
-            extra=extra,
-        )
 
     def _build_widgets(self) -> None:
         _shell = getattr(self, "_widgets_shell_built", False)
@@ -7984,17 +7797,17 @@ class ScalperUI(tk.Tk):
             self.positions_notebook_frame = ttk.Frame(self.notebook)
             self.positions_notebook = ttk.Notebook(self.positions_notebook_frame)
             self.positions_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-            
+
             self.history_notebook_frame = ttk.Frame(self.notebook)
             self.history_notebook = ttk.Notebook(self.history_notebook_frame)
             self.history_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-            
+
             self.analytics_notebook_frame = ttk.Frame(self.notebook)
-            
+
             # Make the Market Analytics tab scrollable
             analytics_outer = ttk.Frame(self.analytics_notebook_frame)
             analytics_outer.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-            
+
             analytics_canvas = tk.Canvas(analytics_outer, highlightthickness=0)
             try:
                 style = ttk.Style(self)
@@ -8003,22 +7816,22 @@ class ScalperUI(tk.Tk):
                     analytics_canvas.configure(background=bg)
             except Exception:
                 pass
-                
+
             analytics_vsb = ttk.Scrollbar(analytics_outer, orient="vertical", command=analytics_canvas.yview)
             analytics_canvas.configure(yscrollcommand=analytics_vsb.set)
             analytics_vsb.pack(side=tk.RIGHT, fill=tk.Y)
             analytics_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            
+
             # Internal container for the analytics notebook
             analytics_container = ttk.Frame(analytics_canvas)
             analytics_container_id = analytics_canvas.create_window((0, 0), window=analytics_container, anchor="nw")
-            
+
             def _on_analytics_configure(_evt: object = None) -> None:
                 try:
                     analytics_canvas.configure(scrollregion=analytics_canvas.bbox("all"))
                 except Exception:
                     return
-                    
+
             def _on_analytics_canvas_configure(evt: object) -> None:
                 try:
                     width = int(getattr(evt, "width"))
@@ -8028,10 +7841,10 @@ class ScalperUI(tk.Tk):
                     analytics_canvas.itemconfigure(analytics_container_id, width=width)
                 except Exception:
                     return
-                    
+
             analytics_container.bind("<Configure>", lambda e: _on_analytics_configure(e))
             analytics_canvas.bind("<Configure>", _on_analytics_canvas_configure)
-            
+
             # Mouse wheel scrolling for Market Analytics
             def _analytics_mousewheel(evt: object) -> None:
                 try:
@@ -8040,28 +7853,28 @@ class ScalperUI(tk.Tk):
                     delta = 0
                 if delta:
                     analytics_canvas.yview_scroll(int(-delta / 120), "units")
-                    
+
             def _analytics_linux_scroll(evt: object) -> None:
                 num = getattr(evt, "num", None)
                 if num == 4:
                     analytics_canvas.yview_scroll(-1, "units")
                 elif num == 5:
                     analytics_canvas.yview_scroll(1, "units")
-                    
+
             analytics_canvas.bind_all("<MouseWheel>", _analytics_mousewheel, add="+")
             analytics_canvas.bind_all("<Button-4>", _analytics_linux_scroll, add="+")
             analytics_canvas.bind_all("<Button-5>", _analytics_linux_scroll, add="+")
-            
+
             self.analytics_notebook = ttk.Notebook(analytics_container)
             self.analytics_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-            
+
             self.sim_notebook_frame = ttk.Frame(self.notebook)
             self.sim_notebook = ttk.Notebook(self.sim_notebook_frame)
             self.sim_notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-            
+
             self.gpt_frame = ttk.Frame(self.notebook)
             self.settings_frame = ttk.Frame(self.notebook)
-    
+
             # Register Parent Tabs in Main Notebook
             self.notebook.add(self.dashboard_frame, text="Live Dashboard")
             self.notebook.add(self.positions_notebook_frame, text="Open Positions")
@@ -8070,50 +7883,26 @@ class ScalperUI(tk.Tk):
             self.notebook.add(self.sim_notebook_frame, text="Simulation & Test")
             self.notebook.add(self.gpt_frame, text="GPT Advisor")
             self.notebook.add(self.settings_frame, text="Settings")
-            
+
             # Live Harness Tab (unified backtest + optimizer) -- tab label renamed to Backtest Runner (additive ML CSV backtester added below)
             self.live_harness_frame = ttk.Frame(self.notebook)
             self.notebook.add(self.live_harness_frame, text="Backtest Runner")
-            
+
             # Build the Live Harness content (internals unchanged for compat)
             self._build_live_harness_tab()
-    
+
             # Historical ML Backtest Runner Tab (lazy when shell built)
             self.ml_backtest_frame = ttk.Frame(self.notebook)
             self.notebook.add(self.ml_backtest_frame, text="Historical ML Backtest Runner")
             if not _shell:
                 self._build_historical_ml_backtest_tab()
-    
+
             # Telemetry & Diagnostics Tab (lazy when shell built)
             self.telemetry_frame = ttk.Frame(self.notebook)
             self.notebook.add(self.telemetry_frame, text="Telemetry & Diagnostics")
             if not _shell:
                 self._build_telemetry_tab()
-    
-            # Forward Validation Tab (lazy when shell built)
-            self.validation_frame = ttk.Frame(self.notebook)
-            self.notebook.add(self.validation_frame, text="Forward Validation")
-            if not _shell:
-                self._build_validation_tab()
 
-            # Ensemble Auto Router Tab (optional paper-only direct model ensemble)
-            self.ensemble_auto_router_frame = ttk.Frame(self.notebook)
-            self.notebook.add(self.ensemble_auto_router_frame, text="Ensemble Auto Router")
-            if not _shell:
-                self._build_ensemble_auto_router_tab()
-    
-            # Paper Forward Monitor Tab (lazy when shell built)
-            self.paper_forward_monitor_frame = ttk.Frame(self.notebook)
-            self.notebook.add(self.paper_forward_monitor_frame, text="Paper Forward Monitor")
-            if not _shell:
-                self._build_paper_forward_monitor_tab()
-    
-            # Candidate Promotion / Deployment Tab (lazy when shell built)
-            self.candidate_promo_frame = ttk.Frame(self.notebook)
-            self.notebook.add(self.candidate_promo_frame, text="Candidate Promotion / Deployment")
-            if not _shell:
-                self._build_candidate_promotion_tab()
-    
             # Now, create sub-frames inside their respective sub-notebooks
             self.trade_frame = ttk.Frame(self.history_notebook)
             self.journal_frame = ttk.Frame(self.history_notebook)
@@ -8124,15 +7913,15 @@ class ScalperUI(tk.Tk):
                 self.analytics_notebook.bind("<<NotebookTabChanged>>", self._on_sub_notebook_tab_changed, add="+")
             except Exception:
                 pass
-            
+
             self.signals_frame = ttk.Frame(self.analytics_notebook)
             self.optimizer_frame = ttk.Frame(self.analytics_notebook)
             self.live_chart_frame = ttk.Frame(self.analytics_notebook)
-            
+
             self.analytics_notebook.add(self.signals_frame, text="Signals/Greeks")
             self.analytics_notebook.add(self.optimizer_frame, text="Optimizer")
             self.analytics_notebook.add(self.live_chart_frame, text="Live Chart")
-            
+
             # LiveChartPlugin is mounted inside chart_area by wire_live_chart_panels()
             # (canvas must be a child of chart_area, not live_chart_frame).
             if not _shell:
@@ -8140,7 +7929,7 @@ class ScalperUI(tk.Tk):
                 wire_live_chart_panels(self)
                 if not self._fast_ui_start_enabled():
                     self._safe_after_app("fetch_initial_candles", 500, self._fetch_and_push_initial_candles)
-    
+
             if not _shell:
                 self.builder_frame = ttk.Frame(self.sim_notebook)
                 self.mc_frame = ttk.Frame(self.sim_notebook)
@@ -8321,7 +8110,7 @@ class ScalperUI(tk.Tk):
             ttk.Entry(hedge_frame, textvariable=self._greeks_target_delta_var, width=8).pack(side=tk.LEFT, padx=(6,8))
             ttk.Button(hedge_frame, text="Suggest Hedge", command=self._on_suggest_hedge).pack(side=tk.LEFT)
             ttk.Button(hedge_frame, text="Apply Hedge (Sim)", command=self._on_apply_hedge).pack(side=tk.LEFT, padx=(6,0))
-            
+
             # Option Chain IV Smile Skew Curve
             self.iv_frame = ttk.Frame(greeks_inner)
             self.iv_frame.pack(fill=tk.BOTH, expand=True, pady=(15, 0))
@@ -8474,7 +8263,7 @@ class ScalperUI(tk.Tk):
         # Live Session Performance (PnL & MTM Chart)
         self.pnl_chart_lf = ttk.LabelFrame(portfolio, text="Live Session Performance (PnL & MTM)")
         self.pnl_chart_lf.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        self.pnl_chart_plugin = TimeSeriesMultiLinePlugin(self.pnl_chart_lf, title="Session Equity Curve", y_label="Rupees (â‚¹)")
+        self.pnl_chart_plugin = TimeSeriesMultiLinePlugin(self.pnl_chart_lf, title="Session Equity Curve", y_label="Rupees (â'1)")
         self.pnl_series_history = {
             "Realized P&L": [],
             "Unrealized MTM": [],
@@ -8593,14 +8382,14 @@ class ScalperUI(tk.Tk):
         self.totp_secret_label = ttk.Label(frm, text="TOTP Secret")
         self.totp_secret_label.grid(row=row, column=0, sticky="w")
         self.totp_secret_var = tk.StringVar(value="")
-        
+
         # Sub-frame container to align entry and show/hide button on the same line
         totp_frm = ttk.Frame(frm)
         totp_frm.grid(row=row, column=1, sticky="w", padx=5)
-        
+
         self.totp_secret_entry = ttk.Entry(totp_frm, textvariable=self.totp_secret_var, show="*", width=45)
         self.totp_secret_entry.pack(side=tk.LEFT, padx=(0, 5))
-        
+
         def toggle_totp_visibility():
             if self.totp_secret_entry.cget("show") == "*":
                 self.totp_secret_entry.configure(show="")
@@ -8608,7 +8397,7 @@ class ScalperUI(tk.Tk):
             else:
                 self.totp_secret_entry.configure(show="*")
                 show_btn.configure(text="Show")
-                
+
         show_btn = ttk.Button(totp_frm, text="Show", width=6, command=toggle_totp_visibility)
         show_btn.pack(side=tk.LEFT)
 
@@ -8617,10 +8406,10 @@ class ScalperUI(tk.Tk):
         self.totp_code_label = ttk.Label(frm, text="Or 6-Digit TOTP Code")
         self.totp_code_label.grid(row=row, column=0, sticky="w")
         self.totp_code_var = tk.StringVar(value="")
-        
+
         totp_code_frm = ttk.Frame(frm)
         totp_code_frm.grid(row=row, column=1, sticky="w", padx=5)
-        
+
         self.totp_code_entry = ttk.Entry(totp_code_frm, textvariable=self.totp_code_var, width=15)
         self.totp_code_entry.pack(side=tk.LEFT, padx=(0, 5))
         self.totp_code_hint_label = ttk.Label(
@@ -8750,8 +8539,6 @@ class ScalperUI(tk.Tk):
             _preset_ui = "Aggressive"
         elif _preset_env == "conservative":
             _preset_ui = "Conservative"
-        elif _preset_env in {"dynamic_preset", "dynamic"}:
-            _preset_ui = "Dynamic Preset"
         elif _preset_env == "trend":
             _preset_ui = "Trend"
         elif _preset_env == "chop":
@@ -8770,7 +8557,6 @@ class ScalperUI(tk.Tk):
             "(none)",
             "Aggressive",
             "Conservative",
-            "Dynamic Preset",
             "Trend",
             "Chop",
             "Expiry",
@@ -8781,14 +8567,12 @@ class ScalperUI(tk.Tk):
         def _apply_quick_preset() -> None:
             name = str(self.preset_var.get() or "").strip().lower()
             current_strategy = str(self.strategy_var.get() or "").strip().lower()
-            if name in {"aggressive", "conservative", "dynamic preset", "trend", "chop", "expiry", "high volatility", "low liquidity"}:
+            if name in {"aggressive", "conservative", "trend", "chop", "expiry", "high volatility", "low liquidity"}:
                 if current_strategy != "auto":
                     self.strategy_var.set("auto")
                 if name == "aggressive":
                     self.timeframe_var.set("1m")
                 elif name == "conservative":
-                    self.timeframe_var.set("3m")
-                elif name == "dynamic preset":
                     self.timeframe_var.set("3m")
                 elif name == "trend":
                     self.timeframe_var.set("2m")
@@ -8802,8 +8586,6 @@ class ScalperUI(tk.Tk):
                     self.timeframe_var.set("5m")
                 if hasattr(self, "delta_hedge_scope_var"):
                     self.delta_hedge_scope_var.set("all_options")
-                if hasattr(self, "_enable_adaptive_regimes_var"):
-                    self._enable_adaptive_regimes_var.set(name == "dynamic preset")
 
         ttk.Button(preset_frame, text="Apply", command=_apply_quick_preset).pack(side=tk.LEFT, padx=(6, 0))
 
@@ -9305,7 +9087,7 @@ class ScalperUI(tk.Tk):
         pat_inner.grid_columnconfigure(1, weight=1)
 
         # ---- Greeks table ----
-        self._greeks_summary_var = tk.StringVar(value="Net Î”: n/a | Avg IV: n/a")
+        self._greeks_summary_var = tk.StringVar(value="Net Delta: n/a | Avg IV: n/a")
         ttk.Label(right, textvariable=self._greeks_summary_var).pack(anchor="w", pady=(0, 6))
 
         cols = (
@@ -9438,7 +9220,7 @@ class ScalperUI(tk.Tk):
 
         # Override checks checkbox
         self.gpt_override_checks_var = tk.BooleanVar(value=False)
-        
+
         def _on_override_checks_changed() -> None:
             try:
                 if self._scalper is not None:
@@ -9449,10 +9231,10 @@ class ScalperUI(tk.Tk):
                     print(f"[GPT] {status_msg}")
             except Exception as e:
                 print(f"Failed to update GPT override checks: {e}")
-        
+
         ttk.Checkbutton(
-            cfg, 
-            text="Override safety checks when GPT TAKE", 
+            cfg,
+            text="Override safety checks when GPT TAKE",
             variable=self.gpt_override_checks_var,
             command=_on_override_checks_changed
         ).grid(row=3, column=1, sticky="w", padx=8, pady=4)
@@ -11096,7 +10878,7 @@ class ScalperUI(tk.Tk):
             else:
                 ath_s = f"{float(ath):.3f}/day"
             self._greeks_summary_var.set(
-                f"Net Î”: {nd_s} | Avg IV: {av_s} | Avg Î˜: {ath_s} | Legs: {int(summary.get('legs') or 0)}"
+                f"Net Delta: {nd_s} | Avg IV: {av_s} | Avg Theta/day: {ath_s} | Legs: {int(summary.get('legs') or 0)}"
             )
         except Exception:
             pass
@@ -11263,7 +11045,7 @@ class ScalperUI(tk.Tk):
                     underlying = scalper.cfg.underlying
                 else:
                     underlying = (os.getenv("MSTOCK_UNDERLYING") or os.getenv("MSTOCK_SYMBOL") or "NIFTY").strip()
-                
+
                 client = getattr(self, "_client", None)
                 if client is not None:
                     try:
@@ -11460,7 +11242,7 @@ class ScalperUI(tk.Tk):
 
         # Build a simple selection dialog.
         win = tk.Toplevel(self)
-        win.title(f"Manual Exit Leg â€” {tid}")
+        win.title(f"Manual Exit Leg - {tid}")
         win.geometry("520x240")
         win.transient(self)
 
@@ -13094,8 +12876,18 @@ class ScalperUI(tk.Tk):
                     opened_ts = float(state.get("opened_ts") or evt.ts)
                     t_str = datetime.fromtimestamp(opened_ts).strftime("%H:%M:%S")
                     mtm, realized = self._compute_parent_display_pnl(trade_id, state)
-                    mtm_str = "" if mtm is None else f"{float(mtm):.2f}"
-                    realized_str = "" if realized is None else f"{float(realized):.2f}"
+                    if mtm is None:
+                        try:
+                            mtm = float(state.get("mtm")) if state.get("mtm") is not None else 0.0
+                        except Exception:
+                            mtm = 0.0
+                    if realized is None:
+                        try:
+                            realized = float(state.get("realized")) if state.get("realized") is not None else 0.0
+                        except Exception:
+                            realized = 0.0
+                    mtm_str = f"{float(mtm):.2f}"
+                    realized_str = f"{float(realized):.2f}"
 
                     def _display_text(value: object, fallback: str = "") -> str:
                         try:
@@ -13129,6 +12921,13 @@ class ScalperUI(tk.Tk):
                     _main_legs, _hedge_opt_legs, hedge_under_legs = self._split_legs_for_display(legs_all)
                     hedge_display_ctx = self._first_display_option_context_from_legs(list(_main_legs) + list(_hedge_opt_legs))
                     legs_str = self._format_trade_legs_for_state(trade_id, state)
+                    if not legs_str and legs_all:
+                        try:
+                            legs_str = self._format_legs(list(legs_all), show_prices=True, hedge_prefix=False)
+                        except Exception:
+                            legs_str = ""
+                    if not legs_str:
+                        legs_str = "-"
                     gpt_col = ""
                     try:
                         # Prefer explicit reason field attached by strategy (e.g. gpt:TAKE:...)
@@ -13158,6 +12957,10 @@ class ScalperUI(tk.Tk):
                     if not gpt_col and "gpt" in str(state.get("status") or "").lower():
                         gpt_col = "AUTO"
 
+                    status_text = _display_text(state.get("status"))
+                    if not status_text:
+                        status_text = "OPEN" if legs_all else "-"
+
                     values = (
                         t_str,
                         trade_id_display,
@@ -13166,7 +12969,7 @@ class ScalperUI(tk.Tk):
                         legs_str,
                         mtm_str,
                         realized_str,
-                        str(state.get("status") or ""),
+                        status_text,
                     )
 
                     row = self._trade_rows.get(trade_id_display)
@@ -13231,7 +13034,7 @@ class ScalperUI(tk.Tk):
                         hedge_state.setdefault("opened_ts", opened_ts)
                         hedge_state["pos_type"] = "delta_hedge"
                         base_name = str(state.get("strategy") or "")
-                        hedge_state["strategy"] = f"{base_name} Î”-hedge".strip() if base_name else "Î”-hedge"
+                        hedge_state["strategy"] = f"{base_name} delta-hedge".strip() if base_name else "delta-hedge"
                         hedge_legs_enriched: list[dict[str, object]] = []
                         for lg in hedge_under_legs:
                             if not isinstance(lg, dict):
@@ -13897,7 +13700,7 @@ class ScalperUI(tk.Tk):
         tk.Entry(eq_frame2, textvariable=eq_tp_var, width=6).pack(side=tk.LEFT, padx=(6, 0))
 
         row += 1
-        tk.Label(content, text="Risk â‚¹ / max notional â‚¹").grid(row=row, column=0, sticky="w", padx=8)
+        tk.Label(content, text="Risk â'1 / max notional â'1").grid(row=row, column=0, sticky="w", padx=8)
         eq_frame3 = tk.Frame(content)
         eq_frame3.grid(row=row, column=1, sticky="w", padx=8)
         eq_risk_var = tk.StringVar(value=str(getattr(cfg, "equity_trade_risk_rupees", 500.0)))
@@ -13906,7 +13709,7 @@ class ScalperUI(tk.Tk):
         tk.Entry(eq_frame3, textvariable=eq_maxnot_var, width=10).pack(side=tk.LEFT, padx=(6, 0))
 
         row += 1
-        tk.Label(content, text="Equity capital â‚¹ / GPT daily manage").grid(row=row, column=0, sticky="w", padx=8)
+        tk.Label(content, text="Equity capital â'1 / GPT daily manage").grid(row=row, column=0, sticky="w", padx=8)
         eq_frame4 = tk.Frame(content)
         eq_frame4.grid(row=row, column=1, sticky="w", padx=8)
         eq_capital_var = tk.StringVar(value=str(getattr(cfg, "equity_trade_capital_rupees", 0.0) or 0.0))
@@ -13956,8 +13759,6 @@ class ScalperUI(tk.Tk):
             _preset_ui = "Aggressive"
         elif _preset_env == "conservative":
             _preset_ui = "Conservative"
-        elif _preset_env in {"dynamic_preset", "dynamic"}:
-            _preset_ui = "Dynamic Preset"
         elif _preset_env == "trend":
             _preset_ui = "Trend"
         elif _preset_env == "chop":
@@ -13975,7 +13776,6 @@ class ScalperUI(tk.Tk):
             "(none)",
             "Aggressive",
             "Conservative",
-            "Dynamic Preset",
             "Trend",
             "Chop",
             "Expiry",
@@ -14251,66 +14051,6 @@ class ScalperUI(tk.Tk):
                 max_pos_var.set(str(preset_position_limit))
                 exit_wing_var.set(False)
 
-            elif name == "Dynamic Preset":
-                if allow_strategy_override:
-                    strategy_var.set("auto")
-                timeframe_var.set("3m")
-                delta_scope_var.set("all_options")
-                adaptive_regimes_enabled_var.set(True)
-                preset_position_limit = 1
-                preset_max_qty = str(preset_position_limit * preset_lot_size)
-                if not str(hedge_nifty_var.get() or "").strip():
-                    hedge_nifty_var.set("NSE:NIFTYBEES")
-                if not str(hedge_bank_var.get() or "").strip():
-                    hedge_bank_var.set("NSE:BANKBEES")
-                cooldown_var.set("45")
-                cooldown_stopout_var.set("180")
-                cooldown_atr_mult_var.set("0.45")
-                max_hold_var.set("60")
-                max_same_type_var.set("0")
-                max_same_dir_qty_var.set(preset_max_qty)
-                req_spot_var.set(True)
-                supertrend_enabled_var.set(True)
-                supertrend_mode_var.set("trend")
-                trend_enabled_var.set(True)
-                adx_enabled_var.set(True)
-                vol_enabled_var.set(True)
-                opening_enabled_var.set(True)
-                mtf_enabled_var.set(False)
-                roc_enabled_var.set(False)
-                chop_enabled_var.set(False)
-                chan_enabled_var.set(False)
-                pivot_enabled_var.set(False)
-                limit_enabled_var.set(False)
-                vwap_enabled_var.set(True)
-                premium_rsi_enabled_var.set(True)
-                premium_rsi_low_var.set("43")
-                premium_rsi_high_var.set("57")
-                entry_min_prem_var.set("0")
-                entry_max_prem_var.set("0")
-                entry_min_total_prem_var.set("0")
-                entry_max_total_prem_var.set("0")
-                entry_candle_age_var.set("150")
-                entry_candle_range_var.set("2.3")
-                entry_gap_var.set("1.4")
-                entry_req_ba_var.set(True)
-                entry_spread_pct_var.set("0.08")
-                entry_spread_abs_var.set("0")
-                iv_expand_var.set("3.0")
-                iv_contract_var.set("3.2")
-                pyramid_var.set("0")
-                max_pos_var.set("1")
-                risk_scale_enabled_var.set(True)
-                risk_scale_stopout_var.set("0.75")
-                risk_scale_recovery_var.set("2")
-                risk_scale_atr_high_var.set("70")
-                risk_scale_atr_factor_var.set("0.8")
-                risk_scale_min_qty_var.set(str(preset_lot_size))
-                risk_scale_max_qty_var.set(preset_max_qty)
-                risk_scale_step_qty_var.set(str(preset_lot_size))
-                exit_short_var.set(False)
-                exit_wing_var.set(False)
-
             elif name == "Trend":
                 if allow_strategy_override:
                     strategy_var.set("auto")
@@ -14472,7 +14212,7 @@ class ScalperUI(tk.Tk):
         tk.Entry(content, textvariable=pyramid_var, width=10).grid(row=row, column=1, sticky="w", padx=8)
 
         row += 1
-        tk.Label(content, text="Max daily loss (â‚¹)").grid(row=row, column=0, sticky="w", padx=8)
+        tk.Label(content, text="Max daily loss (â'1)").grid(row=row, column=0, sticky="w", padx=8)
         daily_loss_var = tk.StringVar(value=f"{cfg.max_daily_loss:.2f}")
         tk.Entry(content, textvariable=daily_loss_var, width=10).grid(row=row, column=1, sticky="w", padx=8)
 
@@ -14876,7 +14616,7 @@ class ScalperUI(tk.Tk):
         tk.Label(content, text="Dir BE / Trail x ATR (BE can be negative)").grid(row=row, column=0, sticky="w", padx=8)
         dir_trail_frame = tk.Frame(content)
         dir_trail_frame.grid(row=row, column=1, sticky="w", padx=8)
-        
+
         row += 1
         tk.Label(content, text='Initial SL / TP (ATR Mult)').grid(row=row, column=0, sticky="w", padx=8)
         sltp_frame = tk.Frame(content)
@@ -14923,7 +14663,7 @@ class ScalperUI(tk.Tk):
         ttk.Checkbutton(dir_opt_frame, text="Spot LTP Req", variable=req_spot_var).pack(side=tk.LEFT, padx=(6, 0))
 
         row += 1
-        tk.Label(content, text="Dir Quality (Min/Î”/Mom xATR)").grid(row=row, column=0, sticky="w", padx=8)
+        tk.Label(content, text="Dir Quality (Min/Delta/Mom xATR)").grid(row=row, column=0, sticky="w", padx=8)
         dir_q_frame = tk.Frame(content)
         dir_q_frame.grid(row=row, column=1, sticky="w", padx=8)
         dir_min_confirm_var = tk.StringVar(value=str(getattr(cfg, "dir_min_confirmations", 4)))
@@ -14998,14 +14738,14 @@ class ScalperUI(tk.Tk):
         row += 1
         robust_sect_lbl = ttk.Label(content, text="Low-Resource & Institutional Robustness", font=("Segoe UI", 10, "bold"))
         robust_sect_lbl.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 4), padx=8)
-        
+
         row += 1
         robust_row1 = tk.Frame(content)
         robust_row1.grid(row=row, column=1, sticky="w", padx=8)
-        
+
         recon_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_reconciliation", True)))
         ttk.Checkbutton(robust_row1, text="Reconciliation On", variable=recon_enabled_var).pack(side=tk.LEFT, padx=(0, 6))
-        
+
         tk.Label(robust_row1, text="Interval (s)").pack(side=tk.LEFT)
         recon_interval_var = tk.StringVar(value=str(getattr(cfg, "reconciliation_interval_sec", 15.0)))
         tk.Entry(robust_row1, textvariable=recon_interval_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
@@ -15020,7 +14760,7 @@ class ScalperUI(tk.Tk):
         row += 1
         robust_row2 = tk.Frame(content)
         robust_row2.grid(row=row, column=1, sticky="w", padx=8)
-        
+
         dq_enabled_var = tk.BooleanVar(value=bool(getattr(cfg, "enable_data_validation", True)))
         ttk.Checkbutton(robust_row2, text="Data Validation", variable=dq_enabled_var).pack(side=tk.LEFT, padx=(0, 6))
 
@@ -15046,9 +14786,6 @@ class ScalperUI(tk.Tk):
         tk.Label(robust_row3, text="Max Strat Drawdown (%)").pack(side=tk.LEFT)
         decay_max_dd_var = tk.StringVar(value=str(getattr(cfg, "max_strategy_drawdown_pct", 0.15)))
         tk.Entry(robust_row3, textvariable=decay_max_dd_var, width=5).pack(side=tk.LEFT, padx=(2, 10))
-
-        shadow_mode_var = tk.BooleanVar(value=bool(getattr(cfg, "shadow_mode", False)))
-        ttk.Checkbutton(robust_row3, text="Shadow Mode", variable=shadow_mode_var).pack(side=tk.LEFT, padx=(0, 6))
 
         row += 1
         robust_row4 = tk.Frame(content)
@@ -15100,13 +14837,13 @@ class ScalperUI(tk.Tk):
                 to_unset: list[str] = []
 
                 preset_name = str(preset_var.get() or "").strip().lower()
-                if preset_name in {"aggressive", "conservative", "dynamic preset", "trend", "chop", "expiry", "high volatility", "low liquidity"}:
+                if preset_name in {"aggressive", "conservative", "trend", "chop", "expiry", "high volatility", "low liquidity"}:
                     p_val = preset_name.replace(" ", "_")
                     os.environ["MSTOCK_PRESET"] = p_val
                     to_persist["MSTOCK_PRESET"] = p_val
                     try:
                         if hasattr(self, "preset_var"):
-                            self.preset_var.set("Dynamic Preset" if preset_name == "dynamic preset" else preset_name.title())
+                            self.preset_var.set(preset_name.title())
                     except Exception:
                         pass
                 else:
@@ -15440,12 +15177,12 @@ class ScalperUI(tk.Tk):
                 # Persist ADX & Volume
                 os.environ["MSTOCK_ENABLE_ADX_FILTER"] = "true" if adx_enabled_var.get() else "false"
                 to_persist["MSTOCK_ENABLE_ADX_FILTER"] = "true" if adx_enabled_var.get() else "false"
-                
+
                 if adx_min_var.get().strip():
                     v = str(float(adx_min_var.get().strip()))
                     os.environ["MSTOCK_ADX_MIN_STRENGTH"] = v
                     to_persist["MSTOCK_ADX_MIN_STRENGTH"] = v
-                
+
                 if adx_period_var.get().strip():
                     v = str(int(adx_period_var.get().strip()))
                     os.environ["MSTOCK_ADX_PERIOD"] = v
@@ -15742,7 +15479,7 @@ class ScalperUI(tk.Tk):
                     os.environ["MSTOCK_SUPERTREND_MODE"] = v
                     to_persist["MSTOCK_SUPERTREND_MODE"] = v
 
-                
+
                 if dir_sl_var.get().strip():
                     v = str(float(dir_sl_var.get().strip()))
                     os.environ["MSTOCK_DIR_SL_ATR_MULT"] = v
@@ -15801,28 +15538,28 @@ class ScalperUI(tk.Tk):
                     v = str(float(spike_var.get().strip()))
                     os.environ["MSTOCK_ATR_SPIKE_MULT"] = v
                     to_persist["MSTOCK_ATR_SPIKE_MULT"] = v
-                
+
                 # Persist New Enhancements
                 if limit_buf_var.get().strip():
                     v = str(float(limit_buf_var.get().strip()))
                     os.environ["MSTOCK_LIMIT_PRICE_BUFFER_PCT"] = v
                     to_persist["MSTOCK_LIMIT_PRICE_BUFFER_PCT"] = v
-                
+
                 os.environ["MSTOCK_ENABLE_MTF_CONFIRMATION"] = "true" if mtf_enabled_var.get() else "false"
                 to_persist["MSTOCK_ENABLE_MTF_CONFIRMATION"] = os.environ["MSTOCK_ENABLE_MTF_CONFIRMATION"]
-                
+
                 os.environ["MSTOCK_ENABLE_ROC_FILTER"] = "true" if roc_enabled_var.get() else "false"
                 to_persist["MSTOCK_ENABLE_ROC_FILTER"] = os.environ["MSTOCK_ENABLE_ROC_FILTER"]
-                
+
                 os.environ["MSTOCK_ENABLE_CHOPPINESS_FILTER"] = "true" if chop_enabled_var.get() else "false"
                 to_persist["MSTOCK_ENABLE_CHOPPINESS_FILTER"] = os.environ["MSTOCK_ENABLE_CHOPPINESS_FILTER"]
-                
+
                 os.environ["MSTOCK_ENABLE_CHANDELIER_EXIT"] = "true" if chan_enabled_var.get() else "false"
                 to_persist["MSTOCK_ENABLE_CHANDELIER_EXIT"] = os.environ["MSTOCK_ENABLE_CHANDELIER_EXIT"]
-                
+
                 os.environ["MSTOCK_ENABLE_PIVOT_TARGETS"] = "true" if pivot_enabled_var.get() else "false"
                 to_persist["MSTOCK_ENABLE_PIVOT_TARGETS"] = os.environ["MSTOCK_ENABLE_PIVOT_TARGETS"]
-                
+
                 os.environ["MSTOCK_ENABLE_LIMIT_ORDERS"] = "true" if limit_enabled_var.get() else "false"
                 to_persist["MSTOCK_ENABLE_LIMIT_ORDERS"] = os.environ["MSTOCK_ENABLE_LIMIT_ORDERS"]
 
@@ -15878,9 +15615,6 @@ class ScalperUI(tk.Tk):
                     v = str(float(decay_max_dd_var.get().strip()))
                     os.environ["MSTOCK_MAX_STRATEGY_DRAWDOWN_PCT"] = v
                     to_persist["MSTOCK_MAX_STRATEGY_DRAWDOWN_PCT"] = v
-
-                os.environ["MSTOCK_SHADOW_MODE"] = "true" if shadow_mode_var.get() else "false"
-                to_persist["MSTOCK_SHADOW_MODE"] = os.environ["MSTOCK_SHADOW_MODE"]
 
                 os.environ["MSTOCK_ENABLE_MEMORY_MANAGER"] = "true" if mem_enabled_var.get() else "false"
                 to_persist["MSTOCK_ENABLE_MEMORY_MANAGER"] = os.environ["MSTOCK_ENABLE_MEMORY_MANAGER"]
@@ -16073,8 +15807,6 @@ class ScalperUI(tk.Tk):
                 os.environ["MSTOCK_PRESET"] = "aggressive"
             elif p == "conservative":
                 os.environ["MSTOCK_PRESET"] = "conservative"
-            elif p == "dynamic preset":
-                os.environ["MSTOCK_PRESET"] = "dynamic_preset"
             else:
                 os.environ.pop("MSTOCK_PRESET", None)
 
@@ -16159,7 +15891,7 @@ class ScalperUI(tk.Tk):
                 self._last_broker_select_log_ts = now
                 print(
                     f"[BROKER-SELECT] ui={ui_raw or '-'} runtime={runtime_raw or '-'} "
-                    f"paper_forward={broker} source={broker_source}:{source}"
+                    f"broker={broker} source={broker_source}:{source}"
                 )
         except Exception:
             pass
@@ -16709,19 +16441,6 @@ class ScalperUI(tk.Tk):
                     except Exception as exc:
                         print(f"[ui] Warning: could not update existing client token: {exc}")
 
-                try:
-                    self._pf_last_auth_status = "AUTH_OK"
-                    self._pf_last_auth_error = ""
-                    self._pf_last_auth_checked_ts = datetime.now(timezone.utc).isoformat()
-                    self._pf_last_auth_endpoint = "login_totp"
-                    self._pf_auth_validation_attempted = True
-                    self._pf_auth_validation_in_progress = False
-                    self._pf_auth_success_count = int(getattr(self, "_pf_auth_success_count", 0) or 0) + 1
-                    self.after(0, self._pf_ensure_paper_forward_running)
-                    print("[PAPER-FWD-AUTH] result status=AUTH_OK endpoint=login_totp")
-                except Exception as exc:
-                    print(f"[ui] Warning: could not update paper-forward auth after TOTP login: {exc}")
-
                 if self.remember_var.get():
                     # Save credentials on successful login if user opted in.
                     self.after(0, self._on_save_credentials)
@@ -16734,6 +16453,24 @@ class ScalperUI(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     # --- Bot control ---
+
+    def _set_bot_control_state(self, *, running: bool, status: str | None = None) -> None:
+        """Keep Start/Stop button state in sync with the bot lifecycle."""
+        try:
+            if hasattr(self, "btn_start"):
+                self.btn_start.configure(state=(tk.DISABLED if running else tk.NORMAL))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "btn_stop"):
+                self.btn_stop.configure(state=(tk.NORMAL if running else tk.DISABLED))
+        except Exception:
+            pass
+        if status is not None and hasattr(self, "status_var"):
+            try:
+                self.status_var.set(status)
+            except Exception:
+                pass
 
     def _on_start(self) -> None:
         # [UI-STABILITY] Do not allow starting the bot while we are closing.
@@ -16782,25 +16519,28 @@ class ScalperUI(tk.Tk):
         broker = self._selected_broker()
         if broker == "mstock":
             if not os.getenv("MSTOCK_ACCESS_TOKEN"):
+                self._bot_running = False
+                self._bot_stopping = False
                 messagebox.showerror("Not logged in", "Generate/set an access token first.")
                 return
         elif broker == "dhan":
             try:
                 self._ensure_dhan_session_ready()
             except Exception as exc:
+                self._bot_running = False
+                self._bot_stopping = False
                 messagebox.showerror("Not logged in", str(exc))
                 return
         else:
+            self._bot_running = False
+            self._bot_stopping = False
             messagebox.showerror("Unsupported broker", f"Unsupported broker: {broker}")
             return
 
         self._bot_stop.clear()
         self._bot_start_ts = time.time()
         self._bot_last_error = ""
-        self.btn_start.configure(state=tk.DISABLED)
-        self.btn_stop.configure(state=tk.NORMAL)
-        if hasattr(self, "status_var"):
-            self.status_var.set("Running...")
+        self._set_bot_control_state(running=True, status="Running...")
 
         def worker() -> None:
             try:
@@ -17012,7 +16752,7 @@ class ScalperUI(tk.Tk):
                                             underlying = scalper.cfg.underlying
                                         else:
                                             underlying = (os.getenv("MSTOCK_UNDERLYING") or os.getenv("MSTOCK_SYMBOL") or "NIFTY").strip()
-                                        
+
                                         if self.live_chart_plugin.symbol != underlying:
                                             self.live_chart_plugin.symbol = underlying
                                             self.live_chart_plugin.ax_price.set_title(f"{underlying} ({self.live_chart_plugin.timeframe})")
@@ -17052,15 +16792,19 @@ class ScalperUI(tk.Tk):
                     self.after(0, lambda: setattr(self, "_scalper", None))
                 except Exception:
                     self._scalper = None
-                self.after(0, lambda: self.btn_start.configure(state=tk.NORMAL))
-                self.after(0, lambda: self.btn_stop.configure(state=tk.DISABLED))
-                if hasattr(self, "status_var"):
-                    # Reflect final state after the worker stops.
-                    self.after(0, lambda: self.status_var.set("Idle"))
+                self._bot_running = False
+                self._bot_stopping = False
+                # Reflect final state after the worker stops.
+                self.after(0, lambda: self._set_bot_control_state(running=False, status="Idle"))
                 # Force one cleanup on shutdown to avoid timing races with status updates.
                 self.after(0, lambda: self._prune_stale_open_rows_when_idle(force=True))
 
         self._bot_thread = self._start_worker("bot_main", worker)
+        if self._bot_thread is None:
+            self._bot_running = False
+            self._bot_stopping = False
+            self._set_bot_control_state(running=False, status="Idle")
+            messagebox.showwarning("Bot start skipped", "Bot worker did not start. Check runtime logs and try again.")
 
     def _on_stop(self) -> None:
         # [SCHEDULER-REFACTOR] Set bot stopping flags
@@ -17081,12 +16825,7 @@ class ScalperUI(tk.Tk):
         self._bot_after_ids.clear()
         # [UI-STABILITY] Graceful stop: signal the bot and update UI.
         self._bot_stop.set()
-        try:
-            self.btn_stop.configure(state=tk.DISABLED)
-        except Exception:
-            pass
-        if hasattr(self, "status_var"):
-            self.status_var.set("Stopping...")
+        self._set_bot_control_state(running=True, status="Stopping...")
         # [STOP-BOT] Poll for bot thread exit using after() (non-blocking)
         def _poll_thread_exit(attempt: int = 0) -> None:
             try:
@@ -17095,14 +16834,14 @@ class ScalperUI(tk.Tk):
                 alive = False
             if not alive:
                 # Thread exited
-                if hasattr(self, "status_var"):
-                    self.status_var.set("Stopped")
+                self._bot_running = False
+                self._bot_stopping = False
+                self._set_bot_control_state(running=False, status="Stopped")
                 return
             # Max attempts: 50 * 200ms = 10 seconds
             if attempt >= 50:
                 print("[STOP-BOT] Warning: Bot thread did not exit after 10 seconds")
-                if hasattr(self, "status_var"):
-                    self.status_var.set("Stop timeout")
+                self._set_bot_control_state(running=False, status="Stop timeout")
                 return
             # Schedule next poll
             self._safe_after_app("bot_stop_poll", 200, _poll_thread_exit, attempt + 1)
@@ -17153,29 +16892,6 @@ class ScalperUI(tk.Tk):
         # existing ones, and close resources before destroying the window.
         self._ui_closing = True
         self._closing = True
-        try:
-            self._pf_user_stopped = True
-            self._pf_monitor_running = False
-            self._pf_update_pending = False
-            if getattr(self, "_pf_stop_event", None) is not None:
-                self._pf_stop_event.set()
-            if getattr(self, "_pf_data_stop", None) is not None:
-                self._pf_data_stop.set()
-            self._gui_cancel_tab_after(
-                "_pf_after_job", tab="paper_forward", reason="on_close", name="paper_forward_monitor_update"
-            )
-            self._gui_cancel_tab_after(
-                "_pf_throttle_after_job", tab="paper_forward", reason="on_close", name="pf_throttled_apply"
-            )
-            for tname in ("_pf_engine_thread", "_pf_data_poller_thread"):
-                t = getattr(self, tname, None)
-                if t is not None and t.is_alive():
-                    try:
-                        t.join(timeout=2.0)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
         try:
             self._cancel_all_after_jobs()
             self._stop_all_workers()
@@ -17242,34 +16958,34 @@ class ScalperUI(tk.Tk):
         mc_title_frame = ttk.Frame(self.mc_frame)
         mc_title_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
         ttk.Label(mc_title_frame, text="Monte Carlo Risk & Stress Simulator", font=("Segoe UI", 12, "bold")).pack(side=tk.LEFT)
-        
+
         # Main split container
         mc_split = ttk.PanedWindow(self.mc_frame, orient=tk.HORIZONTAL)
         mc_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        
+
         # Left Panel (Controls)
         left_panel = ttk.Frame(mc_split)
         mc_split.add(left_panel, weight=1)
-        
+
         # Right Panel (Metrics & Plots)
         right_panel = ttk.Frame(mc_split)
         mc_split.add(right_panel, weight=2)
-        
+
         # Controls Frame (Left Panel Layout)
         ctrl_lf = ttk.LabelFrame(left_panel, text="Simulation Controls")
         ctrl_lf.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
+
         # Trade Source Radiobuttons
         ttk.Label(ctrl_lf, text="Trade PnL Source:", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
         self.mc_source_var = tk.StringVar(value="demo")
-        
+
         src_demo = ttk.Radiobutton(ctrl_lf, text="Example Option Strategy (Demo)", variable=self.mc_source_var, value="demo", command=self._on_mc_source_changed)
         src_demo.pack(anchor="w", padx=20, pady=2)
         src_ledger = ttk.Radiobutton(ctrl_lf, text="Current Session Trade Ledger", variable=self.mc_source_var, value="ledger", command=self._on_mc_source_changed)
         src_ledger.pack(anchor="w", padx=20, pady=2)
         src_manual = ttk.Radiobutton(ctrl_lf, text="Manual Comma-Separated Input", variable=self.mc_source_var, value="manual", command=self._on_mc_source_changed)
         src_manual.pack(anchor="w", padx=20, pady=2)
-        
+
         # CSV Input Box
         ttk.Label(ctrl_lf, text="Trades PnL Values (comma-separated):").pack(anchor="w", padx=10, pady=(10, 2))
         self.mc_csv_text = tk.Text(ctrl_lf, height=4, width=32, wrap=tk.CHAR)
@@ -17277,72 +16993,72 @@ class ScalperUI(tk.Tk):
         # Prepopulate demo trades
         demo_trades_str = "2400, -1800, 3100, -1200, 4200, -2200, 1500, -800, 5000, -3200, 2100, -900, 1800, -1100, 3600, -2800"
         self.mc_csv_text.insert("1.0", demo_trades_str)
-        
+
         # Settings Inputs Grid
         grid_frame = ttk.Frame(ctrl_lf)
         grid_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
-        
+
         # Iterations
         ttk.Label(grid_frame, text="Iterations:").grid(row=0, column=0, sticky="w", pady=4)
         self.mc_iter_var = tk.StringVar(value="5000")
         ttk.Entry(grid_frame, textvariable=self.mc_iter_var, width=10).grid(row=0, column=1, sticky="w", padx=5, pady=4)
-        
+
         # Confidence Level
         ttk.Label(grid_frame, text="Confidence Level (%):").grid(row=1, column=0, sticky="w", pady=4)
         self.mc_conf_var = tk.StringVar(value="95")
         ttk.Entry(grid_frame, textvariable=self.mc_conf_var, width=10).grid(row=1, column=1, sticky="w", padx=5, pady=4)
-        
+
         # Initial Capital
-        ttk.Label(grid_frame, text="Initial Capital (â‚¹):").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(grid_frame, text="Initial Capital (â'1):").grid(row=2, column=0, sticky="w", pady=4)
         self.mc_capital_var = tk.StringVar(value="100000")
         ttk.Entry(grid_frame, textvariable=self.mc_capital_var, width=10).grid(row=2, column=1, sticky="w", padx=5, pady=4)
-        
+
         # Leverage/Lot Size Factor
         ttk.Label(grid_frame, text="Lot Size Factor:").grid(row=3, column=0, sticky="w", pady=4)
         self.mc_lot_var = tk.StringVar(value="1.0")
         ttk.Entry(grid_frame, textvariable=self.mc_lot_var, width=10).grid(row=3, column=1, sticky="w", padx=5, pady=4)
-        
+
         # Slippage Penalty
-        ttk.Label(grid_frame, text="Slippage Penalty (â‚¹/trade):").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Label(grid_frame, text="Slippage Penalty (â'1/trade):").grid(row=4, column=0, sticky="w", pady=4)
         self.mc_slippage_var = tk.StringVar(value="50")
         ttk.Entry(grid_frame, textvariable=self.mc_slippage_var, width=10).grid(row=4, column=1, sticky="w", padx=5, pady=4)
-        
+
         # Resample Mode
         ttk.Label(grid_frame, text="Resample Mode:").grid(row=5, column=0, sticky="w", pady=4)
         self.mc_mode_var = tk.StringVar(value="bootstrap")
         self.mc_mode_cb = ttk.Combobox(grid_frame, textvariable=self.mc_mode_var, values=["bootstrap", "shuffle", "block_bootstrap"], width=12, state="readonly")
         self.mc_mode_cb.grid(row=5, column=1, sticky="w", padx=5, pady=4)
-        
+
         # Action Buttons Layout Grid
         btn_grid = ttk.Frame(ctrl_lf)
         btn_grid.pack(fill=tk.X, padx=10, pady=(10, 15))
-        
+
         self.mc_run_btn = ttk.Button(btn_grid, text="âš¡ Run Simulator", style="Accent.TButton", command=self._run_monte_carlo_sim)
         self.mc_run_btn.grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=5)
-        
+
         self.mc_web_btn = ttk.Button(btn_grid, text="ðŸš€ Launch Dashboard", style="Accent.TButton", command=self._launch_web_dashboard)
         self.mc_web_btn.grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=5)
-        
+
         btn_grid.columnconfigure(0, weight=1)
         btn_grid.columnconfigure(1, weight=1)
-        
+
         # Right Panel Layout
         # Metrics Display Card
         metrics_lf = ttk.LabelFrame(right_panel, text="Stress Test Risk Metrics")
         metrics_lf.pack(fill=tk.X, padx=5, pady=5)
-        
+
         metrics_grid = ttk.Frame(metrics_lf)
         metrics_grid.pack(fill=tk.X, padx=10, pady=10)
-        
+
         # Metric Variables
-        self.mc_original_return_var = tk.StringVar(value="â‚¹0.00")
-        self.mc_median_return_var = tk.StringVar(value="â‚¹0.00")
+        self.mc_original_return_var = tk.StringVar(value="â'10.00")
+        self.mc_median_return_var = tk.StringVar(value="â'10.00")
         self.mc_worst_drawdown_var = tk.StringVar(value="0.00%")
         self.mc_var_drawdown_var = tk.StringVar(value="0.00%")
         self.mc_probability_loss_var = tk.StringVar(value="0.00%")
         self.mc_ruin_var = tk.StringVar(value="0.00%")
         self.mc_streak_var = tk.StringVar(value="0")
-        
+
         # Label layout in grid
         labels = [
             ("Original Return:", self.mc_original_return_var, 0, 0),
@@ -17353,18 +17069,18 @@ class ScalperUI(tk.Tk):
             ("Risk of Ruin (>50% Drawdown):", self.mc_ruin_var, 2, 2),
             ("Worst Consecutive Losses:", self.mc_streak_var, 3, 0)
         ]
-        
+
         for text, var, r, c in labels:
             ttk.Label(metrics_grid, text=text, font=("Segoe UI", 9, "bold")).grid(row=r, column=c, sticky="w", padx=(10, 5), pady=4)
             ttk.Label(metrics_grid, textvariable=var, font=("Segoe UI", 9)).grid(row=r, column=c+1, sticky="w", padx=(0, 20), pady=4)
-            
+
         # Matplotlib Plot Frame
         self.mc_plot_lf = ttk.LabelFrame(right_panel, text="Simulated Equity Curve Scenarios")
         self.mc_plot_lf.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
+
         self.mc_fig = plt.Figure(figsize=(7.5, 3.4), dpi=100)
         self.mc_ax = self.mc_fig.add_subplot(1, 1, 1)
-        
+
         # Apply dark theme styling to Matplotlib immediately
         theme = "dark"
         try:
@@ -17380,12 +17096,12 @@ class ScalperUI(tk.Tk):
                 self.mc_ax.title.set_color("#cccccc")
         except Exception:
             pass
-            
+
         self.mc_ax.grid(True, linestyle="--", alpha=0.3, color="#555555" if theme == "dark" else "#cccccc")
         self.mc_ax.set_title("Run Simulation to Visualize Scenarios")
         self.mc_ax.set_xlabel("Trade Count")
-        self.mc_ax.set_ylabel("Account Balance (â‚¹)")
-        
+        self.mc_ax.set_ylabel("Account Balance (â'1)")
+
         self.mc_canvas = FigureCanvasTkAgg(self.mc_fig, master=self.mc_plot_lf)
         self.mc_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
@@ -17419,7 +17135,7 @@ class ScalperUI(tk.Tk):
         except Exception:
             pass
         import matplotlib.pyplot as plt
-        
+
         try:
             # 1. Parse Inputs
             # Parse Trades List
@@ -17427,7 +17143,7 @@ class ScalperUI(tk.Tk):
             if not text_val:
                 messagebox.showerror("Monte Carlo", "Please enter some trades first.")
                 return
-            
+
             raw_trades = []
             for item in text_val.split(","):
                 item_str = item.strip()
@@ -17436,11 +17152,11 @@ class ScalperUI(tk.Tk):
                         raw_trades.append(float(item_str))
                     except Exception:
                         pass
-            
+
             if not raw_trades:
                 messagebox.showerror("Monte Carlo", "No valid numeric trades found in the input box.")
                 return
-            
+
             # Parse simulation parameters
             try:
                 num_iter = int(self.mc_iter_var.get() or "5000")
@@ -17449,7 +17165,7 @@ class ScalperUI(tk.Tk):
             except Exception:
                 num_iter = 5000
                 self.mc_iter_var.set("5000")
-                
+
             try:
                 conf_level = float(self.mc_conf_var.get() or "95") / 100.0
                 if not (0.01 < conf_level < 0.999):
@@ -17457,7 +17173,7 @@ class ScalperUI(tk.Tk):
             except Exception:
                 conf_level = 0.95
                 self.mc_conf_var.set("95")
-                
+
             try:
                 start_cap = float(self.mc_capital_var.get() or "100000")
                 if start_cap <= 0:
@@ -17465,7 +17181,7 @@ class ScalperUI(tk.Tk):
             except Exception:
                 start_cap = 100000.0
                 self.mc_capital_var.set("100000")
-                
+
             try:
                 lot_size = float(self.mc_lot_var.get() or "1.0")
                 if lot_size <= 0:
@@ -17473,23 +17189,23 @@ class ScalperUI(tk.Tk):
             except Exception:
                 lot_size = 1.0
                 self.mc_lot_var.set("1.0")
-                
+
             try:
                 slippage = float(self.mc_slippage_var.get() or "50")
             except Exception:
                 slippage = 0.0
                 self.mc_slippage_var.set("0")
-                
+
             # 2. Run Simulation Iterations using modular risk engine
             from risk_engine.simulator import SimulationEngine
             sim_engine = SimulationEngine(raw_trades)
             mode = self.mc_mode_var.get() if hasattr(self, 'mc_mode_var') else "bootstrap"
-            
+
             all_final_returns = []
             all_max_drawdowns = []
             all_max_loss_streaks = []
             all_curves = []
-            
+
             # Calculate Original Backtest Curve (no shuffle, but with lot size and slippage)
             orig_curve = [start_cap]
             current_cap = start_cap
@@ -17497,31 +17213,31 @@ class ScalperUI(tk.Tk):
                 current_cap += (pnl * lot_size) - slippage
                 orig_curve.append(current_cap)
             orig_final_return = current_cap - start_cap
-            
+
             # Run simulations
             for _ in range(num_iter):
                 # Resample trades using the new modular engine!
                 resampled = sim_engine.resample_trades(mode=mode, block_size=5)
-                
+
                 curve = [start_cap]
                 cap = start_cap
                 peak = start_cap
                 max_dd = 0.0
                 streak = 0
                 max_streak = 0
-                
+
                 for pnl in resampled:
                     adjusted_pnl = (pnl * lot_size) - slippage
                     cap += adjusted_pnl
                     curve.append(cap)
-                    
+
                     # Track drawdown
                     if cap > peak:
                         peak = cap
                     dd = (peak - cap) / peak if peak > 0 else 0.0
                     if dd > max_dd:
                         max_dd = dd
-                        
+
                     # Track losing streak
                     if adjusted_pnl < 0:
                         streak += 1
@@ -17529,49 +17245,49 @@ class ScalperUI(tk.Tk):
                             max_streak = streak
                     else:
                         streak = 0
-                        
+
                 all_final_returns.append(cap - start_cap)
                 all_max_drawdowns.append(max_dd)
                 all_max_loss_streaks.append(max_streak)
                 all_curves.append(curve)
-                
+
             # 3. Calculate Risk Metrics
             # Sort metrics to calculate percentiles
             sorted_returns = sorted(all_final_returns)
             sorted_drawdowns = sorted(all_max_drawdowns)
-            
+
             median_return = sorted_returns[int(num_iter * 0.50)]
             worst_drawdown = sorted_drawdowns[-1]
-            
+
             # Drawdown percentile (Confidence Level VaR)
             var_index = int(num_iter * conf_level)
             if var_index >= num_iter:
                 var_index = num_iter - 1
             var_drawdown = sorted_drawdowns[var_index]
-            
+
             # Probability of overall net loss (final return < 0)
             losses_count = sum(1 for ret in all_final_returns if ret < 0)
             prob_loss = losses_count / num_iter
-            
+
             # Risk of ruin (probability of drawdown > 50%)
             ruin_count = sum(1 for dd in all_max_drawdowns if dd >= 0.50)
             prob_ruin = ruin_count / num_iter
-            
+
             # Max consecutive losses
             worst_streak = max(all_max_loss_streaks)
-            
+
             # Update variables
-            self.mc_original_return_var.set(f"â‚¹{orig_final_return:,.2f}")
-            self.mc_median_return_var.set(f"â‚¹{median_return:,.2f}")
+            self.mc_original_return_var.set(f"â'1{orig_final_return:,.2f}")
+            self.mc_median_return_var.set(f"â'1{median_return:,.2f}")
             self.mc_worst_drawdown_var.set(f"{worst_drawdown * 100:.2f}%")
             self.mc_var_drawdown_var.set(f"{var_drawdown * 100:.2f}%")
             self.mc_probability_loss_var.set(f"{prob_loss * 100:.2f}%")
             self.mc_ruin_var.set(f"{prob_ruin * 100:.2f}%")
             self.mc_streak_var.set(str(worst_streak))
-            
+
             # 4. Plot Equity Curves
             self.mc_ax.clear()
-            
+
             # Re-apply theme styling
             theme = (os.getenv("MSTOCK_UI_THEME", "dark") or "dark").strip().lower()
             if theme == "dark":
@@ -17594,38 +17310,38 @@ class ScalperUI(tk.Tk):
                 self.mc_ax.yaxis.label.set_color("#333333")
                 self.mc_ax.title.set_color("#333333")
                 grid_color = "#cccccc"
-                
+
             self.mc_ax.grid(True, linestyle="--", alpha=0.3, color=grid_color)
-            
+
             # Plot a representative sample of 50 paths in thin transparent lines
             sample_paths = random.sample(all_curves, min(50, len(all_curves)))
             for curve in sample_paths:
                 self.mc_ax.plot(curve, color="cyan" if theme == "dark" else "blue", linewidth=0.5, alpha=0.15)
-                
+
             # Find and plot the 5th percentile worst-case curve
             # Rank curves by final return
             ranked_curves = sorted(all_curves, key=lambda c: c[-1])
             worst_5pct_index = int(num_iter * 0.05)
             worst_5pct_curve = ranked_curves[worst_5pct_index]
-            
+
             # Find and plot the median curve
             median_index = int(num_iter * 0.50)
             median_curve = ranked_curves[median_index]
-            
+
             # Plot reference bold lines
             x = list(range(len(raw_trades) + 1))
             self.mc_ax.plot(x, orig_curve, color="green" if theme == "dark" else "forestgreen", linewidth=1.5, label="Original Path")
             self.mc_ax.plot(x, median_curve, color="orange", linewidth=1.5, label="Median Path")
             self.mc_ax.plot(x, worst_5pct_curve, color="red", linewidth=1.5, linestyle="--", label="Worst 5% Stress Path")
-            
+
             self.mc_ax.set_title(f"Monte Carlo: {num_iter} Scenarios ({mode.capitalize()})")
             self.mc_ax.set_xlabel("Trade Count")
-            self.mc_ax.set_ylabel("Account Balance (â‚¹)")
+            self.mc_ax.set_ylabel("Account Balance (â'1)")
             self.mc_ax.legend(loc="upper left", fontsize=8)
-            
+
             self.mc_fig.tight_layout()
             self.mc_canvas.draw_idle()
-            
+
         except Exception as err:
             messagebox.showerror("Monte Carlo", f"Error during simulation execution:\n{err}")
 
@@ -17686,7 +17402,7 @@ class ScalperUI(tk.Tk):
                     log_fp = subprocess.DEVNULL
 
                 subprocess.Popen(cmd, cwd=str(py_dir.parent), stdout=log_fp, stderr=log_fp)
-                
+
                 # Wait 2 seconds for server startup, then open the browser
                 time.sleep(2)
                 webbrowser.open("http://localhost:8501")
@@ -17702,298 +17418,6 @@ class ScalperUI(tk.Tk):
         threading.Thread(target=run_streamlit, daemon=True).start()
         messagebox.showinfo("Dashboard Launcher", "Spawning the Institutional Risk Web Dashboard...\n\nIt will open automatically in your browser at http://localhost:8501 shortly!")
 
-    def _build_validation_tab(self) -> None:
-        """Create the layout for the Forward Validation Dashboard."""
-        # Main scrollable canvas frame to support smaller laptop screens
-        outer = ttk.Frame(self.validation_frame)
-        outer.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        try:
-            style = ttk.Style(self)
-            bg = style.lookup("TFrame", "background")
-            if bg:
-                canvas.configure(background=bg)
-        except Exception:
-            pass
-            
-        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Internal container for all widgets
-        container = ttk.Frame(canvas)
-        container_id = canvas.create_window((0, 0), window=container, anchor="nw")
-        
-        def _on_val_configure(_evt: object = None) -> None:
-            try:
-                canvas.configure(scrollregion=canvas.bbox("all"))
-            except Exception:
-                return
-                
-        def _on_val_canvas_configure(evt: object) -> None:
-            try:
-                width = int(evt.width)
-            except Exception:
-                return
-            try:
-                canvas.itemconfigure(container_id, width=width)
-            except Exception:
-                return
-                
-        container.bind("<Configure>", lambda e: _on_val_configure(e))
-        canvas.bind("<Configure>", _on_val_canvas_configure)
-
-        # Let's bind mousewheel
-        def _val_mousewheel(evt: object) -> None:
-            try:
-                delta = int(evt.delta)
-            except Exception:
-                delta = 0
-            if delta:
-                canvas.yview_scroll(int(-delta / 120), "units")
-        container.bind_all("<MouseWheel>", _val_mousewheel, add="+")
-
-        # ---------------- Title & Top-Level Counters Card Frame ----------------
-        title_frame = ttk.Frame(container)
-        title_frame.pack(fill=tk.X, expand=False, padx=10, pady=(10, 5))
-        
-        ttk.Label(title_frame, text="FORWARD VALIDATION AUDIT ENGINE", font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
-        
-        refresh_btn = ttk.Button(title_frame, text="ðŸ”„ Recalculate Shadow Validation", command=self._trigger_validation_refresh)
-        refresh_btn.pack(side=tk.RIGHT, padx=5)
-
-        # Counter Cards Frame
-        cards_frame = ttk.Frame(container)
-        cards_frame.pack(fill=tk.X, expand=False, padx=10, pady=5)
-        
-        # Declare string variables
-        self._val_total_var = tk.StringVar(value="n/a")
-        self._val_active_var = tk.StringVar(value="n/a")
-        self._val_filtered_var = tk.StringVar(value="n/a")
-        self._val_blocked_var = tk.StringVar(value="n/a")
-        self._val_stance_var = tk.StringVar(value="n/a")
-        self._val_throughput_var = tk.StringVar(value="n/a")
-        self._val_signal_conv_var = tk.StringVar(value="n/a")
-        self._val_trade_conv_var = tk.StringVar(value="n/a")
-        self._val_today_var = tk.StringVar(value="n/a")
-        self._val_week_var = tk.StringVar(value="n/a")
-        self._val_cal_err_var = tk.StringVar(value="n/a")
-        self._val_best_reg_var = tk.StringVar(value="n/a")
-        self._val_worst_reg_var = tk.StringVar(value="n/a")
-        self._val_opt_thresh_var = tk.StringVar(value="n/a")
-        self._val_sizing_var = tk.StringVar(value="n/a")
-        self._val_decay_status_var = tk.StringVar(value="n/a")
-
-        def make_card(parent, title, var, bg_color="#2c3e50"):
-            card = tk.Frame(parent, bg=bg_color, bd=1, relief="ridge", width=220, height=80)
-            card.pack(side=tk.LEFT, padx=10, pady=5, expand=True, fill=tk.BOTH)
-            card.pack_propagate(False)
-            
-            lbl_title = tk.Label(card, text=title, font=("Segoe UI", 9), fg="#bdc3c7", bg=bg_color)
-            lbl_title.pack(anchor="w", padx=10, pady=(8, 2))
-            
-            lbl_val = tk.Label(card, textvariable=var, font=("Segoe UI", 18, "bold"), fg="white", bg=bg_color)
-            lbl_val.pack(anchor="w", padx=10)
-            return card
-
-        make_card(cards_frame, "TOTAL PREDICTIONS", self._val_total_var, "#1a252f")
-        make_card(cards_frame, "ACTIVE TRADES", self._val_active_var, "#1a252f")
-        make_card(cards_frame, "FILTERED SIGNALS", self._val_filtered_var, "#1a252f")
-        make_card(cards_frame, "BLOCKED SIGNALS", self._val_blocked_var, "#1a252f")
-
-        summary_row = ttk.Frame(container)
-        summary_row.pack(fill=tk.X, expand=False, padx=10, pady=(0, 10))
-        ttk.Label(summary_row, text="Expected Prediction Throughput / Day:").pack(side=tk.LEFT)
-        ttk.Label(summary_row, textvariable=self._val_throughput_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 20))
-        ttk.Label(summary_row, text="Calibration Stance:").pack(side=tk.LEFT)
-        ttk.Label(summary_row, textvariable=self._val_stance_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 0))
-
-        summary_row_2 = ttk.Frame(container)
-        summary_row_2.pack(fill=tk.X, expand=False, padx=10, pady=(0, 10))
-        ttk.Label(summary_row_2, text="Signal Conversion Rate:").pack(side=tk.LEFT)
-        ttk.Label(summary_row_2, textvariable=self._val_signal_conv_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 20))
-        ttk.Label(summary_row_2, text="Trade Conversion Rate:").pack(side=tk.LEFT)
-        ttk.Label(summary_row_2, textvariable=self._val_trade_conv_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 20))
-        ttk.Label(summary_row_2, text="Predictions Today:").pack(side=tk.LEFT)
-        ttk.Label(summary_row_2, textvariable=self._val_today_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 20))
-        ttk.Label(summary_row_2, text="Predictions This Week:").pack(side=tk.LEFT)
-        ttk.Label(summary_row_2, textvariable=self._val_week_var, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=(6, 0))
-
-        # ---------------- Phase 1: Rolling Validation horizons ----------------
-        p1_frame = ttk.LabelFrame(container, text="Phase 1: Rolling Validation Horizons & Milestone Gates", padding=10)
-        p1_frame.pack(fill=tk.X, expand=False, padx=10, pady=10)
-        
-        columns = ("chk", "cnt", "auc", "wr", "pf", "sr", "exp", "paper", "live", "scale")
-        self.p1_tree = ttk.Treeview(p1_frame, columns=columns, show="headings", height=4)
-        self.p1_tree.pack(fill=tk.BOTH, expand=True)
-        
-        headers = {
-            "chk": "Validation Checkpoint", "cnt": "Count", "auc": "ROC-AUC",
-            "wr": "Win Rate", "pf": "Profit Factor", "sr": "Sharpe Ratio",
-            "exp": "Expectancy", "paper": "Paper Trade Gate", "live": "1 Lot Live Gate",
-            "scale": "Scaling Size Gate"
-        }
-        for col, h in headers.items():
-            self.p1_tree.heading(col, text=h)
-            self.p1_tree.column(col, width=105, anchor="center")
-
-        # ---------------- Phase 2: Regime-Specific Sizing ----------------
-        p2_frame = ttk.LabelFrame(container, text="Phase 2: Regime-Specific Options Flow Performance", padding=10)
-        p2_frame.pack(fill=tk.X, expand=False, padx=10, pady=10)
-        
-        # Sizing callouts row
-        callout_row = ttk.Frame(p2_frame)
-        callout_row.pack(fill=tk.X, expand=False, pady=(0, 10))
-        
-        def make_callout(parent, title, var, fg_col):
-            f = ttk.Frame(parent)
-            f.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=10)
-            ttk.Label(f, text=title, font=("Segoe UI", 9)).pack(anchor="w")
-            ttk.Label(f, textvariable=var, font=("Segoe UI", 12, "bold"), foreground=fg_col).pack(anchor="w")
-            
-        make_callout(callout_row, "ðŸ† Strongest Regime State (Best Edge)", self._val_best_reg_var, "#2ecc71")
-        make_callout(callout_row, "âš ï¸ Weakest Regime State (Risk Suspension)", self._val_worst_reg_var, "#e74c3c")
-        
-        # Regime table
-        reg_cols = ("regime", "cnt", "auc", "wr", "pf", "sr", "exp", "status")
-        self.p2_tree = ttk.Treeview(p2_frame, columns=reg_cols, show="headings", height=8)
-        self.p2_tree.pack(fill=tk.BOTH, expand=True)
-        
-        reg_headers = {
-            "regime": "Regime Classification", "cnt": "Count", "auc": "ROC-AUC",
-            "wr": "Win Rate", "pf": "Profit Factor", "sr": "Sharpe Ratio",
-            "exp": "Expectancy", "status": "Regime Status"
-        }
-        for col, h in reg_headers.items():
-            self.p2_tree.heading(col, text=h)
-            self.p2_tree.column(col, width=120, anchor="center")
-
-        # ---------------- Phase 3 & 5: Calibration & Decay ----------------
-        row3 = ttk.Frame(container)
-        row3.pack(fill=tk.X, expand=False, padx=10, pady=10)
-        
-        p3_frame = ttk.LabelFrame(row3, text="Phase 3: Ensemble Probability Calibration Error", padding=10)
-        p3_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        
-        cal_cols = ("bucket", "cnt", "avg_conf", "act_wr", "pf", "sr", "stance")
-        self.p3_tree = ttk.Treeview(p3_frame, columns=cal_cols, show="headings", height=7)
-        self.p3_tree.pack(fill=tk.BOTH, expand=True)
-        
-        cal_headers = {
-            "bucket": "Probability Bucket", "cnt": "Count", "avg_conf": "Expected Prob",
-            "act_wr": "Actual Win Rate", "pf": "Profit Factor", "sr": "Sharpe",
-            "stance": "Calibration Stance"
-        }
-        for col, h in cal_headers.items():
-            self.p3_tree.heading(col, text=h)
-            self.p3_tree.column(col, width=100, anchor="center")
-            
-        lbl_err_frame = ttk.Frame(p3_frame)
-        lbl_err_frame.pack(fill=tk.X, expand=False, pady=(8, 0))
-        ttk.Label(lbl_err_frame, text="Average Model Probability Calibration Error: ").pack(side=tk.LEFT)
-        ttk.Label(lbl_err_frame, textvariable=self._val_cal_err_var, font=("Segoe UI", 10, "bold"), foreground="#3498db").pack(side=tk.LEFT)
-
-        # Phase 5: Decay Frame
-        p5_frame = ttk.LabelFrame(row3, text="Phase 5: Concept Drift & System Performance Decay Alerts", padding=10)
-        p5_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
-        
-        # Drift variables labels
-        self._val_psi_pcr_var = tk.StringVar(value="n/a")
-        self._val_psi_iv_var = tk.StringVar(value="n/a")
-        self._val_psi_rsi_var = tk.StringVar(value="n/a")
-        self._val_lbl_drift_var = tk.StringVar(value="n/a")
-        self._val_concept_drift_var = tk.StringVar(value="n/a")
-        self._val_brier_drift_var = tk.StringVar(value="n/a")
-        self._val_reg_drift_var = tk.StringVar(value="n/a")
-        self._val_overall_auc_var = tk.StringVar(value="n/a")
-        self._val_overall_sharpe_var = tk.StringVar(value="n/a")
-        self._val_overall_pf_var = tk.StringVar(value="n/a")
-        
-        drift_lbl_grid = ttk.Frame(p5_frame)
-        drift_lbl_grid.pack(fill=tk.X, expand=False, pady=(0, 5))
-        
-        def add_drift_metric(parent, label, var, row, col):
-            ttk.Label(parent, text=label).grid(row=row, column=col*2, sticky="w", padx=5, pady=2)
-            ttk.Label(parent, textvariable=var, font=("Segoe UI", 9, "bold")).grid(row=row, column=col*2+1, sticky="w", padx=5, pady=2)
-            
-        add_drift_metric(drift_lbl_grid, "Feature PSI (PCR):", self._val_psi_pcr_var, 0, 0)
-        add_drift_metric(drift_lbl_grid, "Feature PSI (IV):", self._val_psi_iv_var, 0, 1)
-        add_drift_metric(drift_lbl_grid, "Feature PSI (RSI):", self._val_psi_rsi_var, 1, 0)
-        add_drift_metric(drift_lbl_grid, "Label Drift:", self._val_lbl_drift_var, 1, 1)
-        add_drift_metric(drift_lbl_grid, "Concept Drift:", self._val_concept_drift_var, 2, 0)
-        add_drift_metric(drift_lbl_grid, "Brier Score Drift:", self._val_brier_drift_var, 2, 1)
-        add_drift_metric(drift_lbl_grid, "Regime Shift Drift:", self._val_reg_drift_var, 3, 0)
-        add_drift_metric(drift_lbl_grid, "Overall ROC-AUC:", self._val_overall_auc_var, 3, 1)
-        add_drift_metric(drift_lbl_grid, "Overall Sharpe:", self._val_overall_sharpe_var, 4, 0)
-        add_drift_metric(drift_lbl_grid, "Overall Profit Factor:", self._val_overall_pf_var, 4, 1)
-
-        ttk.Label(p5_frame, text="Drift & Decay Alerts Console:", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(10, 2))
-        
-        self.alerts_text = ScrolledText(p5_frame, height=5, font=("Consolas", 9), state=tk.DISABLED)
-        self.alerts_text.pack(fill=tk.BOTH, expand=True)
-
-        # ---------------- Phase 4 & 7: Threshold Optimization & Capital Readiness ----------------
-        row4 = ttk.Frame(container)
-        row4.pack(fill=tk.X, expand=False, padx=10, pady=(10, 20))
-        
-        p4_frame = ttk.LabelFrame(row4, text="Phase 4: Confidence Gating Threshold Optimization", padding=10)
-        p4_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        
-        thresh_cols = ("thresh", "trades", "auc", "pf", "sr", "exp")
-        self.p4_tree = ttk.Treeview(p4_frame, columns=thresh_cols, show="headings", height=5)
-        self.p4_tree.pack(fill=tk.BOTH, expand=True)
-        
-        thresh_headers = {
-            "thresh": "Threshold Filter", "trades": "Trades Passed", "auc": "ROC-AUC",
-            "pf": "Profit Factor", "sr": "Sharpe Ratio", "exp": "Expectancy"
-        }
-        for col, h in thresh_headers.items():
-            self.p4_tree.heading(col, text=h)
-            self.p4_tree.column(col, width=100, anchor="center")
-            
-        rec_row = ttk.Frame(p4_frame)
-        rec_row.pack(fill=tk.X, expand=False, pady=(8, 0))
-        ttk.Label(rec_row, text="Recommended Optimal Confidence Threshold: ").pack(side=tk.LEFT)
-        ttk.Label(rec_row, textvariable=self._val_opt_thresh_var, font=("Segoe UI", 10, "bold"), foreground="#2ecc71").pack(side=tk.LEFT)
-
-        # Phase 7: Sizing Sizing Readiness
-        p7_frame = ttk.LabelFrame(row4, text="Phase 7: Capital Scaling Sizing Sizing Readiness", padding=10)
-        p7_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
-        
-        p7_cols = ("scale", "gate", "status")
-        self.p7_tree = ttk.Treeview(p7_frame, columns=p7_cols, show="headings", height=4)
-        self.p7_tree.pack(fill=tk.BOTH, expand=True)
-        
-        p7_headers = {
-            "scale": "Sizing Scale", "gate": "Sizing Validation Gate", "status": "Deployment Status"
-        }
-        for col, h in p7_headers.items():
-            self.p7_tree.heading(col, text=h)
-            self.p7_tree.column(col, width=130, anchor="center")
-            
-        p7_rec_row = ttk.Frame(p7_frame)
-        p7_rec_row.pack(fill=tk.X, expand=False, pady=(8, 0))
-        ttk.Label(p7_rec_row, text="Optimal Position Size Recommendation: ").pack(side=tk.LEFT)
-        ttk.Label(p7_rec_row, textvariable=self._val_sizing_var, font=("Segoe UI", 10, "bold"), foreground="#2ecc71").pack(side=tk.LEFT)
-
-    def _trigger_validation_refresh(self) -> None:
-        """Fetch forward shadow metrics from the database and populate the validation dashboard."""
-        if self._throttle_ui_update("forward_validation", 2.0):
-            return
-        if not self._is_ui_alive():
-            return
-        if self._start_worker("forward_validation", self._validation_refresh_worker) is None:
-            return
-
-    def _validation_refresh_worker(self) -> None:
-        try:
-            data = self._collect_validation_dashboard_data()
-            self._run_on_ui_thread(self._apply_validation_dashboard_ui, data, tab="forward_validation")
-        except Exception as exc:
-            self._log_gui_error("validation_refresh_worker", exc, tab="forward_validation")
-
     def _collect_validation_dashboard_data(self) -> dict[str, Any]:
         from institutional_framework.validation_analytics import ValidationAnalyticsEngine
         engine = ValidationAnalyticsEngine()
@@ -18006,4664 +17430,6 @@ class ScalperUI(tk.Tk):
             "milestones": engine.fetch_milestones_and_readiness(),
             "final_report": engine.generate_final_report_data(),
         }
-
-    def _apply_validation_dashboard_ui(self, bundle: dict[str, Any]) -> None:
-        """Populate forward validation tab from collected data (main thread only)."""
-        try:
-            summary = bundle.get("summary")
-            regimes = bundle.get("regimes")
-            cal = bundle.get("cal")
-            thresh = bundle.get("thresh")
-            drift = bundle.get("drift")
-            milestones = bundle.get("milestones")
-            final_report = bundle.get("final_report")
-
-            # Safe formatting helper
-            def safe_format(d, key, fmt=None):
-                if not isinstance(d, dict):
-                    return "N/A"
-                val = d.get(key, "N/A")
-                if val is None or val == "N/A":
-                    return "N/A"
-                try:
-                    val_float = float(val)
-                    if fmt:
-                        return fmt.format(val_float)
-                    return str(val)
-                except Exception:
-                    return str(val)
-
-            # Update string variables
-            self._val_total_var.set(str(summary.get("total_predictions", "0") if isinstance(summary, dict) else "0"))
-            self._val_active_var.set(str(summary.get("active_trades", "0") if isinstance(summary, dict) else "0"))
-            self._val_filtered_var.set(str(summary.get("filtered_signals", "0") if isinstance(summary, dict) else "0"))
-            self._val_blocked_var.set(str(summary.get("blocked_signals", "0") if isinstance(summary, dict) else "0"))
-            self._val_throughput_var.set(safe_format(summary, "prediction_throughput_per_day", "{:.2f}"))
-            self._val_signal_conv_var.set(safe_format(summary, "signal_conversion_rate", "{:.2f}%"))
-            self._val_trade_conv_var.set(safe_format(summary, "trade_conversion_rate", "{:.2f}%"))
-            self._val_today_var.set(str(summary.get("predictions_today", "0") if isinstance(summary, dict) else "0"))
-            self._val_week_var.set(str(summary.get("predictions_this_week", "0") if isinstance(summary, dict) else "0"))
-            self._val_stance_var.set(cal.get("stance", "N/A") if isinstance(cal, dict) else "N/A")
-            self._val_cal_err_var.set(safe_format(cal, "average_calibration_error_pct", "{:.2f}%"))
-            
-            best_reg = regimes.get("best_regime", "N/A") if isinstance(regimes, dict) else "N/A"
-            worst_reg = regimes.get("worst_regime", "N/A") if isinstance(regimes, dict) else "N/A"
-            best_reg_sharpe = safe_format(regimes.get("regimes", {}).get(best_reg, {}) if isinstance(regimes, dict) else {}, "sharpe", "{:.2f}")
-            worst_reg_sharpe = safe_format(regimes.get("regimes", {}).get(worst_reg, {}) if isinstance(regimes, dict) else {}, "sharpe", "{:.2f}")
-            
-            self._val_best_reg_var.set(f"{best_reg} (Sharpe: {best_reg_sharpe})")
-            self._val_worst_reg_var.set(f"{worst_reg} (Sharpe: {worst_reg_sharpe})")
-            self._val_opt_thresh_var.set(f"Confidence > {safe_format(thresh, 'optimal_threshold', '{:.2f}')}")
-            self._val_sizing_var.set(final_report.get("recommended_position_sizing", "N/A") if isinstance(final_report, dict) else "N/A")
-
-            maps = dict(getattr(self, "_val_tree_iid_maps", {}) or {})
-            rolling_chk = summary.get("rolling_checkpoints", {}) if isinstance(summary, dict) else {}
-            milestone_dict = milestones.get("milestones", {}) if isinstance(milestones, dict) else {}
-            p1_rows: list[dict[str, Any]] = []
-            for checkpoint, m in rolling_chk.items():
-                m_gate = milestone_dict.get(checkpoint, {})
-                exp_val = safe_format(m, "expectancy", "{:.2f}")
-                p1_rows.append({
-                    "iid": str(checkpoint),
-                    "values": (
-                        f"{checkpoint} predictions",
-                        str(m.get("count", 0)),
-                        safe_format(m, "roc_auc", "{:.3f}"),
-                        safe_format(m, "win_rate", "{:.1f}%"),
-                        safe_format(m, "profit_factor", "{:.2f}"),
-                        safe_format(m, "sharpe", "{:.2f}"),
-                        f"Rs.{exp_val}" if exp_val != "N/A" else "N/A",
-                        m_gate.get("paper", "n/a") if isinstance(m_gate, dict) else "n/a",
-                        m_gate.get("live1", "n/a") if isinstance(m_gate, dict) else "n/a",
-                        m_gate.get("scale", "n/a") if isinstance(m_gate, dict) else "n/a",
-                    ),
-                })
-            maps["p1"] = self._upsert_tree_rows(
-                self.p1_tree, p1_rows, key_field="iid", iid_map=maps.get("p1"), tab="forward_validation_p1",
-            )
-
-            regimes_dict = regimes.get("regimes", {}) if isinstance(regimes, dict) else {}
-            best_reg_name = regimes.get("best_regime", "N/A") if isinstance(regimes, dict) else "N/A"
-            worst_reg_name = regimes.get("worst_regime", "N/A") if isinstance(regimes, dict) else "N/A"
-            p2_rows: list[dict[str, Any]] = []
-            for r_name, m in regimes_dict.items():
-                if r_name == best_reg_name:
-                    status_tag = "Best Edge"
-                elif r_name == worst_reg_name:
-                    status_tag = "Worst Edge"
-                else:
-                    status_tag = "Active"
-                exp_val = safe_format(m, "expectancy", "{:.2f}")
-                p2_rows.append({
-                    "iid": str(r_name),
-                    "values": (
-                        r_name,
-                        str(m.get("count", 0)),
-                        safe_format(m, "roc_auc", "{:.3f}"),
-                        safe_format(m, "win_rate", "{:.1f}%"),
-                        safe_format(m, "profit_factor", "{:.2f}"),
-                        safe_format(m, "sharpe", "{:.2f}"),
-                        f"Rs.{exp_val}" if exp_val != "N/A" else "N/A",
-                        status_tag,
-                    ),
-                })
-            maps["p2"] = self._upsert_tree_rows(
-                self.p2_tree, p2_rows, key_field="iid", iid_map=maps.get("p2"), tab="forward_validation_p2",
-            )
-
-
-            cal_buckets = cal.get("buckets", {}) if isinstance(cal, dict) else {}
-            p3_rows: list[dict[str, Any]] = []
-            for b_name, m in cal_buckets.items():
-                avg_conf = m.get("avg_confidence", "N/A")
-                if avg_conf != "N/A" and avg_conf is not None:
-                    try:
-                        avg_conf_val = f"{float(avg_conf) * 100:.1f}%"
-                    except Exception:
-                        avg_conf_val = "N/A"
-                else:
-                    avg_conf_val = "N/A"
-                p3_rows.append({
-                    "iid": str(b_name),
-                    "values": (
-                        b_name,
-                        str(m.get("count", 0)),
-                        avg_conf_val,
-                        safe_format(m, "actual_win_rate", "{:.1f}%"),
-                        safe_format(m, "profit_factor", "{:.2f}"),
-                        safe_format(m, "sharpe", "{:.2f}"),
-                        m.get("calibration_status", "N/A"),
-                    ),
-                })
-            maps["p3"] = self._upsert_tree_rows(
-                self.p3_tree, p3_rows, key_field="iid", iid_map=maps.get("p3"), tab="forward_validation_p3",
-            )
-
-            # Update Phase 5 Drift meters & Alerts console
-            d_metrics = drift.get("drift_metrics", {}) if isinstance(drift, dict) else {}
-            self._val_psi_pcr_var.set(safe_format(d_metrics, "feature_psi_pcr", "{:.4f}"))
-            self._val_psi_iv_var.set(safe_format(d_metrics, "feature_psi_iv", "{:.4f}"))
-            self._val_psi_rsi_var.set(safe_format(d_metrics, "feature_psi_rsi", "{:.4f}"))
-            self._val_lbl_drift_var.set(safe_format(d_metrics, "label_drift", "{:.2f}%"))
-            self._val_concept_drift_var.set(safe_format(d_metrics, "concept_drift", "{:.2f}%"))
-            self._val_brier_drift_var.set(safe_format(d_metrics, "performance_brier_drift_pct", "{:.2f}%"))
-            self._val_reg_drift_var.set(safe_format(d_metrics, "regime_drift_pct", "{:.2f}%"))
-            self._val_overall_auc_var.set(safe_format(d_metrics, "roc_auc", "{:.3f}"))
-            self._val_overall_sharpe_var.set(safe_format(d_metrics, "sharpe", "{:.2f}"))
-            self._val_overall_pf_var.set(safe_format(d_metrics, "profit_factor", "{:.2f}"))
-
-            self.alerts_text.config(state=tk.NORMAL)
-            self.alerts_text.delete("1.0", tk.END)
-            
-            drift_alerts = drift.get("alerts", []) if isinstance(drift, dict) else []
-            if drift_alerts:
-                for alert in drift_alerts:
-                    self.alerts_text.insert(tk.END, f"ðŸš¨ {alert}\n")
-            else:
-                self.alerts_text.insert(tk.END, "ðŸ† SYSTEM HEALTHY: Zero edge decay alerts triggered.\n")
-                self.alerts_text.insert(tk.END, "PSI shows excellent feature stability. Brier score is consistent.\n")
-                self.alerts_text.insert(tk.END, "Durable, statistically significant trading edge fully verified.\n")
-            self.alerts_text.config(state=tk.DISABLED)
-
-            thresh_dict = thresh.get("thresholds", {}) if isinstance(thresh, dict) else {}
-            p4_rows: list[dict[str, Any]] = []
-            for label, m in thresh_dict.items():
-                exp_val = safe_format(m, "expectancy", "{:.2f}")
-                p4_rows.append({
-                    "iid": str(label),
-                    "values": (
-                        label,
-                        str(m.get("count", 0)),
-                        safe_format(m, "roc_auc", "{:.3f}"),
-                        safe_format(m, "profit_factor", "{:.2f}"),
-                        safe_format(m, "sharpe", "{:.2f}"),
-                        f"Rs.{exp_val}" if exp_val != "N/A" else "N/A",
-                    ),
-                })
-            maps["p4"] = self._upsert_tree_rows(
-                self.p4_tree, p4_rows, key_field="iid", iid_map=maps.get("p4"), tab="forward_validation_p4",
-            )
-
-            cap_readiness = milestones.get("capital_readiness", {}) if isinstance(milestones, dict) else {}
-            p7_rows: list[dict[str, Any]] = []
-            for scale, status in cap_readiness.items():
-                gate_str = (
-                    "N >= 250, AUC >= 0.55" if scale == "1 lot"
-                    else "N >= 250, AUC >= 0.56" if scale == "2 lots"
-                    else "N >= 500, AUC >= 0.57, Sharpe >= 1.0" if scale == "5 lots"
-                    else "N >= 1000, AUC >= 0.58, Sharpe >= 1.2"
-                )
-                p7_rows.append({
-                    "iid": str(scale),
-                    "values": (scale, gate_str, status),
-                })
-            maps["p7"] = self._upsert_tree_rows(
-                self.p7_tree, p7_rows, key_field="iid", iid_map=maps.get("p7"), tab="forward_validation_p7",
-            )
-            self._val_tree_iid_maps = maps
-            self._tab_last_update_ts["forward_validation"] = datetime.now(timezone.utc).isoformat()
-
-            logger.info("Forward Shadow Validation Dashboard successfully refreshed.")
-        except Exception as exc:
-            self._log_gui_error("apply_validation_dashboard_ui", exc, tab="forward_validation")
-
-
-    _PF_EXPLICIT_STATUS_VALUES = frozenset({
-        "NOT_READY",
-        "MODEL_NOT_LOADED",
-        "FEATURES_MISSING",
-        "ARTIFACT_NOT_FOUND",
-        "PREDICT_EXCEPTION",
-        "INVALID_OUTPUT",
-        "NO_VALID_CONTRACT",
-        "LOW_CONFIDENCE",
-        "ARTIFACT_IDENTITY_MISMATCH",
-        "FEATURE_ORDER_MISSING",
-        "MODEL_FILE_MISSING",
-        "PREDICT_ERROR",
-        "WAITING_FOR_MSTOCK_EXCHANGE",
-        "WAITING_FOR_MSTOCK_EXPIRY",
-        "READY_FOR_PREDICTION",
-    })
-    _PF_BLANK_DISPLAY = frozenset({"", "-", "N/A", "n/a", "na", "NONE", "None"})
-
-    def _pf_dict_get(self, name: str, default=None):
-        return self._ui_dict_get(name, default)
-
-    @classmethod
-    def _pf_is_blank_display(cls, value: Any) -> bool:
-        if value is None:
-            return True
-        return str(value).strip() in cls._PF_BLANK_DISPLAY
-
-    def _pf_runtime_id(self, row_or_dec: Dict[str, Any]) -> str:
-        return self._pf_row_cache_key(row_or_dec)
-
-    def _pf_sort_rows_stable(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        order = list(self._pf_dict_get("_pf_candidate_order", []) or [])
-        rank = {rid: idx for idx, rid in enumerate(order)}
-        return sorted(
-            rows or [],
-            key=lambda r: (
-                rank.get(self._pf_runtime_id(r), 10_000),
-                self._pf_runtime_id(r),
-            ),
-        )
-
-    def _pf_stabilize_row_data(self, runtime_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
-        prev = dict((self._pf_dict_get("_pf_last_good_row_data", {}) or {}).get(runtime_id, {}))
-        merged = dict(prev)
-        for key, val in (row or {}).items():
-            if val is None:
-                continue
-            if isinstance(val, str) and not val.strip() and key not in ("last_no_trade_reason", "raw_reason", "reason_code"):
-                continue
-            merged[key] = val
-        raw_reason = str(
-            row.get("raw_reason")
-            or row.get("last_no_trade_reason")
-            or row.get("no_trade_reason")
-            or row.get("reason_code")
-            or ""
-        ).upper()
-        explicit_reason = any(tok in raw_reason for tok in self._PF_EXPLICIT_STATUS_VALUES)
-        predict_attempted = bool(row.get("predict_attempted", merged.get("predict_attempted", False)))
-        conf = row.get("confidence")
-        if conf in (None, "") and not explicit_reason and not predict_attempted:
-            if merged.get("confidence") not in (None, ""):
-                row = dict(row)
-                row["confidence"] = merged.get("confidence")
-                row["confidence_display"] = merged.get("confidence_display")
-        for field in (
-            "selected_strike",
-            "selected_option_type",
-            "selected_symbol",
-            "entry_price",
-            "current_price",
-            "option_current_price",
-            "spot_price",
-            "position_status",
-            "final_signal",
-            "last_no_trade_reason",
-            "raw_reason",
-        ):
-            new_val = row.get(field)
-            old_val = merged.get(field)
-            if self._pf_is_blank_display(new_val) and not self._pf_is_blank_display(old_val):
-                if field in ("last_no_trade_reason", "raw_reason") and explicit_reason:
-                    continue
-                row = dict(row)
-                row[field] = old_val
-        merged.update({k: v for k, v in row.items() if v is not None})
-        store = self._pf_dict_get("_pf_last_good_row_data")
-        if store is None:
-            store = {}
-            self._pf_last_good_row_data = store
-        store[runtime_id] = merged
-        return merged
-
-    def _pf_coalesce_display_values(self, runtime_id: str, old_vals: tuple, new_vals: tuple) -> tuple:
-        if not old_vals:
-            return new_vals
-        cols = tuple(self.pf_tree["columns"]) if getattr(self, "pf_tree", None) is not None else ()
-        out = list(new_vals)
-        for idx, col in enumerate(cols):
-            if idx >= len(out):
-                break
-            new_v = out[idx]
-            old_v = old_vals[idx] if idx < len(old_vals) else ""
-            if not self._pf_is_blank_display(new_v):
-                continue
-            if self._pf_is_blank_display(old_v):
-                continue
-            if col == "conf":
-                if str(old_v).strip().upper() in self._PF_EXPLICIT_STATUS_VALUES or self._pf_conf_is_numeric(old_v):
-                    out[idx] = old_v
-            elif col in ("sel_strike", "sel_type", "sel_symbol", "entry_px", "cur_opt_px", "spot", "final_signal", "paper_action", "trade_reason", "last_reason"):
-                out[idx] = old_v
-        return tuple(out)
-
-    @staticmethod
-    def _pf_conf_is_numeric(value: Any) -> bool:
-        try:
-            float(str(value).strip())
-            return True
-        except Exception:
-            return False
-
-    def _pf_update_paper_forward_state(
-        self,
-        rows: List[Dict[str, Any]] | None = None,
-        *,
-        source: str = "",
-        data_status: Any = None,
-        skip_reasons: Dict[str, str] | None = None,
-    ) -> None:
-        lock = getattr(self, "_pf_state_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._pf_state_lock = lock
-        with lock:
-            state = getattr(self, "_paper_forward_state", None)
-            if not isinstance(state, dict):
-                state = {}
-                self._paper_forward_state = state
-            if rows is not None:
-                incoming = list(rows or [])
-                if incoming:
-                    state["candidates"] = ScalperUI._pf_merge_runtime_rows_with_baseline(self, incoming)
-                elif not state.get("candidates"):
-                    baseline = ScalperUI._pf_config_baseline_rows(self)
-                    if baseline:
-                        state["candidates"] = list(baseline)
-            if data_status is not None:
-                state["data_status"] = data_status
-            if skip_reasons:
-                state["last_skip_reasons"] = dict(skip_reasons)
-            rt = self._pf_dict_get("_pf_runtime")
-            if rt is not None:
-                state["broker_status"] = getattr(getattr(rt, "auth", None), "status", "") or state.get("broker_status", "")
-                state["chain_status"] = str(getattr(rt, "option_chain_rows", 0) or 0)
-                state["candle_status"] = str(getattr(rt, "candle_count", 0) or 0)
-            state["last_update_ts"] = datetime.now(timezone.utc).isoformat()
-            state["last_source"] = source or state.get("last_source", "")
-
-    def _pf_request_ui_update(self, *, source: str = "", generation: int | None = None) -> None:
-        if self._gui_is_closing():
-            return
-        if generation is not None and generation != int(self._pf_dict_get("_pf_loop_generation", 0) or 0):
-            print(f"[PF-LOOP] stale_ui_request_ignored source={source} generation={generation}")
-            return
-        if threading.current_thread() is not threading.main_thread():
-            print(
-                f"[GUI-THREAD] tab=paper_forward worker_thread={threading.current_thread().name} "
-                f"ui_thread=main action=request_update source={source}"
-            )
-            self.ui_call(self._pf_request_ui_update, source=source, generation=generation)
-            return
-        now = time.time()
-        last = float(getattr(self, "_pf_last_ui_update_ts", 0.0) or 0.0)
-        min_iv = float(getattr(self, "_pf_ui_update_min_interval_sec", 1.0) or 1.0)
-        if now - last < min_iv:
-            self._pf_pending_ui_update = True
-            self._pf_update_pending = True
-            self._pf_pending_ui_source = source or "throttled_pending"
-            self._pf_pending_ui_generation = generation
-            remaining_ms = max(50, int((min_iv - (now - last)) * 1000))
-            print(f"[PAPER-FWD-UI] skip_throttled_update=true source={source} wait_ms={remaining_ms}")
-            if not getattr(self, "_pf_throttle_after_job", None):
-                self._pf_throttle_after_job = self.after(
-                    min(remaining_ms, 1000),
-                    self._pf_apply_pending_ui_update,
-                    generation,
-                )
-            return
-        self._pf_pending_ui_update = False
-        self._pf_update_pending = False
-        self._pf_apply_canonical_ui_update(source=source, generation=generation)
-
-    def _pf_apply_pending_ui_update(self, generation: int | None = None) -> None:
-        self._pf_throttle_after_job = None
-        if not getattr(self, "_pf_pending_ui_update", False) and generation is None:
-            return
-        source = getattr(self, "_pf_pending_ui_source", "throttled_pending") or "throttled_pending"
-        pending_generation = getattr(self, "_pf_pending_ui_generation", generation)
-        self._pf_pending_ui_update = False
-        self._pf_update_pending = False
-        self._pf_apply_canonical_ui_update(source=source, generation=pending_generation)
-
-    def _pf_gui_loop_diagnostics(self) -> dict[str, Any]:
-        eng_thread = self._pf_dict_get("_pf_engine_thread")
-        data_thread = self._pf_dict_get("_pf_data_poller_thread")
-        tree_count = 0
-        try:
-            if getattr(self, "pf_tree", None) is not None:
-                tree_count = len(self.pf_tree.get_children())
-        except Exception:
-            tree_count = 0
-        return {
-            "pf_after_job": getattr(self, "_pf_after_job", None),
-            "pf_throttle_after_job": getattr(self, "_pf_throttle_after_job", None),
-            "pf_update_job": getattr(self, "_pf_update_job", None),
-            "paper_forward_running": bool(
-                self._pf_dict_get("pf_engine")
-                and eng_thread
-                and eng_thread.is_alive()
-                and not (self._pf_dict_get("_pf_stop_event") and self._pf_dict_get("_pf_stop_event").is_set())
-            ),
-            "worker_thread_alive": bool(eng_thread and eng_thread.is_alive()),
-            "data_poller_alive": bool(data_thread and data_thread.is_alive()),
-            "last_ui_update_ts": getattr(self, "_pf_last_gui_update_ts", None),
-            "last_ui_update_mono": getattr(self, "_pf_last_ui_update_ts", None),
-            "pending_ui_update": bool(getattr(self, "_pf_pending_ui_update", False)),
-            "candidate_row_count": len(getattr(self, "_pf_candidate_order", []) or []),
-            "tree_item_count": tree_count,
-            "loop_generation": int(self._pf_dict_get("_pf_loop_generation", 0) or 0),
-            "user_stopped": bool(self._pf_dict_get("_pf_user_stopped")),
-            "app_after_jobs": list((getattr(self, "_app_after_ids", {}) or {}).keys()),
-        }
-
-    def _pf_queue_state_update(
-        self,
-        rows: List[Dict[str, Any]] | None = None,
-        *,
-        source: str = "",
-        generation: int | None = None,
-    ) -> None:
-        if generation is not None and generation != int(self._pf_dict_get("_pf_loop_generation", 0) or 0):
-            return
-        if self._gui_is_closing():
-            return
-        if rows is None:
-            engine = self._pf_dict_get("pf_engine")
-            if engine is None:
-                return
-            try:
-                rows = engine.get_status_table()
-            except Exception:
-                rows = []
-        self._pf_update_paper_forward_state(rows=list(rows or []), source=source)
-        self._pf_request_ui_update(source=source, generation=generation)
-
-    def _pf_should_auto_start(self) -> bool:
-        """Return True when paper-forward multi should start without a manual button click."""
-        if str(os.getenv("MSTOCK_ENABLE_LIVE_ORDERS", "false")).lower() in ("1", "true", "yes"):
-            return False
-        if str(os.getenv("MSTOCK_AUTO_START_PAPER_FORWARD", "")).strip().lower() in ("0", "false", "no"):
-            return False
-        cand_file = _paper_forward_candidate_config_path()
-        if not cand_file.exists():
-            return False
-        if str(os.getenv("MSTOCK_PAPER_FORWARD_MULTI", "0")).strip().lower() in ("1", "true", "yes"):
-            return True
-        try:
-            data = json.loads(cand_file.read_text(encoding="utf-8"))
-            loaded = [
-                c for c in data.get("candidates", [])
-                if c.get("paper_forward_only") or c.get("classification") == "paper_forward_only"
-            ]
-            return len(loaded) > 0
-        except Exception:
-            return False
-
-    def _pf_ensure_paper_forward_running(self) -> None:
-        """Idempotent auto-start for paper-forward multi (safe: no live orders)."""
-        if self._pf_dict_get("_pf_user_stopped"):
-            return
-        if not self._pf_should_auto_start():
-            return
-        if self._pf_dict_get("_pf_starting"):
-            print("[PF-AUTO-START] already_starting=true skip_duplicate=true", flush=True)
-            return
-        if getattr(self, "pf_status_var", None) is None or getattr(self, "pf_tree", None) is None:
-            try:
-                self._ensure_lazy_main_tab_built("Paper Forward Monitor")
-            except Exception as exc:
-                print(f"[PF-AUTO-START] lazy_tab_build_request_failed={exc}", flush=True)
-            self._safe_after_app("pf_auto_start_after_tab_build", 300, self._pf_ensure_paper_forward_running)
-            print("[PF-AUTO-START] deferred reason=paper_forward_tab_not_built", flush=True)
-            return
-        engine = self._pf_dict_get("pf_engine")
-        eng_thread = self._pf_dict_get("_pf_engine_thread")
-        stop_event = self._pf_dict_get("_pf_stop_event")
-        if engine and eng_thread and eng_thread.is_alive() and not (stop_event and stop_event.is_set()):
-            self._pf_request_ui_update(source="ensure_running")
-            return
-        try:
-            print("[PF-AUTO-START] starting paper_forward_multi from config/env", flush=True)
-            self._pf_start_multi()
-        except Exception as exc:
-            print(f"[PF-AUTO-START] failed: {exc}", flush=True)
-
-    def _pf_bind_tree_scroll(self) -> None:
-        """Bind mouse wheel scrolling on the Paper Forward Monitor table."""
-        tree = getattr(self, "pf_tree", None)
-        if tree is None:
-            return
-
-        def _wheel_delta(event) -> int:
-            if getattr(event, "delta", 0):
-                return int(-1 * (event.delta / 120))
-            if getattr(event, "num", None) == 4:
-                return -1
-            if getattr(event, "num", None) == 5:
-                return 1
-            return 0
-
-        def _on_mousewheel(event):
-            delta = _wheel_delta(event)
-            if not delta:
-                return
-            if event.state & 0x0001:  # Shift held -> horizontal scroll
-                tree.xview_scroll(delta, "units")
-            else:
-                tree.yview_scroll(delta, "units")
-            return "break"
-
-        targets = [tree]
-        area = getattr(self, "_pf_tree_area", None)
-        if area is not None:
-            targets.append(area)
-        for widget in targets:
-            widget.bind("<MouseWheel>", _on_mousewheel, add="+")
-            widget.bind("<Shift-MouseWheel>", _on_mousewheel, add="+")
-            widget.bind("<Button-4>", _on_mousewheel, add="+")
-            widget.bind("<Button-5>", _on_mousewheel, add="+")
-
-    # --- Ensemble Auto Router Tab (optional direct-model paper mode only) ---
-    def _build_ensemble_auto_router_tab(self) -> None:
-        frame = self.ensemble_auto_router_frame
-        root = ttk.Frame(frame)
-        root.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        ctrl = ttk.Frame(root)
-        ctrl.pack(fill=tk.X, pady=(0, 8))
-        self._ensemble_status_var = tk.StringVar(value="Ensemble Auto Router: loading")
-        ttk.Label(ctrl, textvariable=self._ensemble_status_var).pack(side=tk.LEFT)
-        ttk.Button(ctrl, text="Start Ensemble Paper Mode", command=self._ensemble_start_paper_mode).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(ctrl, text="Stop Ensemble Paper Mode", command=self._ensemble_stop_paper_mode).pack(side=tk.LEFT, padx=4)
-        ttk.Button(ctrl, text="Reload Models", command=self._ensemble_reload_models).pack(side=tk.LEFT, padx=4)
-        ttk.Button(ctrl, text="Run Dry Decision Once", command=self._ensemble_run_dry_decision_once).pack(side=tk.LEFT, padx=4)
-        ttk.Button(ctrl, text="Export Ensemble Report", command=self._ensemble_export_report).pack(side=tk.LEFT, padx=4)
-
-        summary = ttk.LabelFrame(root, text="Final Decision")
-        summary.pack(fill=tk.X, pady=(0, 8))
-        self._ensemble_decision_vars = {
-            "enabled": tk.StringVar(value="enabled: n/a"),
-            "final_confidence": tk.StringVar(value="final confidence: n/a"),
-            "final_direction": tk.StringVar(value="final direction: n/a"),
-            "decision": tk.StringVar(value="decision: n/a"),
-            "block_reason": tk.StringVar(value="block reason: n/a"),
-            "contract": tk.StringVar(value="selected option: n/a"),
-            "pnl": tk.StringVar(value="paper P&L: realized Rs. 0.00 | unrealized Rs. 0.00"),
-        }
-        for idx, key in enumerate(("enabled", "final_confidence", "final_direction", "decision", "block_reason", "contract", "pnl")):
-            ttk.Label(summary, textvariable=self._ensemble_decision_vars[key]).grid(row=idx // 2, column=idx % 2, sticky="w", padx=8, pady=3)
-        summary.grid_columnconfigure(0, weight=1)
-        summary.grid_columnconfigure(1, weight=1)
-
-        model_lf = ttk.LabelFrame(root, text="Model Votes")
-        model_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        model_cols = (
-            "model",
-            "loaded",
-            "status",
-            "ce_prob",
-            "pe_prob",
-            "raw_output",
-            "confidence",
-            "direction",
-            "vote",
-            "weight",
-            "label_mapping",
-            "error",
-        )
-        self.ensemble_model_tree = ttk.Treeview(model_lf, columns=model_cols, show="headings", height=8)
-        for col, title, width in (
-            ("model", "Model", 210),
-            ("loaded", "Loaded", 70),
-            ("status", "Status", 150),
-            ("ce_prob", "CE Prob", 80),
-            ("pe_prob", "PE Prob", 80),
-            ("raw_output", "Raw Output", 180),
-            ("confidence", "Confidence", 90),
-            ("direction", "Direction Vote", 100),
-            ("vote", "Vote", 80),
-            ("weight", "Weight", 70),
-            ("label_mapping", "Label Mapping", 180),
-            ("error", "Error", 260),
-        ):
-            self.ensemble_model_tree.heading(col, text=title)
-            self.ensemble_model_tree.column(col, width=width, stretch=(col in {"error", "raw_output", "label_mapping"}))
-        self.ensemble_model_tree.pack(fill=tk.BOTH, expand=True)
-
-        opt_lf = ttk.LabelFrame(root, text="Selected Option / Paper State")
-        opt_lf.pack(fill=tk.X)
-        opt_cols = ("symbol", "strike", "expiry", "bid", "ask", "ltp", "spread", "realized", "unrealized")
-        self.ensemble_option_tree = ttk.Treeview(opt_lf, columns=opt_cols, show="headings", height=2)
-        for col, title, width in (
-            ("symbol", "Symbol", 180),
-            ("strike", "Strike", 80),
-            ("expiry", "Expiry", 100),
-            ("bid", "Bid", 70),
-            ("ask", "Ask", 70),
-            ("ltp", "LTP", 70),
-            ("spread", "Spread %", 80),
-            ("realized", "Realized P&L", 100),
-            ("unrealized", "Unrealized P&L", 110),
-        ):
-            self.ensemble_option_tree.heading(col, text=title)
-            self.ensemble_option_tree.column(col, width=width, stretch=(col == "symbol"))
-        self.ensemble_option_tree.pack(fill=tk.X)
-
-        debug_lf = ttk.LabelFrame(root, text="Debug Log")
-        debug_lf.pack(fill=tk.BOTH, expand=False, pady=(8, 0))
-        self.ensemble_debug_text = ScrolledText(debug_lf, height=7, wrap=tk.WORD)
-        self.ensemble_debug_text.pack(fill=tk.BOTH, expand=True)
-
-        print("[ENSEMBLE-GUI] tab initialized", flush=True)
-        self._ensemble_ensure_runtime()
-        self._ensemble_refresh_ui()
-
-    def _ensemble_ensure_runtime(self) -> tuple[EnsembleAutoRouter, EnsemblePaperTrader]:
-        if self._ensemble_router is None:
-            cfg = load_ensemble_auto_config()
-            self._ensemble_router = EnsembleAutoRouter(cfg)
-        if self._ensemble_paper is None:
-            self._ensemble_paper = EnsemblePaperTrader(self._ensemble_router)
-        return self._ensemble_router, self._ensemble_paper
-
-    def _ensemble_snapshot_from_ui(self) -> dict[str, object]:
-        rows = []
-        for attr in ("_latest_option_chain_rows", "_last_option_chain_rows", "_paper_forward_option_chain_rows", "latest_option_chain", "option_chain_data"):
-            val = getattr(self, attr, None)
-            if isinstance(val, list) and val:
-                rows = [dict(x) for x in val if isinstance(x, dict)]
-                if rows:
-                    break
-        snap: dict[str, object] = {}
-        if rows:
-            # Prefer a row with usable price data, but keep the full chain for side selection.
-            base = next((r for r in rows if r.get("ltp") or r.get("close") or r.get("bid") or r.get("ask")), rows[0])
-            snap.update(base)
-            snap["option_chain"] = rows
-        candles = []
-        for attr in ("_latest_candles", "_chart_candles", "candles"):
-            val = getattr(self, attr, None)
-            if isinstance(val, list) and val:
-                for candle in val[-100:]:
-                    if isinstance(candle, dict):
-                        candles.append(dict(candle))
-                        continue
-                    row = {}
-                    for key in ("open", "high", "low", "close", "volume", "timestamp", "datetime", "ts"):
-                        try:
-                            cv = getattr(candle, key)
-                        except Exception:
-                            cv = None
-                        if cv not in (None, ""):
-                            row[key] = cv
-                    if row:
-                        candles.append(row)
-                if candles:
-                    break
-        if candles:
-            snap["candles"] = candles
-            latest = candles[-1]
-            for src, dst in (("open", "open"), ("high", "high"), ("low", "low"), ("close", "close"), ("volume", "volume_spot")):
-                if latest.get(src) not in (None, ""):
-                    snap.setdefault(dst, latest.get(src))
-        try:
-            if self._spot_ltp_live is not None:
-                snap.setdefault("spot_close", float(self._spot_ltp_live))
-                snap.setdefault("ctx_spot", float(self._spot_ltp_live))
-                snap.setdefault("spot", float(self._spot_ltp_live))
-        except Exception:
-            pass
-        if not snap:
-            snap = {"option_chain": []}
-        return snap
-
-    def _ensemble_populate_model_vote_rows(self, router: EnsembleAutoRouter, result: object = None) -> int:
-        tree = getattr(self, "ensemble_model_tree", None)
-        if tree is None:
-            return 0
-        rows = router.model_vote_rows(result if result is not None else router.last_decision)
-        try:
-            for iid in tree.get_children():
-                tree.delete(iid)
-            for row in rows:
-                confidence = "-" if row.get("confidence") is None else f"{float(row['confidence']):.4f}"
-                ce_prob = "-" if row.get("ce_prob") is None else f"{float(row['ce_prob']):.4f}"
-                pe_prob = "-" if row.get("pe_prob") is None else f"{float(row['pe_prob']):.4f}"
-                direction = "-" if row.get("direction") is None else f"{float(row['direction']):.4f}"
-                values = (
-                    row.get("model") or "-",
-                    "True" if row.get("loaded") else "False",
-                    row.get("status") or "-",
-                    ce_prob,
-                    pe_prob,
-                    row.get("raw_output") or "-",
-                    confidence,
-                    direction,
-                    row.get("vote") or "NO_VOTE",
-                    f"{float(row.get('weight') or 0.0):.3f}",
-                    row.get("label_mapping") or "-",
-                    row.get("error") or row.get("artifact_path") or "-",
-                )
-                tree.insert("", tk.END, iid=str(row.get("model_key") or row.get("model")), values=values)
-            print(f"[ENSEMBLE-GUI] populated model rows count={len(rows)}", flush=True)
-            return len(rows)
-        except Exception as exc:
-            print(f"[ENSEMBLE-ERROR] populate_model_vote_rows error={type(exc).__name__}: {exc}", flush=True)
-            raise
-
-    def _ensemble_populate_selected_option_row(self, paper: EnsemblePaperTrader, result: object = None) -> None:
-        tree = getattr(self, "ensemble_option_tree", None)
-        if tree is None:
-            return
-        opt = getattr(result, "selected_option", None) if result is not None else None
-        spread = getattr(result, "spread_pct", None) if result is not None else None
-        vals = selected_option_state_row(
-            selected_option=opt,
-            spread_pct=spread,
-            open_position=paper.open_position,
-            realized_pnl=float(paper.realized_pnl),
-            unrealized_pnl=float(paper.unrealized_pnl),
-        )
-        try:
-            for iid in tree.get_children():
-                tree.delete(iid)
-            tree.insert("", tk.END, iid="selected", values=vals)
-        except Exception as exc:
-            print(f"[ENSEMBLE-ERROR] populate_selected_option error={type(exc).__name__}: {exc}", flush=True)
-            raise
-
-    def _ensemble_update_debug_log(self, router: EnsembleAutoRouter, result: object = None) -> None:
-        widget = getattr(self, "ensemble_debug_text", None)
-        if widget is None:
-            return
-        try:
-            lines = router.debug_lines(result if result is not None else router.last_decision)
-            widget.configure(state=tk.NORMAL)
-            widget.delete("1.0", tk.END)
-            widget.insert(tk.END, "\n".join(lines[-120:]) if lines else "[ENSEMBLE-LOAD] no diagnostics")
-            widget.configure(state=tk.DISABLED)
-        except Exception as exc:
-            print(f"[ENSEMBLE-ERROR] update_debug_log error={type(exc).__name__}: {exc}", flush=True)
-
-    def _ensemble_refresh_ui(self) -> None:
-        try:
-            router, paper = self._ensemble_ensure_runtime()
-            if not router.enabled and paper.paper_running:
-                paper.stop()
-                self._ensemble_paper_running = False
-            status = f"Ensemble Auto Router: {'enabled' if router.enabled else 'disabled by config'} | paper mode: {'running' if (router.enabled and paper.paper_running) else 'stopped'}"
-            self._safe_label_set(getattr(self, "_ensemble_status_var", None), status, tab="ensemble_auto_router")
-            result = router.last_decision
-            if hasattr(self, "_ensemble_decision_vars"):
-                vars_map = self._ensemble_decision_vars
-                vars_map["enabled"].set(f"enabled: {router.enabled}")
-                vars_map["final_confidence"].set(f"final confidence: {(result.final_confidence if result else 0.0):.4f}")
-                vars_map["final_direction"].set(f"final direction: {(result.final_direction if result else 0.0):.4f}")
-                vars_map["decision"].set(f"decision: {result.decision if result else 'n/a'}")
-                vars_map["block_reason"].set(f"block reason: {result.block_reason if result else 'n/a'}")
-                opt = result.selected_option if result else {}
-                vars_map["contract"].set(
-                    "selected option: "
-                    f"{opt.get('symbol') or opt.get('trading_symbol') or '-'} "
-                    f"strike={opt.get('strike') or opt.get('strike_price') or '-'} expiry={opt.get('expiry') or '-'}"
-                )
-                vars_map["pnl"].set(f"paper P&L: realized Rs. {paper.realized_pnl:.2f} | unrealized Rs. {paper.unrealized_pnl:.2f}")
-            self._ensemble_populate_model_vote_rows(router, result)
-            self._ensemble_populate_selected_option_row(paper, result)
-            self._ensemble_update_debug_log(router, result)
-        except Exception as exc:
-            print(f"[ENSEMBLE-ERROR] refresh_ui error={type(exc).__name__}: {exc}", flush=True)
-            self._log_gui_error("ensemble_refresh_ui", exc, tab="ensemble_auto_router")
-
-    def _ensemble_reload_models(self) -> None:
-        try:
-            router, _paper = self._ensemble_ensure_runtime()
-            router.reload()
-            self._ensemble_refresh_ui()
-        except Exception as exc:
-            messagebox.showerror("Ensemble Reload", str(exc))
-
-    def _ensemble_run_dry_decision_once(self) -> None:
-        try:
-            router, _paper = self._ensemble_ensure_runtime()
-            result = router.decide(self._ensemble_snapshot_from_ui(), open_positions=[])
-            print(f"[ENSEMBLE-DECISION] dry_once={decision_to_dict(result)}")
-            self._ensemble_refresh_ui()
-        except Exception as exc:
-            messagebox.showerror("Ensemble Dry Decision", str(exc))
-
-    def _ensemble_start_paper_mode(self) -> None:
-        try:
-            router, paper = self._ensemble_ensure_runtime()
-            router.set_runtime_enabled(True)
-            paper.start()
-            self._ensemble_paper_running = True
-            self._ensemble_paper_tick()
-            self._ensemble_refresh_ui()
-        except Exception as exc:
-            messagebox.showerror("Ensemble Paper Mode", str(exc))
-
-    def _ensemble_stop_paper_mode(self) -> None:
-        try:
-            _router, paper = self._ensemble_ensure_runtime()
-            paper.stop()
-            self._ensemble_paper_running = False
-            self._ensemble_refresh_ui()
-        except Exception as exc:
-            messagebox.showerror("Ensemble Paper Mode", str(exc))
-
-    def _ensemble_paper_tick(self) -> None:
-        try:
-            if not self._ensemble_paper_running:
-                return
-            _router, paper = self._ensemble_ensure_runtime()
-            paper.on_snapshot(self._ensemble_snapshot_from_ui())
-            self._ensemble_refresh_ui()
-        except Exception as exc:
-            self._log_gui_error("ensemble_paper_tick", exc, tab="ensemble_auto_router")
-        if self._ensemble_paper_running and not self._closing:
-            self._safe_after_app("ensemble_paper_tick", 5000, self._ensemble_paper_tick)
-
-    def _ensemble_export_report(self) -> None:
-        try:
-            _router, paper = self._ensemble_ensure_runtime()
-            trades_path, summary_path = paper.export()
-            self._ensemble_refresh_ui()
-            messagebox.showinfo("Ensemble Export", f"Wrote:\n{trades_path}\n{summary_path}")
-        except Exception as exc:
-            messagebox.showerror("Ensemble Export", str(exc))
-
-    # --- Paper Forward Monitor Tab (multi-candidate paper/sim observation only) ---
-    def _build_paper_forward_monitor_tab(self) -> None:
-        if getattr(self, "_paper_forward_monitor_built", False):
-            self._pf_request_ui_update(
-                source="tab_already_built",
-                generation=int(self._pf_dict_get("_pf_loop_generation", 0) or 0),
-            )
-            return
-        self._paper_forward_monitor_built = True
-        frame = self.paper_forward_monitor_frame
-        # Top controls
-        ctrl = ttk.Frame(frame)
-        ctrl.pack(fill="x", padx=8, pady=4)
-
-        self.pf_engine = None
-        self.pf_status_var = tk.StringVar(value="Paper Forward Monitor â€” All simulated. Live orders: FALSE")
-
-        ttk.Button(ctrl, text="Reload Candidates", command=self._pf_reload_candidates).pack(side="left", padx=4)
-        ttk.Button(ctrl, text="Start Paper Forward Multi", command=self._pf_start_multi).pack(side="left", padx=4)
-        ttk.Button(ctrl, text="Stop", command=self._pf_stop_multi).pack(side="left", padx=4)
-        ttk.Button(ctrl, text="Export Summary", command=self._pf_export_summary).pack(side="left", padx=4)
-        ttk.Button(ctrl, text="Diagnose Candidates", command=self._pf_diagnose_candidates).pack(side="left", padx=4)
-        ttk.Button(ctrl, text="Repair Candidate Artifact Paths", command=self._pf_repair_candidate_artifacts).pack(side="left", padx=4)
-        ttk.Button(ctrl, text="Verify Token Now", command=self._pf_verify_token_button).pack(side="left", padx=4)
-        ttk.Button(ctrl, text="Debug PF State", command=self._pf_debug_runtime_state).pack(side="left", padx=4)
-        ttk.Button(ctrl, text="Diagnose m.Stock Option Chain", command=self._pf_diagnose_mstock_chain).pack(side="left", padx=4)
-        self.pf_lifecycle_filter_var = tk.StringVar(value="Show Qualified Only")
-        lifecycle_filter = ttk.Combobox(
-            ctrl,
-            textvariable=self.pf_lifecycle_filter_var,
-            values=(
-                "Show Qualified Only",
-                "Show Paper Forward Eligible",
-                "Show Shadow Eligible",
-                "Show Live Eligible",
-                "Show Blocked / Rejected",
-                "Show All Debug",
-            ),
-            width=24,
-            state="readonly",
-        )
-        lifecycle_filter.pack(side="left", padx=4)
-        lifecycle_filter.bind("<<ComboboxSelected>>", lambda _e: self._pf_on_lifecycle_filter_changed())
-        ttk.Label(ctrl, textvariable=self.pf_status_var, foreground="red").pack(side="left", padx=12)
-
-        # Safety banner
-        banner = ttk.Label(frame, text="PAPER/SIM ONLY â€” broker.place_order NEVER called â€” MSTOCK_ENABLE_LIVE_ORDERS must be false", foreground="red", font=("TkDefaultFont", 9, "bold"))
-        banner.pack(fill="x", padx=8, pady=2)
-        bs_banner = ttk.Label(
-            frame,
-            text=(
-                "PAPER/SIM ONLY — Black-Scholes synthetic chain + synthetic candles active. "
-                "Results are not real-market forward performance."
-            ),
-            foreground="darkorange",
-            font=("TkDefaultFont", 9, "bold"),
-        )
-        bs_banner.pack(fill="x", padx=8, pady=2)
-        self._pf_bs_warning_banner = bs_banner
-
-        # Treeview table (vertical + horizontal scroll)
-        cols = (
-            "enabled", "candidate_id", "model", "preset", "side", "stage", "next_step", "can_advance",
-            "block_reason", "missing_requirements", "artifact_status", "data_status", "confidence_health",
-            "trades_days", "final_signal", "conf", "ensemble_prob", "xgb_prob", "rf_prob", "model_disagreement", "allowed", "model_type",
-            "feature_missing_count", "feature_invalid_count", "pred_block_reason", "paper_action", "trade_reason",
-            "pos", "sel_strike", "sel_type", "sel_symbol", "entries", "exits", "entry_px", "cur_opt_px", "qty", "spot", "unreal_pnl", "real_pnl",
-            "mark_source", "cost_quality", "last_mark_time", "trades", "sim_wr", "max_dd", "last_reason", "updated",
-        )
-        tree_area = ttk.Frame(frame)
-        tree_area.pack(fill="both", expand=True, padx=8, pady=4)
-        self._pf_tree_area = tree_area
-
-        self.pf_tree = ttk.Treeview(tree_area, columns=cols, show="headings", height=12)
-        col_titles = {
-            "entry_px": "Entry Px (Opt)",
-            "cur_opt_px": "Cur Px (Opt)",
-            "qty": "Qty",
-            "spot": "Spot",
-            "unreal_pnl": "Unreal PnL (Rs)",
-            "real_pnl": "Real PnL (Rs)",
-            "mark_source": "Mark Source",
-            "cost_quality": "Cost Qlty",
-            "last_mark_time": "Last Mark Time",
-            "sim_wr": "Sim Wr",
-            "max_dd": "Max Dd (Rs)",
-            "sel_strike": "Sel Strike",
-            "sel_type": "Type",
-            "sel_symbol": "Symbol",
-            "stage": "Stage",
-            "next_step": "Next Step",
-            "can_advance": "Can Advance",
-            "block_reason": "Block Reason",
-            "missing_requirements": "Missing Requirements",
-            "artifact_status": "Artifact Status",
-            "data_status": "Data Status",
-            "confidence_health": "Confidence Health",
-            "trades_days": "Trades / Days",
-            "ensemble_prob": "Ens Prob",
-            "xgb_prob": "XGB Prob",
-            "rf_prob": "RF Prob",
-            "model_disagreement": "Disagree",
-            "allowed": "Allowed",
-            "model_type": "Model Type",
-            "feature_missing_count": "Feat Miss",
-            "feature_invalid_count": "Feat Bad",
-            "pred_block_reason": "Pred Block",
-            "paper_action": "Paper Action",
-            "trade_reason": "Trade Reason",
-        }
-        for c in cols:
-            self.pf_tree.heading(c, text=col_titles.get(c, c.replace("_", " ").title()))
-            narrow = c in ("enabled", "conf", "ensemble_prob", "xgb_prob", "rf_prob", "model_disagreement", "allowed", "feature_missing_count", "feature_invalid_count", "pos", "sel_type", "entries", "exits", "sim_wr", "trades", "spot", "qty", "can_advance", "paper_action")
-            width = 70 if narrow else (260 if c == "candidate_id" else (240 if c == "trade_reason" else (220 if c in ("sel_symbol", "block_reason", "missing_requirements", "pred_block_reason") else (300 if c == "last_reason" else 110))))
-            anchor = "e" if c in ("unreal_pnl", "real_pnl", "max_dd", "entry_px", "cur_opt_px", "spot", "sel_strike") else "w"
-            # stretch=False so horizontal scrollbar reveals wide candidate_id / last_reason columns.
-            self.pf_tree.column(c, width=width, stretch=False, anchor=anchor)
-
-        pf_vsb = ttk.Scrollbar(tree_area, orient="vertical", command=self.pf_tree.yview)
-        pf_hsb = ttk.Scrollbar(tree_area, orient="horizontal", command=self.pf_tree.xview)
-        self.pf_tree.configure(yscrollcommand=pf_vsb.set, xscrollcommand=pf_hsb.set)
-        try:
-            self.pf_tree.tag_configure("advance", background="#d9f2df")
-            self.pf_tree.tag_configure("waiting", background="#fff4c2")
-            self.pf_tree.tag_configure("blocked", background="#ffd6d6")
-            self.pf_tree.tag_configure("disabled", background="#e6e6e6")
-            self.pf_tree.tag_configure("live", background="#d9e8ff")
-        except Exception:
-            pass
-        self.pf_tree.grid(row=0, column=0, sticky="nsew")
-        pf_vsb.grid(row=0, column=1, sticky="ns")
-        pf_hsb.grid(row=1, column=0, sticky="ew")
-        tree_area.grid_rowconfigure(0, weight=1)
-        tree_area.grid_columnconfigure(0, weight=1)
-
-        self._pf_bind_tree_scroll()
-        self.pf_tree.bind("<Double-1>", self._pf_show_candidate_reason_detail)
-
-        # Status line
-        self.pf_live_var = tk.StringVar(value="Live orders: FALSE | Broker orders: FALSE | Candidates: 0 | Active pos: 0")
-        ttk.Label(frame, textvariable=self.pf_live_var).pack(fill="x", padx=8)
-
-        # Broker auth + candle source status (TASK 1/2)
-        self.pf_broker_status_var = tk.StringVar(value="Broker auth: UNKNOWN | Candle source: none")
-        ttk.Label(frame, textvariable=self.pf_broker_status_var, foreground="blue").pack(fill="x", padx=8)
-
-        self.pf_readiness_var = tk.StringVar(value="Readiness: (waiting for first eval)")
-        ttk.Label(frame, textvariable=self.pf_readiness_var, foreground="darkgreen").pack(fill="x", padx=8)
-
-        self._pf_after_job = None
-        self._pf_throttle_after_job = None
-        self._pf_update_job = None
-        self._pf_engine_thread = None
-        self._pf_stop_event = None
-        self._pf_loop_generation = 0
-        self._pf_data_poller_thread = None
-        self._pf_data_stop = None
-        self._pf_synthetic_candles_active = False
-        self._synthetic_chain_active = False
-        self._last_spot_source = ""
-        self._chain_source = ""
-        self._pf_last_gui_rows_by_candidate = {}
-        self._pf_poll_cycle_id = 0
-        self._pf_user_stopped = False
-        self._pf_tree_iids: Dict[str, str] = {}
-        self._pf_last_display_values: Dict[str, tuple] = {}
-        self._pf_last_good_row_data: Dict[str, Dict[str, Any]] = {}
-        self._pf_lifecycle_by_candidate: Dict[str, CandidateLifecycleStatus] = {}
-        self._pf_lifecycle_by_row_key: Dict[str, CandidateLifecycleStatus] = {}
-        self._pf_lifecycle_worker_running = False
-        self._pf_lifecycle_last_refresh_ts = 0.0
-        self._pf_candidate_order: List[str] = []
-        self._pf_last_ui_update_ts = 0.0
-        self._pf_ui_update_min_interval_sec = 1.0
-        self._pf_pending_ui_update = False
-        self._pf_update_pending = False
-        self._pf_starting = False
-        self._pf_monitor_running = False
-        self._option_chain_fetch_in_progress = False
-        self._last_option_chain_fetch_ts = 0.0
-        self._option_chain_cache_ttl_sec = 5.0
-        self._pf_state_lock = threading.RLock()
-        self._paper_forward_state: Dict[str, Any] = {
-            "broker_status": "",
-            "chain_status": "",
-            "candle_status": "",
-            "candidates": [],
-            "last_prediction_results": {},
-            "last_skip_reasons": {},
-            "last_update_ts": "",
-            "rows": [],
-            "data_status": None,
-        }
-
-        # PF autostart is scheduled from _post_first_paint_startup via _maybe_autostart_paper_forward
-
-        # TASK 1: EXACTLY ONE canonical runtime state for all PF data/auth/snapshots
-        self._pf_runtime = PaperForwardRuntime()
-        # For backward compat with auth code (sync auth into runtime.auth)
-        self._pf_auth_state = self._pf_runtime.auth
-        # legacy compat for existing tests
-        self._pf_last_auth_status = "TOKEN_MISSING"
-        self._pf_last_auth_error = ""
-        self._pf_auth_validation_attempted = False
-        self._pf_auth_validation_in_progress = False
-        self._pf_auth_token_hash_prefix = ""
-        self._pf_auth_success_count = 0
-        self._pf_auth_failure_count = 0
-        self._pf_last_valid_auth_state = None
-        self._pf_last_auth_endpoint = ""
-        self._pf_last_auth_checked_ts = ""
-        self._pf_auth_validation_started_ts = ""
-        self._pf_client_created = False
-        self._pf_client_source = "none"
-        self._pf_latest_decisions_by_candidate = {}
-        # also keep scattered data refs in sync with runtime where used
-        self._option_chain_data = []
-        self._latest_option_chain = []
-        self.option_chain_data = []
-        self.latest_option_chain = []
-        self._latest_option_chain_rows = []
-        self._latest_option_chain_cache = []
-        self._last_option_chain_rows = []
-        self._paper_forward_option_chain_rows = []
-        if not hasattr(self, "_market_data_lock"):
-            self._market_data_lock = threading.RLock()
-        self._latest_candles = []
-        try:
-            self._pf_reload_candidates()
-        except Exception as exc:
-            print(f"[PF-CANDIDATE] initial reload skipped: {type(exc).__name__}: {exc}")
-            self._pf_refresh_lifecycle_async(force=True)
-
-    def _pf_reload_candidates(self):
-        try:
-            candidate_file = _paper_forward_candidate_config_label()
-            cfg_diag = diagnose_paper_forward_candidate_config(candidate_file)
-            # Clear tree first (PHASE 4)
-            for i in self.pf_tree.get_children():
-                self.pf_tree.delete(i)
-            raw = _load_paper_forward_monitor_candidate_rows(candidate_file)
-            # Dedupe by stable full row identity; do not collapse threshold/model variants.
-            seen = {}
-            deduped = []
-            dups = 0
-            for c in raw:
-                if not _is_paper_forward_monitor_candidate(c):
-                    continue
-                threshold = c.get("threshold")
-                if threshold in (None, ""):
-                    threshold = c.get("selected_threshold") or c.get("entry_threshold") or ""
-                key = "|".join(
-                    str(x or "")
-                    for x in (
-                        c.get("candidate_id"),
-                        c.get("artifact_dir"),
-                        c.get("model_name"),
-                        c.get("preset_family"),
-                        c.get("side_policy"),
-                        threshold,
-                    )
-                )
-                if not key or key in seen:
-                    dups += 1
-                    continue
-                seen[key] = True
-                row = dict(c)
-                row["_row_key"] = key
-                deduped.append(row)
-            self.pf_candidates = deduped
-            self._pf_config_candidate_rows = list(deduped)
-            self._pf_candidate_order = [self._pf_row_cache_key(c) for c in deduped]
-            self._pf_active_candidate_id = str(cfg_diag.get("active_candidate_id") or "")
-            self._pf_candidate_config_reason = str(cfg_diag.get("reason") or "")
-            enabled = sum(1 for c in deduped if c.get("enabled", True))
-            disabled = len(deduped) - enabled
-            self.pf_status_var.set(
-                f"Config candidates={len(raw)} | enabled={enabled} | disabled={disabled} | duplicate_removed={dups} | reason={self._pf_candidate_config_reason}"
-            )
-            self._paper_forward_state["candidates"] = list(deduped)
-            self._paper_forward_state["rows"] = list(deduped)
-            self._pf_last_gui_rows_by_candidate = {
-                self._pf_row_cache_key(r): dict(r) for r in deduped if isinstance(r, dict)
-            }
-            self._pf_refresh_table(deduped, allow_full_clear=True)
-            print(f"[PF-CANDIDATE] config_candidates={len(raw)} enabled={enabled} disabled={disabled} duplicate_removed={dups}")
-            self._pf_refresh_lifecycle_async(force=True)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load paper forward candidate config: {e}")
-
-    def _pf_refresh_lifecycle_async(self, *, force: bool = False) -> None:
-        now = time.time()
-        if not force and now - float(getattr(self, "_pf_lifecycle_last_refresh_ts", 0.0) or 0.0) < 5.0:
-            return
-        if getattr(self, "_pf_lifecycle_worker_running", False):
-            return
-        self._pf_lifecycle_worker_running = True
-        self._pf_lifecycle_last_refresh_ts = now
-
-        def worker() -> None:
-            try:
-                rows = _load_paper_forward_monitor_candidate_rows(_paper_forward_candidate_config_label())
-                runtime = {}
-                try:
-                    runtime = dict(getattr(self, "_pf_latest_decisions_by_candidate", {}) or {})
-                except Exception:
-                    runtime = {}
-                live_ids = [c.candidate_id for c in load_live_whitelist() if getattr(c, "live_whitelisted", False)]
-                statuses = evaluate_candidate_rows(rows, runtime_stats=runtime, config={"live_1lot_whitelist": live_ids})
-                by_id = {st.candidate_id: st for st in statuses}
-                by_id_all = {}
-                for st in statuses:
-                    by_id_all.setdefault(st.candidate_id, []).append(st)
-                by_row_key = {}
-                for row, st in zip(rows, statuses):
-                    key = self._pf_row_cache_key(row)
-                    if key:
-                        by_row_key[key] = st
-                try:
-                    write_lifecycle_report(statuses)
-                except Exception as report_exc:
-                    print(f"[PF-LIFECYCLE] report write skipped: {report_exc}")
-                def apply() -> None:
-                    self._pf_lifecycle_by_candidate = by_id
-                    self._pf_lifecycle_statuses_by_candidate = by_id_all
-                    self._pf_lifecycle_by_row_key = by_row_key
-                    self._pf_lifecycle_worker_running = False
-                    self._pf_request_ui_update(source="lifecycle_refresh", generation=int(self._pf_dict_get("_pf_loop_generation", 0) or 0))
-                self.ui_call(apply)
-            except Exception as exc:
-                def fail() -> None:
-                    self._pf_lifecycle_worker_running = False
-                    self.pf_status_var.set(f"Lifecycle evaluation failed: {type(exc).__name__}: {exc}")
-                self.ui_call(fail)
-
-        threading.Thread(target=worker, daemon=True, name="candidate-lifecycle-pf").start()
-
-    def _pf_on_lifecycle_filter_changed(self) -> None:
-        try:
-            rows = list((getattr(self, "_paper_forward_state", {}) or {}).get("candidates") or [])
-            if not rows:
-                rows = list(getattr(self, "_pf_last_gui_rows_by_candidate", {}).values())
-            if not rows:
-                rows = list(getattr(self, "pf_candidates", []) or [])
-            if rows:
-                self._pf_refresh_table(rows)
-        except Exception as exc:
-            print(f"[PF-LIFECYCLE] immediate filter apply skipped: {exc}")
-        self._pf_refresh_lifecycle_async(force=True)
-
-    def _pf_lifecycle_filter_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        state_dict = getattr(self, "__dict__", {})
-        filter_var = state_dict.get("pf_lifecycle_filter_var")
-        try:
-            view = str(filter_var.get() if filter_var is not None else "Show Qualified Only")
-        except Exception:
-            view = "Show Qualified Only"
-        view_key = view.strip().lower()
-        paper_forward_view = view_key in {"paper", "paper forward eligible", "show paper forward eligible"}
-        debug_view = view_key in {"all", "all debug", "show all debug", "blocked", "blocked / rejected", "show blocked / rejected"}
-        statuses = state_dict.get("_pf_lifecycle_by_candidate", {}) or {}
-        statuses_all = state_dict.get("_pf_lifecycle_statuses_by_candidate", {}) or {}
-        statuses_by_row = state_dict.get("_pf_lifecycle_by_row_key", {}) or {}
-        if not statuses and not statuses_by_row and not statuses_all:
-            if debug_view:
-                return list(rows or [])
-            return [row for row in (rows or []) if _flag_is_true(row.get("enabled"), default=False)]
-        out: List[Dict[str, Any]] = []
-        for row in rows or []:
-            cid = str(row.get("candidate_id") or "")
-            row_key = self._pf_row_cache_key(row)
-            st = statuses_by_row.get(row_key)
-            all_for_candidate = list(statuses_all.get(cid) or [])
-            row_has_enabled = "enabled" in row
-            row_enabled = _flag_is_true(row.get("enabled"), default=False) if row_has_enabled else False
-            if st is None:
-                if len(all_for_candidate) == 1:
-                    st = all_for_candidate[0]
-                elif row_has_enabled:
-                    expected_disabled = not row_enabled
-                    candidates = [
-                        candidate_status
-                        for candidate_status in all_for_candidate
-                        if (str(candidate_status.current_stage).strip().upper() == "DISABLED") == expected_disabled
-                    ]
-                    if len(candidates) == 1:
-                        st = candidates[0]
-                    elif candidates and all(lifecycle_status_visible(candidate_status, view) for candidate_status in candidates):
-                        st = candidates[0]
-                else:
-                    st = statuses.get(cid)
-            status_disabled = bool(st is not None and str(st.current_stage).strip().upper() == "DISABLED")
-            if not debug_view and (not row_enabled or status_disabled):
-                continue
-            if (
-                st is not None
-                and not lifecycle_status_visible(st, view)
-                and not (paper_forward_view and _is_paper_forward_monitor_candidate(row))
-            ):
-                continue
-            if st is not None:
-                enriched = dict(row)
-                enriched["enabled"] = row_enabled
-                enriched["lifecycle_stage"] = st.current_stage
-                enriched["lifecycle_block_reason"] = st.block_reason
-                enriched["lifecycle_can_advance"] = st.can_advance
-                out.append(enriched)
-            elif view in {"Show All Debug", "Show Blocked / Rejected"}:
-                out.append(row)
-        return out
-
-    def _pf_diagnose_candidates(self):
-        """PHASE 10: Run full diagnostics, show summary, write reports. Also prints exact 10-field table per candidate (fix 9)."""
-        try:
-            # Direct per-candidate 10-field diagnostic print for all (even if script run) - uses runtime state + config
-            try:
-                cands = list(getattr(self, "pf_candidates", []) or [])
-                if not cands and hasattr(self, "pf_engine") and self.pf_engine:
-                    cands = list(getattr(self.pf_engine, "candidates", []) or [])
-                states = getattr(self, "_pf_latest_decisions_by_candidate", {}) or {}
-                eng_states = {}
-                if hasattr(self, "pf_engine") and self.pf_engine:
-                    try:
-                        eng_states = getattr(self.pf_engine, "_state", {}) or {}
-                    except Exception:
-                        eng_states = {}
-                print("[PF-DIAGNOSE-ALL] === Diagnose Candidates for all loaded ===")
-                for c in cands:
-                    cid = str(c.get("candidate_id") or "")
-                    # config vs runtime enabled (runtime may be flipped on load/disable)
-                    config_en = bool(c.get("_orig_enabled", c.get("enabled", True)))
-                    runtime_en = bool(c.get("enabled", True))
-                    mname = c.get("model_name", "") or (c.get("_resolve", {}) or {}).get("model_name", "")
-                    preset = c.get("preset_family", "") or (c.get("_resolve", {}) or {}).get("preset_family", "")
-                    sidep = c.get("side_policy", "") or (c.get("_resolve", {}) or {}).get("side_policy", "")
-                    thr = c.get("threshold") or c.get("selected_threshold") or (c.get("_resolve", {}) or {}).get("artifact_meta", {}).get("threshold", 0)
-                    cfg_ad = c.get("_config_artifact_dir") or c.get("artifact_dir", "") or ""
-                    res = c.get("_resolve") or {}
-                    resolved_ad = res.get("resolved_dir") or c.get("artifact_dir", "") or ""
-                    id_status = res.get("artifact_identity_status", "ok" if resolved_ad else "missing")
-                    ameta = res.get("artifact_meta", {}) or {}
-                    art_model = ameta.get("model_name", "")
-                    art_preset = ameta.get("preset_family", "")
-                    art_side = ameta.get("side_policy", "")
-                    art_thr = ameta.get("threshold", "")
-                    # model_path
-                    from pathlib import Path as _P
-                    mp = None
-                    mp_exists = False
-                    try:
-                        mp = res.get("model_file") or ( _P(resolved_ad) / "model.pkl" if resolved_ad else None )
-                        if mp:
-                            mp = str(mp)
-                            mp_exists = _P(mp).exists() if mp else False
-                    except Exception:
-                        pass
-                    fo_len = int(c.get("required_features") or len(c.get("_feature_order") or c.get("_feature_list") or []))
-                    fo_src = c.get("_feature_order_src", "") or (ameta.get("feature_order_src_file", "") if ameta else "")
-                    # missing/pred/last from state
-                    miss_cnt = 0
-                    pred_att = False
-                    rawc = None
-                    final_sig = "NO_TRADE"
-                    last_r = ""
-                    try:
-                        last_dec = states.get(cid) or eng_states.get(cid) or {}
-                        miss_cnt = len(last_dec.get("missing_features") or [])
-                        pred_att = bool(last_dec.get("predict_attempted", last_dec.get("predict_attempted", False)))
-                        rawc = last_dec.get("confidence", last_dec.get("raw_output"))
-                        final_sig = last_dec.get("final_signal", last_dec.get("last_signal", "NO_TRADE"))
-                        last_r = last_dec.get("last_no_trade_reason", last_dec.get("reason_code", last_dec.get("no_trade_reason", "")))
-                    except Exception:
-                        pass
-                    print(
-                        f"candidate_id={cid} config_enabled={config_en} runtime_enabled={runtime_en} "
-                        f"model_name={mname} preset_family={preset} side_policy={sidep} threshold={thr} "
-                        f"config_artifact_dir={cfg_ad} resolved_artifact_dir={resolved_ad} "
-                        f"artifact_identity_status={id_status} artifact_model_family={art_model} "
-                        f"artifact_preset_family={art_preset} artifact_side_policy={art_side} artifact_threshold={art_thr} "
-                        f"model_path={mp or ''} model_exists={mp_exists} feature_order_len={fo_len} "
-                        f"feature_order_source={fo_src} missing_features={miss_cnt} prediction_attempted={pred_att} "
-                        f"raw_output/conf={rawc} final_signal={final_sig} last_reason={last_r}"
-                    )
-                    if str(last_r).upper() == "ARTIFACT_NOT_FOUND" or str(c.get("disabled_reason", "")).upper() == "ARTIFACT_NOT_FOUND":
-                        print(
-                            f"candidate_id={cid} artifact_dir=None model_path=None "
-                            "reason=ARTIFACT_NOT_FOUND "
-                            "suggestion=run scripts/repair_paper_forward_candidate_artifacts.py --dry-run"
-                        )
-                print("[PF-DIAGNOSE-ALL] === end ===")
-            except Exception as _de:
-                print(f"[PF-DIAGNOSE-ALL] direct print error (non-fatal): {_de}")
-
-            import subprocess
-            res = subprocess.run(
-                [sys.executable, "scripts/diagnose_paper_forward_candidates.py"],
-                cwd=str(Path(__file__).parent.parent),
-                capture_output=True, text=True, timeout=180
-            )
-            out = (res.stdout or "") + "\n" + (res.stderr or "")
-            # Find latest report
-            reports = sorted(Path("reports").glob("paper_forward_candidate_diagnostics_*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
-            latest = reports[0] if reports else None
-            # TASK 5: enrich popup with runtime counters
-            extra = ""
-            try:
-                if hasattr(self, "pf_engine") and self.pf_engine:
-                    d = self.pf_engine.get_diagnostics() or {}
-                    last_ts = d.get("last_snapshot_ts")
-                    age = "n/a"
-                    try:
-                        if last_ts:
-                            age_s = (datetime.now(timezone.utc) - datetime.fromisoformat(str(last_ts).replace("Z", "+00:00"))).total_seconds()
-                            age = f"{age_s:.1f}s"
-                    except Exception:
-                        pass
-                    extra = (
-                        f"\nSnapshots: {d.get('snapshots_received',0)} | Evals: {d.get('evaluations_count',0)} "
-                        f"| Preds: {d.get('predictions_attempted',0)} | PredOK: {d.get('predictions_success',0)} "
-                        f"| RouteErrs: {d.get('route_errors',0)} | Last snap age: {age}"
-                    )
-                    reasons = d.get("reason_counts", {})
-                    if reasons:
-                        top = ", ".join(f"{k}:{v}" for k,v in sorted(reasons.items(), key=lambda x:-x[1])[:5])
-                        extra += f"\nTop reasons: {top}"
-                    miss = d.get("top_missing_features", {})
-                    if miss:
-                        extra += "\nTop missing features: " + ", ".join(f"{k}:{v}" for k, v in list(miss.items())[:8])
-                    data_status = d.get("data_status", {})
-                    if data_status:
-                        cache_counts = self._option_chain_cache_counts()
-                        cached_rows, cached_source = self._get_cached_option_chain_rows()
-                        sample_row = cached_rows[0] if cached_rows else {}
-                        sample_keys = sorted(list(sample_row.keys()))[:30] if isinstance(sample_row, dict) else []
-                        age = "n/a"
-                        try:
-                            ts = getattr(self, "_last_option_chain_ts", None)
-                            if ts:
-                                age = f"{(datetime.now() - ts).total_seconds():.1f}s"
-                        except Exception:
-                            pass
-                        print(f"[DIAG-OC] cache_counts={cache_counts}")
-                        print(f"[DIAG-OC] sample_row={sample_row}")
-                        extra += (
-                            f"\nData status: auth={data_status.get('broker_auth')} "
-                            f"auth_error={data_status.get('auth_error') or '-'} "
-                            f"validation_attempted={data_status.get('auth_validation_attempted')} "
-                            f"endpoint={data_status.get('auth_validation_endpoint') or '-'} "
-                            f"last_checked={data_status.get('auth_last_checked_ts') or '-'} "
-                            f"candles={data_status.get('candle_count')} source={data_status.get('candle_source')} "
-                            f"candle_error={data_status.get('candle_error') or '-'} "
-                            f"spot={data_status.get('spot_status')} option_chain={data_status.get('option_chain_status')} "
-                            f"rows={data_status.get('option_chain_rows') or data_status.get('option_rows')} "
-                            f"option_error={data_status.get('option_chain_error') or '-'} "
-                            f"quality={data_status.get('data_quality_status')}"
-                        )
-                        extra += (
-                            f"\nOption chain diagnostics: source={cached_source or getattr(self, '_last_option_chain_source', '-') or '-'} "
-                            f"age={age} cache_counts={cache_counts} sample_keys={sample_keys} "
-                            f"last_fetch_error={getattr(self, '_last_option_chain_error', None) or '-'}"
-                        )
-                        quality = str(data_status.get("data_quality_status") or "")
-                        if quality and quality != "DATA_OK":
-                            blockers = []
-                            if quality in ("TOKEN_NOT_VERIFIED", "AUTH_FAILED", "SESSION_EXPIRED"):
-                                blockers.append(f"broker token verification failed: {data_status.get('auth_error') or data_status.get('broker_auth')}")
-                            if data_status.get("option_chain_error"):
-                                blockers.append(f"option chain: {data_status.get('option_chain_error')}")
-                            if data_status.get("candle_error"):
-                                blockers.append(f"candles: {data_status.get('candle_error')}")
-                            extra += f"\nNo paper trades because {' + '.join(blockers) if blockers else 'data quality is ' + quality}."
-                    extra += f"\nCandidate rows updated: {d.get('candidate_rows_updated',0)}"
-                    if d.get("route_exception_tracebacks"):
-                        extra += "\nRoute exception details:"
-                        for ex in d.get("route_exception_tracebacks", [])[:5]:
-                            extra += f"\n- {ex.get('candidate_id')}: {ex.get('exception_type')}: {ex.get('exception_message')}"
-                            tb = str(ex.get("traceback") or "").splitlines()[-3:]
-                            if tb:
-                                extra += "\n  " + " | ".join(tb)
-            except Exception:
-                pass
-            summary = f"Diagnose complete.{extra}\nLatest report: {latest}\n\nLast 1500 chars of output:\n{out[-1500:]}"
-            messagebox.showinfo("Paper Forward Diagnose", summary)
-            print("[PAPER-FWD-GUI] Diagnose button ran, report:", latest)
-            # Try to refresh status from latest json if present
-            if latest:
-                j = latest.with_suffix(".json")
-                if j.exists():
-                    try:
-                        data = json.loads(j.read_text(encoding="utf-8"))
-                        self.pf_status_var.set(f"DIAG DONE: OK={data.get('loaded_ok',0)} FAIL={data.get('failed',0)} | see {latest.name}")
-                    except Exception:
-                        pass
-        except Exception as e:
-            messagebox.showerror("Diagnose error", str(e))
-
-    def _pf_repair_candidate_artifacts(self):
-        """Run strict artifact repair dry-run, then optionally apply after confirmation."""
-        try:
-            import subprocess
-
-            cmd = [sys.executable, "scripts/repair_paper_forward_candidate_artifacts.py", "--dry-run"]
-            res = subprocess.run(
-                cmd,
-                cwd=str(Path(__file__).parent.parent),
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-            out = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
-            print("[PF-REPAIR-DRY-RUN]")
-            print(out)
-            if hasattr(self, "pf_status_var"):
-                self.pf_status_var.set("REPAIR DRY-RUN COMPLETE - see logs")
-            if res.returncode != 0:
-                messagebox.showerror("Repair dry-run failed", out[-3000:] or f"exit={res.returncode}")
-                return
-            apply_now = messagebox.askyesno(
-                "Repair Candidate Artifact Paths",
-                "Dry-run completed and was printed to logs.\n\nApply exact artifact path repairs now?",
-            )
-            if not apply_now:
-                return
-            apply_res = subprocess.run(
-                [sys.executable, "scripts/repair_paper_forward_candidate_artifacts.py", "--apply"],
-                cwd=str(Path(__file__).parent.parent),
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-            apply_out = (apply_res.stdout or "") + ("\n" + apply_res.stderr if apply_res.stderr else "")
-            print("[PF-REPAIR-APPLY]")
-            print(apply_out)
-            if apply_res.returncode != 0:
-                messagebox.showerror("Repair apply failed", apply_out[-3000:] or f"exit={apply_res.returncode}")
-                return
-            messagebox.showinfo("Repair Candidate Artifact Paths", apply_out[-3000:] or "Repair applied.")
-            self._pf_reload_candidates()
-        except Exception as e:
-            messagebox.showerror("Repair error", str(e))
-
-    def _render_paper_forward_row(self, r: Dict[str, Any]) -> tuple:
-        """TASK4: render row strictly from (enhanced) runtime decision state."""
-        def _fmt_prob(value: Any) -> str:
-            try:
-                if value in (None, ""):
-                    return "-"
-                return f"{float(value):.4f}"
-            except Exception:
-                return "-"
-
-        def _fmt_count(value: Any) -> str:
-            try:
-                if value in (None, ""):
-                    return "-"
-                return str(int(value))
-            except Exception:
-                return "-"
-
-        def _fmt_allowed(value: Any) -> str:
-            if value is True:
-                return "Y"
-            if value is False:
-                return "N"
-            if value in (None, ""):
-                return "-"
-            return str(value)
-
-        conf = r.get("confidence")
-        predict_attempted = bool(r.get("predict_attempted", False))
-        raw_reason = str(r.get("raw_reason") or r.get("last_no_trade_reason", r.get("no_trade_reason", r.get("reason_code", ""))))
-        display_reason, _ = map_paper_forward_reason(raw_reason)
-        ru = raw_reason.upper()
-        conf_str = str(r.get("confidence_display") or "").strip()
-        if not conf_str:
-            conf_str = format_paper_forward_confidence(
-                conf,
-                predict_attempted=predict_attempted,
-                reason=raw_reason,
-                load_status=str(r.get("_load_status") or ""),
-            )
-        wr = r.get("win_rate", 0)
-        wr_str = f"{float(wr):.2%}" if isinstance(wr, (int,float)) else "0.00%"
-        if "ARTIFACT_IDENTITY_MISMATCH" in ru:
-            display_reason = "ARTIFACT_IDENTITY_MISMATCH"
-        elif "FEATURE_ORDER_MISSING" in ru:
-            display_reason = "FEATURE_ORDER_MISSING"
-        elif "FEATURES_MISSING" in ru or "MISSING_FEATURES" in ru:
-            display_reason = "FEATURES_MISSING"
-        elif "MODEL_FILE" in ru or "missing_model_file" in ru:
-            display_reason = "MODEL_FILE_MISSING"
-        elif "PREDICT_ERROR" in ru or "model_route_exception" in ru.lower():
-            display_reason = "PREDICT_ERROR"
-        elif "WAITING_FOR_MSTOCK_EXCHANGE" in ru:
-            display_reason = "WAITING_FOR_MSTOCK_EXCHANGE"
-        elif "WAITING_FOR_MSTOCK_EXPIRY" in ru:
-            display_reason = "WAITING_FOR_MSTOCK_EXPIRY"
-        elif "READY_FOR_PREDICTION" in ru or (not raw_reason and r.get("final_signal") not in (None, "NO_TRADE")):
-            display_reason = "READY_FOR_PREDICTION"
-        pos = r.get("position_status", "FLAT")
-        sel_strike = r.get("selected_strike")
-        sel_type = r.get("selected_option_type") or ""
-        sel_symbol = r.get("selected_symbol") or ""
-        entry_px = r.get("entry_price")
-        cur_opt = r.get("option_current_price") or r.get("current_price")
-        spot_px = r.get("spot_price")
-        is_synth_row = bool(r.get("synthetic_mode"))
-        if is_synth_row:
-            wr_str = f"{wr_str}*" if wr_str else "0.00%*"
-        max_dd = r.get("max_drawdown", 0)
-        try:
-            max_dd_str = str(round(float(max_dd or 0), 2))
-        except Exception:
-            max_dd_str = "0.0"
-        row_key = self._pf_row_cache_key(r)
-        state_dict = getattr(self, "__dict__", {})
-        lifecycle = (
-            (state_dict.get("_pf_lifecycle_by_row_key", {}) or {}).get(row_key)
-            or (state_dict.get("_pf_lifecycle_by_candidate", {}) or {}).get(str(r.get("candidate_id") or ""))
-        )
-        missing_req = ""
-        if lifecycle is not None:
-            missing_req = "; ".join(lifecycle.missing_requirements[:3])
-        enabled_display = "Y" if _flag_is_true(r.get("enabled"), default=False) else "N"
-        values_by_col = {
-            "enabled": enabled_display,
-            "candidate_id": r.get("candidate_id", ""),
-            "model": r.get("model_name", ""),
-            "preset": r.get("preset_family", r.get("selected_preset", "")),
-            "side": r.get("side_policy", ""),
-            "stage": lifecycle.current_stage if lifecycle is not None else r.get("lifecycle_stage", "-"),
-            "next_step": lifecycle.next_stage if lifecycle is not None else "-",
-            "can_advance": "Y" if (lifecycle.can_advance if lifecycle is not None else r.get("lifecycle_can_advance")) else "N",
-            "block_reason": (lifecycle.block_reason if lifecycle is not None else r.get("lifecycle_block_reason", "")) or "-",
-            "missing_requirements": missing_req or "-",
-            "artifact_status": lifecycle.artifact_status if lifecycle is not None else "-",
-            "data_status": lifecycle.data_status if lifecycle is not None else "-",
-            "confidence_health": lifecycle.confidence_health if lifecycle is not None else "-",
-            "trades_days": f"{lifecycle.trades}/{lifecycle.days}" if lifecycle is not None else f"{int(r.get('total_trades', r.get('trades', 0)) or 0)}/-",
-            "final_signal": r.get("final_signal", r.get("last_signal", "NO_TRADE")),
-            "conf": conf_str,
-            "ensemble_prob": _fmt_prob(r.get("ensemble_prob")),
-            "xgb_prob": _fmt_prob(r.get("xgb_prob")),
-            "rf_prob": _fmt_prob(r.get("rf_prob")),
-            "model_disagreement": _fmt_prob(r.get("model_disagreement")),
-            "allowed": _fmt_allowed(r.get("allowed")),
-            "model_type": str(r.get("model_type") or "-"),
-            "feature_missing_count": _fmt_count(r.get("feature_missing_count")),
-            "feature_invalid_count": _fmt_count(r.get("feature_invalid_count")),
-            "pred_block_reason": str(r.get("block_reason") or "-"),
-            "paper_action": str(r.get("paper_action") or r.get("simulated_action") or "-"),
-            "trade_reason": str(r.get("trade_reason") or display_reason or "-"),
-            "pos": pos,
-            "sel_strike": f"{float(sel_strike):.0f}" if sel_strike not in (None, "", 0) else "-",
-            "sel_type": sel_type if sel_type else "-",
-            "sel_symbol": sel_symbol if sel_symbol else "-",
-            "entries": int(r.get("total_entries", 0) or 0),
-            "exits": int(r.get("total_exits", 0) or 0),
-            "entry_px": f"{float(entry_px):.2f}" if entry_px not in (None, "", 0) else "-",
-            "cur_opt_px": f"{float(cur_opt):.2f}" if cur_opt not in (None, "", 0) else "-",
-            "qty": int(r.get("qty", r.get("position_qty", 65)) or 65),
-            "spot": f"{float(spot_px):.2f}" if spot_px not in (None, "", 0) else "-",
-            "unreal_pnl": f"{float(r.get('unrealized_pnl', r.get('unreal_pnl',0)) or 0):.2f}",
-            "real_pnl": f"{float(r.get('realized_pnl', r.get('real_pnl',0)) or 0):.2f}",
-            "mark_source": r.get("mark_source") or r.get("pnl_source", ""),
-            "cost_quality": str(r.get("cost_quality") or "APPROX"),
-            "last_mark_time": str(r.get("last_mark_time") or "")[:19],
-            "trades": int(r.get("total_trades", r.get("trades", 0)) or 0),
-            "wr": wr_str,
-            "sim_wr": wr_str,
-            "max_dd": max_dd_str,
-            "last_reason": display_reason,
-            "updated": r.get("last_update", r.get("last_eval_ts", "")),
-        }
-        cols = None
-        try:
-            tree = getattr(self, "pf_tree", None)
-            if tree is not None:
-                cols = tuple(tree["columns"])
-        except Exception:
-            cols = None
-        if not cols:
-            cols = (
-                "enabled", "candidate_id", "model", "preset", "side", "final_signal",
-                "conf", "paper_action", "trade_reason", "pos", "sel_strike", "sel_type", "sel_symbol", "entries",
-                "exits", "entry_px", "cur_opt_px", "spot", "unreal_pnl", "real_pnl",
-                "trades", "wr", "max_dd", "last_reason", "updated",
-            )
-        return tuple(values_by_col.get(c, "") for c in cols)
-
-    def _pf_row_cache_key(self, row_or_dec: Dict[str, Any]) -> str:
-        explicit = row_or_dec.get("_row_key") or row_or_dec.get("row_key")
-        if explicit:
-            return str(explicit)
-        cid = str(row_or_dec.get("candidate_id") or "")
-        if not cid:
-            return ""
-        artifact_base = Path(str(row_or_dec.get("artifact_dir") or "")).name
-        threshold = row_or_dec.get("threshold")
-        if threshold in (None, ""):
-            threshold = row_or_dec.get("selected_threshold") or row_or_dec.get("entry_threshold") or ""
-        if not artifact_base and threshold in (None, ""):
-            return cid
-        return f"{cid}|{artifact_base}|{threshold}"
-
-    def _pf_remember_decisions(self, decisions: List[Dict[str, Any]] | None) -> None:
-        if not decisions:
-            return
-        state = getattr(self, "__dict__", {})
-        cache = state.get("_pf_latest_decisions_by_row_key")
-        if cache is None:
-            cache = {}
-            self._pf_latest_decisions_by_row_key = cache
-        for dec in decisions:
-            if not isinstance(dec, dict):
-                continue
-            cid = str(dec.get("candidate_id") or "")
-            if not cid:
-                continue
-            row_key = self._pf_row_cache_key(dec)
-            if not row_key:
-                continue
-            ts = dec.get("timestamp") or dec.get("last_update") or datetime.now(timezone.utc).isoformat()
-            cache[row_key] = {
-                "candidate_id": cid,
-                "_row_key": row_key,
-                "final_signal": dec.get("final_signal", dec.get("side_decision", "NO_TRADE")),
-                "confidence": dec.get("confidence", dec.get("probability")),
-                "threshold": dec.get("threshold", dec.get("effective_threshold")),
-                "last_no_trade_reason": dec.get("no_trade_reason") or dec.get("reason_code") or dec.get("block_reason") or "",
-                "last_update": ts,
-                "_cached_at": ts,
-                "predict_attempted": bool(dec.get("predict_attempted")),
-                "unrealized_pnl": dec.get("unrealized_pnl", dec.get("unreal_pnl")),
-                "realized_pnl": dec.get("realized_pnl", dec.get("real_pnl")),
-                "total_trades": dec.get("total_trades", dec.get("trades")),
-                "total_entries": dec.get("total_entries"),
-                "total_exits": dec.get("total_exits"),
-                "win_rate": dec.get("win_rate"),
-                "position_status": dec.get("position_status"),
-                "entry_price": dec.get("entry_price", dec.get("sim_entry_price")),
-                "current_price": dec.get("current_price", dec.get("option_current_price", dec.get("sim_exit_price"))),
-                "option_current_price": dec.get("option_current_price", dec.get("current_price", dec.get("sim_exit_price"))),
-                "qty": dec.get("qty", dec.get("position_qty")),
-                "position_qty": dec.get("position_qty", dec.get("qty")),
-                "lot_size": dec.get("lot_size"),
-                "lots": dec.get("lots"),
-                "direction": dec.get("direction", "BUY"),
-                "price_diff": dec.get("price_diff"),
-                "pnl_formula": dec.get("pnl_formula"),
-                "mark_source": dec.get("mark_source", dec.get("pnl_source")),
-                "last_mark_time": dec.get("last_mark_time"),
-                "spot_price": dec.get("spot_price"),
-                "selected_strike": dec.get("selected_strike") or dec.get("entry_strike"),
-                "selected_option_type": dec.get("selected_option_type") or dec.get("sim_side"),
-                "selected_symbol": dec.get("selected_symbol") or dec.get("entry_symbol"),
-                "ensemble_prob": dec.get("ensemble_prob"),
-                "xgb_prob": dec.get("xgb_prob"),
-                "rf_prob": dec.get("rf_prob"),
-                "model_disagreement": dec.get("model_disagreement"),
-                "block_reason": dec.get("block_reason"),
-                "allowed": dec.get("allowed"),
-                "model_type": dec.get("model_type"),
-                "feature_missing_count": dec.get("feature_missing_count"),
-                "feature_invalid_count": dec.get("feature_invalid_count"),
-            }
-        print(f"[PF-DECISION-CACHE] updated={len(decisions)} cached={len(cache)} keys=row_key")
-
-    def _pf_parse_update_ts(self, value: Any) -> float:
-        if value in (None, ""):
-            return 0.0
-        if isinstance(value, (int, float)):
-            return float(value)
-        try:
-            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-        except Exception:
-            return 0.0
-
-    def _pf_merge_cached_decisions_into_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        cache = getattr(self, "__dict__", {}).get("_pf_latest_decisions_by_row_key", {}) or {}
-        if not cache:
-            return rows
-        out = []
-        seen = set()
-        for row in rows or []:
-            merged = dict(row)
-            row_key = self._pf_row_cache_key(merged)
-            cached = cache.get(row_key)
-            if cached:
-                row_ts = self._pf_parse_update_ts(merged.get("last_update") or merged.get("last_eval_ts"))
-                cached_ts = self._pf_parse_update_ts(cached.get("last_update") or cached.get("_cached_at"))
-                row_has_live_attrs = any(
-                    merged.get(k) not in (None, "", 0, 0.0, "NO_TRADE")
-                    for k in ("last_no_trade_reason", "confidence", "unrealized_pnl", "realized_pnl", "total_trades", "total_entries", "total_exits", "position_status", "entry_price", "current_price", "option_current_price", "spot_price", "selected_strike", "selected_option_type", "selected_symbol")
-                )
-                if not row_ts or (cached_ts > row_ts and not row_has_live_attrs):
-                    for key, val in cached.items():
-                        if key.startswith("_"):
-                            continue
-                        live_row_keys = {
-                            "position_status",
-                            "entry_price",
-                            "current_price",
-                            "option_current_price",
-                            "spot_price",
-                            "unrealized_pnl",
-                            "realized_pnl",
-                            "total_trades",
-                            "total_entries",
-                            "total_exits",
-                            "win_rate",
-                            "selected_strike",
-                            "selected_option_type",
-                            "selected_symbol",
-                        }
-                        if key in live_row_keys and merged.get(key) not in (None, ""):
-                            continue
-                        if key in ("selected_strike", "selected_option_type", "selected_symbol"):
-                            merged[key] = val
-                        elif val not in (None, ""):
-                            merged[key] = val
-                seen.add(row_key)
-            out.append(merged)
-        for row_key, cached in cache.items():
-            if row_key not in seen:
-                out.append(dict(cached))
-        return out
-
-    def _pf_find_option_chain_row_for_status_row(
-        self,
-        status_row: Dict[str, Any],
-        chain_rows: List[Dict[str, Any]],
-    ) -> Dict[str, Any] | None:
-        wanted_symbol = str(
-            status_row.get("selected_symbol")
-            or status_row.get("entry_symbol")
-            or ""
-        ).strip().upper()
-        wanted_side = str(
-            status_row.get("selected_option_type")
-            or status_row.get("entry_option_type")
-            or status_row.get("sim_side")
-            or ""
-        ).strip().upper()
-        wanted_strike = _to_float_or_none(status_row.get("selected_strike") or status_row.get("entry_strike"))
-
-        if wanted_symbol:
-            for row in chain_rows or []:
-                if not isinstance(row, dict):
-                    continue
-                row_symbol = str(
-                    row.get("trading_symbol")
-                    or row.get("tradingsymbol")
-                    or row.get("symbol")
-                    or row.get("tsym")
-                    or ""
-                ).strip().upper()
-                if row_symbol and row_symbol == wanted_symbol:
-                    return row
-
-        if wanted_side not in {"CE", "PE"} or wanted_strike is None:
-            return None
-        for row in chain_rows or []:
-            if not isinstance(row, dict):
-                continue
-            row_side = str(row.get("option_type") or row.get("type") or row.get("right") or "").strip().upper()
-            if row_side in {"CALL", "C"}:
-                row_side = "CE"
-            elif row_side in {"PUT", "P"}:
-                row_side = "PE"
-            row_strike = _to_float_or_none(row.get("strike") or row.get("strike_price") or row.get("strikePrice"))
-            if row_side == wanted_side and row_strike is not None and abs(float(row_strike) - float(wanted_strike)) <= 0.01:
-                return row
-        return None
-
-    def _pf_live_option_ltp_for_status_row(
-        self,
-        status_row: Dict[str, Any],
-        chain_rows: List[Dict[str, Any]],
-        mark_cache: Dict[tuple[str, str, str], float | None],
-    ) -> float | None:
-        client = self._pf_dict_get("_client")
-        if client is None:
-            return None
-        pos = str(status_row.get("position_status") or "").strip().upper()
-        if not (pos.startswith("OPEN") or pos.startswith("LONG") or bool(status_row.get("open_position"))):
-            return None
-
-        chain_row = self._pf_find_option_chain_row_for_status_row(status_row, chain_rows) or {}
-        symbol = str(
-            status_row.get("selected_symbol")
-            or status_row.get("entry_symbol")
-            or chain_row.get("trading_symbol")
-            or chain_row.get("tradingsymbol")
-            or chain_row.get("symbol")
-            or chain_row.get("tsym")
-            or ""
-        ).strip()
-        token = str(
-            status_row.get("token")
-            or status_row.get("symbolToken")
-            or status_row.get("security_id")
-            or chain_row.get("token")
-            or chain_row.get("symbolToken")
-            or chain_row.get("symboltoken")
-            or chain_row.get("instrumentToken")
-            or chain_row.get("instrumenttoken")
-            or chain_row.get("instrument_token")
-            or chain_row.get("security_id")
-            or chain_row.get("securityId")
-            or chain_row.get("scripToken")
-            or ""
-        ).strip()
-        exchange = str(
-            status_row.get("exchange")
-            or chain_row.get("exchange")
-            or chain_row.get("exch_seg")
-            or "NFO"
-        ).strip().upper() or "NFO"
-        opt_type = str(
-            status_row.get("selected_option_type")
-            or status_row.get("entry_option_type")
-            or status_row.get("sim_side")
-            or chain_row.get("option_type")
-            or chain_row.get("type")
-            or ""
-        ).strip().upper()
-        if opt_type in {"CALL", "C"}:
-            opt_type = "CE"
-        elif opt_type in {"PUT", "P"}:
-            opt_type = "PE"
-
-        if not symbol and not token:
-            return None
-        cache_key = (exchange, token, symbol)
-        if cache_key in mark_cache:
-            return mark_cache[cache_key]
-
-        live_ltp = None
-        try:
-            live_ltp = self._try_get_live_ltp_for_leg(
-                client,
-                {
-                    "symbol": symbol,
-                    "token": token,
-                    "exchange": exchange,
-                    "option_type": opt_type,
-                },
-            )
-        except Exception:
-            live_ltp = None
-        if live_ltp is not None and float(live_ltp) > 0:
-            mark_cache[cache_key] = float(live_ltp)
-        else:
-            mark_cache[cache_key] = None
-        return mark_cache[cache_key]
-
-    def _pf_apply_live_option_marks_to_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not rows or self._pf_dict_get("_client") is None:
-            return rows
-        try:
-            chain_rows, _chain_source = self._get_cached_option_chain_rows()
-        except Exception:
-            chain_rows = []
-        out: List[Dict[str, Any]] = []
-        mark_cache: Dict[tuple[str, str, str], float | None] = {}
-        for row in rows or []:
-            if not isinstance(row, dict):
-                out.append(row)
-                continue
-            enriched = dict(row)
-            live_ltp = self._pf_live_option_ltp_for_status_row(enriched, chain_rows, mark_cache)
-            if live_ltp is not None and float(live_ltp) > 0:
-                entry_px = enriched.get("entry_price")
-                qty = enriched.get("qty") or enriched.get("position_qty") or 65
-                unreal = enriched.get("unrealized_pnl", 0.0)
-                price_diff = enriched.get("price_diff", 0.0)
-                try:
-                    if entry_px not in (None, "", 0, 0.0):
-                        price_diff = float(live_ltp) - float(entry_px)
-                        unreal = _compute_option_pnl(entry_px, float(live_ltp), qty, side=enriched.get("direction") or "BUY")
-                except Exception:
-                    unreal = enriched.get("unrealized_pnl", 0.0)
-                enriched["current_price"] = float(live_ltp)
-                enriched["option_current_price"] = float(live_ltp)
-                enriched["unrealized_pnl"] = unreal
-                enriched["price_diff"] = price_diff
-                enriched["pnl_formula"] = "(current_option_price - entry_price) * qty"
-                enriched["pnl_source"] = "UI_BROKER_LIVE_LTP"
-                cid = str(enriched.get("candidate_id") or "")
-                try:
-                    eng = getattr(self, "pf_engine", None)
-                    st = getattr(eng, "_state", {}).get(cid) if eng is not None else None
-                    if isinstance(st, dict):
-                        st["current_price"] = float(live_ltp)
-                        st["option_current_price"] = float(live_ltp)
-                        st["unrealized_pnl"] = unreal
-                        st["price_diff"] = price_diff
-                        st["pnl_formula"] = "(current_option_price - entry_price) * qty"
-                        st["pnl_source"] = "UI_BROKER_LIVE_LTP"
-                    cs = getattr(eng, "_candidate_states", {}).get(cid) if eng is not None else None
-                    if cs is not None:
-                        cs.current_price = float(live_ltp)
-                        cs.unreal_pnl = unreal
-                        cs.pnl_source = "UI_BROKER_LIVE_LTP"
-                except Exception:
-                    pass
-            out.append(enriched)
-        return out
-
-    def _pf_config_baseline_rows(self) -> List[Dict[str, Any]]:
-        state = getattr(self, "__dict__", {})
-        rows = list(state.get("_pf_config_candidate_rows") or [])
-        if rows:
-            return rows
-        rows = list(state.get("pf_candidates") or [])
-        if rows:
-            return rows
-        rows = list((state.get("_paper_forward_state") or {}).get("rows") or [])
-        if rows:
-            return rows
-        return list((state.get("_pf_last_gui_rows_by_candidate") or {}).values())
-
-    def _pf_merge_runtime_rows_with_baseline(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        baseline = [dict(r) for r in ScalperUI._pf_config_baseline_rows(self) if isinstance(r, dict)]
-        runtime_rows = [dict(r) for r in (rows or []) if isinstance(r, dict)]
-        if not baseline:
-            return runtime_rows
-        if not runtime_rows:
-            return baseline
-
-        out_by_key = {self._pf_row_cache_key(r) or str(r.get("candidate_id") or ""): dict(r) for r in baseline}
-        order = list(out_by_key)
-        for row in runtime_rows:
-            key = self._pf_row_cache_key(row) or str(row.get("candidate_id") or "")
-            if not key:
-                continue
-            merged = dict(out_by_key.get(key, {}))
-            for field, value in row.items():
-                if value not in (None, ""):
-                    merged[field] = value
-            if key not in out_by_key:
-                order.append(key)
-            out_by_key[key] = merged
-        return [out_by_key[key] for key in order if key in out_by_key]
-
-    def _pf_refresh_table(self, rows: List[Dict[str, Any]], *, allow_full_clear: bool = False):
-        if threading.current_thread() is not threading.main_thread():
-            payload = list(rows or [])
-            self.ui_call(self._pf_refresh_table, payload, allow_full_clear=allow_full_clear)
-            return
-        if self._gui_is_closing() or not self._gui_widget_alive(getattr(self, "pf_tree", None)):
-            return
-        t0 = time.time()
-        tree = self.pf_tree
-        try:
-            selected = tuple(tree.selection())
-        except Exception:
-            selected = ()
-        try:
-            yview = tree.yview()
-        except Exception:
-            yview = (0.0, 1.0)
-        baseline_rows = ScalperUI._pf_config_baseline_rows(self)
-        if not rows and not allow_full_clear and baseline_rows:
-            rows = baseline_rows
-        else:
-            rows = ScalperUI._pf_merge_runtime_rows_with_baseline(self, list(rows or []))
-        rows = self._pf_sort_rows_stable(list(rows or []))
-        lifecycle_filter_ready = False
-        try:
-            state_dict = getattr(self, "__dict__", {})
-            lifecycle_filter_ready = bool(state_dict.get("_pf_lifecycle_by_candidate", {}) or state_dict.get("_pf_lifecycle_by_row_key", {}))
-            rows = self._pf_lifecycle_filter_rows(rows)
-        except Exception as exc:
-            print(f"[PF-LIFECYCLE] filter skipped: {exc}")
-        wanted: set[str] = set()
-        inserted = updated = removed = changed_cells = 0
-        iid_map = self._pf_dict_get("_pf_tree_iids", {}) or {}
-        last_display = self._pf_dict_get("_pf_last_display_values", {}) or {}
-        for r in rows:
-            runtime_id = self._pf_runtime_id(r)
-            cid = str(r.get("candidate_id") or "")
-            if not runtime_id or not cid:
-                continue
-            wanted.add(runtime_id)
-            stable_row = self._pf_stabilize_row_data(runtime_id, r)
-            vals = self._render_paper_forward_row(stable_row)
-            row_key = self._pf_row_cache_key(r)
-            state_dict = getattr(self, "__dict__", {})
-            st = (state_dict.get("_pf_lifecycle_by_row_key", {}) or {}).get(row_key) or (state_dict.get("_pf_lifecycle_by_candidate", {}) or {}).get(cid)
-            tag = lifecycle_row_tag(st) if st is not None else ""
-            iid = iid_map.get(runtime_id) or runtime_id
-            old_vals = tuple(tree.item(iid).get("values") or ()) if tree.exists(iid) else last_display.get(runtime_id, ())
-            vals = self._pf_coalesce_display_values(runtime_id, old_vals, vals)
-            if tree.exists(iid):
-                if old_vals != vals:
-                    tree.item(iid, values=vals)
-                    updated += 1
-                    for idx, (ov, nv) in enumerate(zip(old_vals, vals)):
-                        if ov != nv:
-                            changed_cells += 1
-                if tag:
-                    tree.item(iid, tags=(tag,))
-                iid_map[runtime_id] = iid
-            else:
-                insert_at = len(tree.get_children())
-                order = list(self._pf_dict_get("_pf_candidate_order", []) or [])
-                if runtime_id in order:
-                    insert_at = order.index(runtime_id)
-                tree.insert("", insert_at, iid=iid, values=vals, tags=(tag,) if tag else ())
-                iid_map[runtime_id] = iid
-                inserted += 1
-            last_display[runtime_id] = tuple(vals)
-        stale = [iid for iid in list(tree.get_children()) if iid not in wanted]
-        state_dict = getattr(self, "__dict__", {})
-        filter_var = state_dict.get("pf_lifecycle_filter_var")
-        try:
-            view_key = str(filter_var.get() if filter_var is not None else "").strip().lower()
-        except Exception:
-            view_key = ""
-        preserve_pf_baseline = (
-            bool(ScalperUI._pf_config_baseline_rows(self))
-            and view_key in {"paper", "paper forward eligible", "show paper forward eligible", "qualified", "show qualified only"}
-            and not allow_full_clear
-        )
-        if preserve_pf_baseline:
-            baseline_ids = {
-                self._pf_runtime_id(r)
-                for r in ScalperUI._pf_config_baseline_rows(self)
-                if isinstance(r, dict) and self._pf_runtime_id(r)
-            }
-            stale = [iid for iid in stale if iid not in baseline_ids]
-        if stale and (allow_full_clear or len(wanted) > 0 or lifecycle_filter_ready):
-            for iid in stale:
-                try:
-                    tree.delete(iid)
-                    removed += 1
-                except Exception:
-                    pass
-            for runtime_id, mapped in list(iid_map.items()):
-                if mapped in stale or runtime_id not in wanted:
-                    iid_map.pop(runtime_id, None)
-                    last_display.pop(runtime_id, None)
-        self._pf_tree_iids = iid_map
-        self._pf_last_display_values = last_display
-        if selected and hasattr(tree, "selection_set"):
-            keep = tuple(s for s in selected if tree.exists(s))
-            if keep:
-                try:
-                    tree.selection_set(keep)
-                except Exception:
-                    pass
-        if hasattr(tree, "yview_moveto"):
-            try:
-                if yview and yview[0] is not None:
-                    tree.yview_moveto(yview[0])
-            except Exception:
-                pass
-        duration_ms = int((time.time() - t0) * 1000)
-        log_gui_perf(
-            tree_update_ms=duration_ms,
-            inserted=inserted,
-            updated=updated,
-            removed=removed,
-            changed_cells=changed_cells,
-            rows=len(rows),
-        )
-
-    def _pf_apply_canonical_ui_update(self, *, source: str = "", generation: int | None = None) -> None:
-        """Single canonical Paper Forward UI updater (main thread only)."""
-        if generation is not None and generation != int(self._pf_dict_get("_pf_loop_generation", 0) or 0):
-            print(f"[PF-LOOP] stale_ui_update_ignored source={source or 'unknown'} generation={generation}")
-            return
-        if self._gui_is_closing() or not self._gui_widget_alive(getattr(self, "pf_tree", None)):
-            return
-        try:
-            engine = self._pf_dict_get("pf_engine")
-            if not engine:
-                rows = list((getattr(self, "_paper_forward_state", {}) or {}).get("candidates") or [])
-                if not rows:
-                    rows = list(getattr(self, "_pf_last_gui_rows_by_candidate", {}).values())
-                if not rows:
-                    rows = list(getattr(self, "pf_candidates", []) or [])
-                if rows:
-                    self._pf_refresh_table(rows)
-                    pf_live_var = self._pf_dict_get("pf_live_var")
-                    if pf_live_var is not None:
-                        active = sum(1 for r in rows if str(r.get("position_status", "")).upper().startswith("OPEN"))
-                        pf_live_var.set(
-                            f"Live orders: FALSE | Broker orders: FALSE | Candidates: {len(rows)} | "
-                            f"Active pos: {active} | Entries: 0 | Completed trades: 0 | UI source={source or 'config'}"
-                        )
-                return
-            lock = getattr(self, "_pf_state_lock", None) or threading.RLock()
-            with lock:
-                state_rows = list((getattr(self, "_paper_forward_state", {}) or {}).get("candidates") or [])
-            try:
-                engine_candidates = list(getattr(engine, "candidates", []) or [])
-                if engine_candidates:
-                    self.pf_candidates = engine_candidates
-                if not self._pf_candidate_order:
-                    self._pf_candidate_order = [self._pf_row_cache_key(c) for c in self.pf_candidates]
-            except Exception:
-                pass
-            rows = list(state_rows)
-            if not rows:
-                try:
-                    rows = list(engine.get_status_table())
-                except Exception:
-                    rows = []
-            rows = ScalperUI._pf_merge_runtime_rows_with_baseline(self, rows)
-            rows = self._pf_merge_cached_decisions_into_rows(rows)
-            try:
-                rows = self._pf_apply_live_option_marks_to_rows(rows)
-            except Exception as mark_exc:
-                print(f"[PF-MONITOR] live marks skipped: {mark_exc}")
-            pf_log("DEBUG", f"[PAPER-FWD-UI] update_start rows={len(rows)} source={source or 'unknown'}", rate_key="pf_ui_update_start", rate_interval=10.0)
-            self._pf_last_gui_rows_by_candidate = {
-                self._pf_row_cache_key(r): dict(r) for r in rows if isinstance(r, dict)
-            }
-            self._pf_refresh_table(rows)
-            active = sum(1 for r in rows if str(r.get("position_status", "")).upper().startswith("OPEN"))
-            total_entries = sum(int(r.get("total_entries") or 0) for r in rows)
-            diag = {}
-            try:
-                diag = engine.get_diagnostics() or {}
-            except Exception:
-                diag = {}
-            extra = f" snaps={diag.get('snapshots_received',0)} evals={diag.get('evaluations_count',0)} errs={diag.get('route_errors',0)}"
-            tick = datetime.now().strftime("%H:%M:%S")
-            self._pf_last_gui_refresh_local = tick
-            pf_live_var = self._pf_dict_get("pf_live_var")
-            if pf_live_var is not None:
-                pf_live_var.set(
-                    f"Live orders: FALSE | Broker orders: FALSE | Candidates: {len(rows)} | "
-                    f"Active pos: {active} | Entries: {total_entries} | Completed trades: "
-                    f"{sum(int(r.get('total_trades') or 0) for r in rows)}{extra} | UI tick={tick}"
-                )
-            readiness = diag.get("readiness_summary") if isinstance(diag, dict) else {}
-            pf_readiness_var = self._pf_dict_get("pf_readiness_var")
-            if pf_readiness_var is not None and isinstance(readiness, dict) and readiness:
-                pf_readiness_var.set(
-                    f"Readiness: predictable={readiness.get('candidates_predictable', 0)}/"
-                    f"{readiness.get('candidates_total', 0)} "
-                    f"blocked_feat={readiness.get('candidates_blocked_feature', 0)} "
-                    f"blocked_dep={readiness.get('candidates_blocked_dependency', 0)} "
-                    f"low_conf={readiness.get('candidates_low_confidence', 0)} "
-                    f"signal={readiness.get('candidates_signal', 0)} "
-                    f"cost_real={readiness.get('cost_real', 0)} cost_approx={readiness.get('cost_approx', 0)} "
-                    f"ltp_ok={readiness.get('ltp_broker_ok', 0)} ltp_fb={readiness.get('ltp_fallback', 0)} "
-                    f"data={readiness.get('data_quality') or '-'}"
-                )
-            ds = diag.get("data_status", {}) if isinstance(diag, dict) else {}
-            status_obj = None
-            if ds:
-                status_obj = PaperForwardDataStatus(
-                    broker_name=ds.get("broker_name") or "unknown",
-                    broker_auth=ds.get("broker_auth") or ds.get("auth_status") or "UNKNOWN",
-                    auth_error=ds.get("auth_error") or "",
-                    candle_source=ds.get("candle_source") or "none",
-                    candle_count=int(ds.get("candle_count") or 0),
-                    spot=ds.get("spot"),
-                    option_rows=int(ds.get("option_chain_rows") or ds.get("option_rows") or 0),
-                    option_chain_status=ds.get("option_chain_status") or "",
-                    option_chain_expiry=ds.get("option_chain_expiry"),
-                    option_chain_error=ds.get("option_chain_error") or "",
-                    option_chain_source=ds.get("option_chain_source") or "",
-                    option_chain_age_sec=ds.get("option_chain_age_sec"),
-                    latest_tick=ds.get("last_tick_ts") or ds.get("latest_tick"),
-                    last_snapshot_ts=ds.get("last_snapshot_ts"),
-                    data_quality_status=ds.get("data_quality_status") or "",
-                )
-                self._pf_apply_data_status_to_ui(status_obj)
-            self._pf_update_paper_forward_state(rows=rows, source=source, data_status=status_obj)
-            sample = {}
-            if rows:
-                sample = {
-                    k: rows[0].get(k)
-                    for k in ("candidate_id", "final_signal", "confidence", "unrealized_pnl", "realized_pnl", "total_trades", "last_no_trade_reason", "last_update")
-                }
-            self._pf_last_gui_update_ts = datetime.now(timezone.utc).isoformat()
-            self._pf_last_ui_update_ts = time.time()
-            self._pf_last_gui_row_count = len(rows)
-            self._pf_last_gui_sample = sample
-            self._last_pf_update_ts = datetime.now().strftime("%H:%M:%S")
-            log_gui_perf(source=source or "unknown", ui_queue=self._ui_queue.qsize(), rows=len(rows))
-        except Exception as e:
-            print("[PF-MONITOR] gui refresh err", e)
-
-    def _pf_refresh_monitor_ui(self, rows: List[Dict[str, Any]] | None = None, *, source: str = "", generation: int | None = None) -> None:
-        """Queue canonical Paper Forward state then request a debounced UI apply."""
-        if rows is not None:
-            self._pf_update_paper_forward_state(rows=list(rows), source=source)
-        else:
-            self._pf_queue_state_update(source=source, generation=generation)
-            return
-        self._pf_request_ui_update(source=source, generation=generation)
-
-    def _pf_show_candidate_reason_detail(self, event=None) -> None:
-        try:
-            selection = self.pf_tree.selection()
-            if not selection:
-                row_id = self.pf_tree.identify_row(getattr(event, "y", 0)) if event is not None else ""
-                selection = (row_id,) if row_id else ()
-            if not selection:
-                return
-            iid = str(selection[0])
-            values = []
-            try:
-                values = list(self.pf_tree.item(iid).get("values") or [])
-            except Exception:
-                values = []
-            cid = str(values[1] if len(values) > 1 else iid)
-            rows = getattr(self, "_pf_last_gui_rows_by_candidate", {}) or {}
-            row = dict(rows.get(iid) or rows.get(cid) or {})
-            if not row:
-                row = next(
-                    (
-                        dict(item)
-                        for item in rows.values()
-                        if str((item or {}).get("candidate_id") or "") == cid
-                    ),
-                    {},
-                )
-            candidate = None
-            for cand in list(getattr(self, "pf_candidates", []) or []) + list(getattr(getattr(self, "pf_engine", None), "candidates", []) or []):
-                if str(cand.get("candidate_id") or "") == cid:
-                    candidate = cand
-                    break
-            candidate = candidate or {}
-            raw_reason = str(row.get("raw_reason") or row.get("last_no_trade_reason") or "")
-            display_reason, _ = map_paper_forward_reason(raw_reason)
-            artifact_dir = candidate.get("artifact_dir") or row.get("artifact_dir")
-            artifact_base = Path(str(artifact_dir)).name if artifact_dir else None
-            text = (
-                f"candidate_id={cid}\n"
-                f"display_reason={display_reason}\n"
-                f"raw_reason={raw_reason or '-'}\n"
-                f"final_signal={row.get('final_signal', '-')}\n"
-                f"confidence={row.get('confidence', '-')}\n"
-                f"ensemble_prob={row.get('ensemble_prob', '-')}\n"
-                f"xgb_prob={row.get('xgb_prob', '-')}\n"
-                f"rf_prob={row.get('rf_prob', '-')}\n"
-                f"model_disagreement={row.get('model_disagreement', '-')}\n"
-                f"allowed={row.get('allowed', '-')}\n"
-                f"model_type={row.get('model_type', '-')}\n"
-                f"feature_missing_count={row.get('feature_missing_count', '-')}\n"
-                f"feature_invalid_count={row.get('feature_invalid_count', '-')}\n"
-                f"block_reason={row.get('block_reason', '-')}\n"
-                f"entries={row.get('total_entries', 0)} exits={row.get('total_exits', 0)} "
-                f"completed_trades={row.get('total_trades', 0)}\n"
-                f"entry_price={row.get('entry_price', '-')} current_price={row.get('current_price', '-')}\n"
-                f"unreal_pnl={row.get('unrealized_pnl', 0)} pnl_source={row.get('pnl_source', '-')}\n"
-                f"open_since={row.get('open_since', '-')}\n"
-                f"artifact_dir_basename={artifact_base or '-'}\n"
-                f"threshold={candidate.get('threshold') or candidate.get('selected_threshold') or row.get('threshold') or '-'}"
-            )
-            messagebox.showinfo("Paper Forward Candidate Detail", text)
-            print("[PF-CANDIDATE-DETAIL] " + text.replace("\n", " | "))
-        except Exception as exc:
-            print("[PF-CANDIDATE-DETAIL] error", exc)
-
-    def _pf_start_multi(self):
-        if getattr(self, "_pf_starting", False):
-            print("[PAPER-FWD-UI] start_in_progress=true skip_start_duplicate=true")
-            try:
-                self.pf_status_var.set("STARTING_PAPER_FORWARD_MONITOR")
-            except Exception:
-                pass
-            return
-        self._pf_user_stopped = False
-        candidate_file = _paper_forward_candidate_config_label()
-        cfg_diag = diagnose_paper_forward_candidate_config(candidate_file)
-        self._pf_active_candidate_id = str(cfg_diag.get("active_candidate_id") or "")
-        self._pf_candidate_config_reason = str(cfg_diag.get("reason") or "")
-        if os.getenv("MSTOCK_ENABLE_LIVE_ORDERS", "false").lower() in ("1","true","yes"):
-            messagebox.showerror("Blocked", "MSTOCK_ENABLE_LIVE_ORDERS=true â€” refusing to start paper multi")
-            return
-        self._pf_starting = True
-        self.pf_status_var.set("LOADING_CANDIDATES + PRESETS + ARTIFACTS")
-        # TASK 7: logs + trigger chain fetch if needed + do not eval until chain
-        n_cand = int(cfg_diag.get("candidates", 0) or 0)
-        n_en = int(cfg_diag.get("enabled", 0) or 0)
-        c_count = 0
-        try:
-            dash_candles_var = self._pf_dict_get("_dash_candles_var")
-            c_count = int(str(dash_candles_var.get() if dash_candles_var is not None else "0") or "0")
-        except Exception:
-            c_count = len(self._pf_dict_get("_latest_candles") or [])
-        chain0 = self._pf_dict_get("_paper_forward_option_chain_rows") or self._pf_dict_get("_latest_option_chain_rows") or []
-        opt_rows0 = len(chain0) if chain0 else 0
-        broker0 = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        print(f"[PF-START] broker={broker0} candidates={n_cand} enabled={n_en} candles={c_count} option_rows={opt_rows0}")
-        if opt_rows0 == 0:
-            print(f"[PF-START] triggering_option_chain_fetch=true")
-        # Start background thread feeding real snapshots (PHASE 6)
-        if (
-            getattr(self, "_pf_monitor_running", False)
-            and self._pf_engine_thread
-            and self._pf_engine_thread.is_alive()
-            and not (self._pf_stop_event and self._pf_stop_event.is_set())
-        ):
-            print("[PAPER-FWD-UI] already_running=true skip_start_duplicate=true")
-            self._pf_request_ui_update(
-                source="start_duplicate",
-                generation=int(self._pf_dict_get("_pf_loop_generation", 0) or 0),
-            )
-            self._pf_starting = False
-            return
-        try:
-            self.pf_engine = PaperForwardEngine(
-                candidate_file=candidate_file,
-                artifacts_dir="artifacts/candidates",
-                log_dir="logs",
-                reports_dir="reports",
-                broker_safe_mode=True,
-            )
-            engine_candidates = list(getattr(self.pf_engine, "candidates", []) or [])
-            if engine_candidates:
-                self.pf_candidates = engine_candidates
-            elif getattr(self, "_pf_config_candidate_rows", None):
-                self.pf_candidates = list(self._pf_config_candidate_rows)
-            else:
-                self.pf_candidates = []
-            self._pf_candidate_order = [self._pf_row_cache_key(c) for c in self.pf_candidates]
-            try:
-                ids = [str(c.get("candidate_id") or "") for c in self.pf_candidates]
-                row_keys = [self._pf_row_cache_key(c) for c in self.pf_candidates]
-                dup_ids = sorted({x for x in ids if x and ids.count(x) > 1})
-                dup_rows = sorted({x for x in row_keys if x and row_keys.count(x) > 1})
-                artifact_ok = sum(
-                    1 for c in self.pf_candidates
-                    if str(c.get("_load_status") or "").upper() in ("", "OK", "LOAD_OK")
-                    or bool(((c.get("_resolve") or {}).get("model_file")))
-                )
-                unapproved_pe = [
-                    cid for cid in ids
-                    if ("PE" in cid.upper() and ("T35" in cid.upper() or "T40" in cid.upper()) and "CONSERVATIVE" in cid.upper())
-                ]
-                print(
-                    f"[PF-CANDIDATE-AUDIT] total={len(self.pf_candidates)} "
-                    f"enabled={sum(1 for c in self.pf_candidates if c.get('enabled', True))} "
-                    f"disabled={sum(1 for c in self.pf_candidates if not c.get('enabled', True))} "
-                    f"artifact_ok={artifact_ok} duplicate_candidate_ids={dup_ids} "
-                    f"duplicate_row_keys={dup_rows} unapproved_t35_t40_pe_conservative={unapproved_pe}"
-                )
-            except Exception as audit_exc:
-                print(f"[PF-CANDIDATE-AUDIT] error={audit_exc}")
-            self._pf_loop_generation = int(self._pf_dict_get("_pf_loop_generation", 0) or 0) + 1
-            generation = self._pf_loop_generation
-            self._pf_queue_state_update(self.pf_engine.get_status_table(), source="start_engine_init", generation=generation)
-            n = len(self.pf_candidates)
-            # approximate valid/invalid from load_status if present
-            valid = sum(1 for c in self.pf_candidates if c.get("enabled", True) and c.get("_load_status", "OK") not in ("FEATURE_ORDER_MISSING", "ARTIFACT_MISSING", "candidate_missing_artifact_paths"))
-            invalid = n - valid
-            print(f"[PF-GUI-UPDATE] rows={n} valid={valid} invalid={invalid}")
-            if not self._pf_active_candidate_id:
-                self.pf_status_var.set(str(self._pf_candidate_config_reason or "ROUTER_DISABLED_NO_ACTIVE_CANDIDATE"))
-        except Exception as e:
-            print(f"[PF-ENGINE-INIT-ERR] {e}")
-            import traceback
-            print(traceback.format_exc())
-            self.pf_status_var.set("DEGRADED_NO_CANDIDATES (init failed, see logs)")
-            # do not popup; show clean degraded status
-            self.pf_engine = None
-            # still try to show empty rows
-            try:
-                self._pf_queue_state_update([], source="start_engine_init_failed", generation=self._pf_dict_get("_pf_loop_generation", 0))
-            except Exception:
-                pass
-            self._pf_starting = False
-            return
-        generation = int(self._pf_dict_get("_pf_loop_generation", 0) or 0)
-        self._pf_stop_event = threading.Event()
-        self._pf_engine_thread = self._start_worker(
-            "pf_engine_loop",
-            self._pf_run_loop,
-            args=(generation,),
-            stop_event=self._pf_stop_event,
-        )
-        self._pf_monitor_running = True
-        self._pf_update_pending = False
-        print(f"[PF-LOOP] start generation={generation}")
-        self.pf_status_var.set("WAITING_FOR_MARKET_DATA | RUNNING_DATA_ONLY (paper sim, no orders)")
-        self._pf_schedule_update(generation)
-        # Keep the button callback non-blocking. Broker auth, candles, and option-chain
-        # reads are handled by the background data poller below.
-        try:
-            rows = self.pf_engine.get_status_table() if self.pf_engine else []
-            self._pf_queue_state_update(rows, source="start_ready_for_poller", generation=generation)
-        except Exception as _e_init_pf:
-            print("[PF] start table update err", _e_init_pf)
-
-        # TASK 2: Always start safe read-only data poller while engine is running.
-        self._start_paper_forward_data_poller(generation)
-        self._pf_starting = False
-
-    def _pf_stop_multi(self):
-        self._pf_user_stopped = True
-        self._pf_monitor_running = False
-        self._pf_loop_generation = int(self._pf_dict_get("_pf_loop_generation", 0) or 0) + 1
-        print(f"[PF-LOOP] stop generation={self._pf_loop_generation}")
-        if self._pf_stop_event:
-            self._pf_stop_event.set()
-        self._stop_paper_forward_data_poller()
-        self._gui_cancel_tab_after(
-            "_pf_after_job", tab="paper_forward", reason="stop_multi", name="paper_forward_monitor_update"
-        )
-        self._gui_cancel_tab_after(
-            "_pf_throttle_after_job", tab="paper_forward", reason="stop_multi", name="pf_throttled_apply"
-        )
-        self._pf_update_job = None
-        self._pf_pending_ui_update = False
-        self._pf_update_pending = False
-        self.pf_status_var.set("STOPPED")
-        if self.pf_engine:
-            self.pf_engine.write_summary()
-
-    def _pf_run_loop(self, generation: int = 0):
-        engine = self.pf_engine
-        if not engine:
-            return
-        while not (self._pf_stop_event and self._pf_stop_event.is_set()) and generation == int(self._pf_dict_get("_pf_loop_generation", 0) or 0):
-            try:
-                # Build real snapshot from app state (prefer option chain even if candles empty)
-                # NOTE: _build calls _pf_ensure_auth_terminal which advances to terminal state
-                snap = self._build_paper_snapshot_for_engine()
-                chain, _chain_source = self._get_cached_option_chain_rows()
-
-                # Use canonical single source of truth (TASK1) after build/ensure
-                st = self._pf_dict_get("_pf_auth_state")
-                auth_state = st.status if st else str((snap or {}).get("broker_auth") or "")
-                # Skip ALL evals (on_market + router) unless exactly AUTH_OK (TASK5)
-                # This covers both pending (VERIFYING/UNCHECKED) and terminal-failed (SESSION/AUTH_FAILED/INIT_FAILED)
-                if auth_state != "AUTH_OK":
-                    try:
-                        if st:
-                            self._pf_set_table_auth_block_reason(auth_state)
-                        if hasattr(engine, "_auth_wait_cycles"):
-                            engine._auth_wait_cycles = int(getattr(engine, "_auth_wait_cycles", 0)) + 1
-                        rows = engine.get_status_table()
-                        self._pf_queue_state_update(rows, source="run_loop_auth_wait", generation=generation)
-                    except Exception:
-                        pass
-                    # do not call on_market_snapshot, do not increment evals, do not run models/router
-                    self._pf_auth_trace("skip_eval", reason="auth_not_terminal", status=auth_state, poll_cycle_id=self._pf_dict_get("_pf_poll_cycle_id", 0))
-                else:
-                    decisions = engine.on_market_snapshot(snap or {}, chain)
-                    self._pf_remember_decisions(decisions)
-                    for d in decisions:
-                        engine.write_jsonl(d)
-                    engine.write_summary()
-                    # update table
-                    try:
-                        rows = engine.get_status_table()
-                        self._pf_queue_state_update(rows, source="run_loop_decisions", generation=generation)
-                    except Exception:
-                        pass
-            except Exception as e:
-                print("[PF-MULTI] live feed err", e)
-            time.sleep(3.0)  # poll interval for live data
-        print(f"[PF-LOOP] exit generation={generation}")
-
-    def _publish_market_snapshot_to_paper_forward(self, snap: dict = None, chain: Any = None, source: str = "unknown"):
-        """TASK 1/3/5/6: Central publish + snapshot arbitration point. Only canonical runtime + good snaps reach engine.
-        Bad/stale/ui_or_engine snapshots after a good one are rejected to prevent overwrite.
-        """
-        stop_event = self._pf_dict_get("_pf_stop_event")
-        if stop_event and stop_event.is_set():
-            print(f"[PF-LOOP] publish_ignored_after_stop source={source}")
-            return
-        if not self._pf_dict_get("pf_engine"):
-            return
-        runtime = self._pf_dict_get("_pf_runtime")
-        if runtime is None:
-            runtime = PaperForwardRuntime()
-            self._pf_runtime = runtime
-            self._pf_auth_state = runtime.auth
-        runtime.broker_name = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        try:
-            if snap is None:
-                snap = self._build_paper_snapshot_for_engine()
-            if chain is None:
-                cached_chain, _chain_source = self._get_cached_option_chain_rows()
-                chain = cached_chain or runtime.option_chain
-            # BLOCKER 1 guard + log
-            if not isinstance(snap, dict):
-                print(f"[PF-PUBLISH-SNAPSHOT] type={type(snap).__name__} keys=N/A option_rows=N/A candles=N/A source={source}")
-                if isinstance(snap, (int, float, type(None))):
-                    snap = {}
-                else:
-                    snap = {}
-            print(
-                f"[PF-PUBLISH-SNAPSHOT] type={type(snap).__name__} "
-                f"keys={list(snap.keys())[:6] if isinstance(snap,dict) else 'N/A'} "
-                f"option_rows={snap.get('option_rows') if isinstance(snap,dict) else 'N/A'} "
-                f"candles={snap.get('candle_count') if isinstance(snap,dict) else 'N/A'} "
-                f"source={source}"
-            )
-            is_candle_only = any(kw in str(source or "").lower() for kw in ("candle", "live_chart_candles_only_update", "candles_only"))
-            if is_candle_only:
-                print(f"[PF-PUBLISH-SNAPSHOT] mode=candles_only merge_only=true source={source}")
-                if isinstance(snap, dict):
-                    if snap.get("candles"):
-                        runtime.candles = list(snap.get("candles") or runtime.candles)
-                        runtime.candle_count = len(runtime.candles)
-                        runtime.candle_source = snap.get("candle_source") or source or runtime.candle_source
-                    if snap.get("price") or snap.get("spot"):
-                        try:
-                            if not self._pf_live_spot_is_fresh():
-                                runtime.spot = float(snap.get("spot") or snap.get("price") or runtime.spot)
-                        except Exception:
-                            pass
-                    prev_quality = str(runtime.data_quality or runtime.last_good_snapshot_quality or "")
-                    if runtime.candle_count > 0 and runtime.option_chain_rows > 0 and runtime.spot not in (None, 0, 0.0):
-                        if prev_quality in ("DATA_OK", "") or prev_quality.startswith("WAITING_FOR_CANDLES"):
-                            runtime.data_quality = "DATA_OK"
-                        elif prev_quality == "DATA_OK":
-                            print(
-                                f"[PF-READINESS-DOWNGRADE-BLOCKED] source={source} old=DATA_OK "
-                                f"new=WAITING_FOR_CANDLES reason=partial_snapshot"
-                            )
-                    if (
-                        runtime.auth.status == "AUTH_OK"
-                        and runtime.option_chain_rows > 0
-                        and runtime.candle_count >= 20
-                        and self.pf_engine
-                        and not (self._pf_dict_get("_pf_stop_event") and self._pf_dict_get("_pf_stop_event").is_set())
-                    ):
-                        try:
-                            merged = runtime.get_canonical_snapshot()
-                            merged["data_quality_status"] = "DATA_OK"
-                            merged["last_data_quality"] = prev_quality or "DATA_OK"
-                            decisions = self.pf_engine.on_market_snapshot(merged, runtime.option_chain)
-                            self._pf_remember_decisions(decisions)
-                            rows = self.pf_engine.get_status_table()
-                            self._pf_queue_state_update(rows, source="candles_only_merge")
-                        except Exception as merge_exc:
-                            self._log_gui_error("pf_candles_only_merge", merge_exc, tab="paper_forward")
-                return
-            print(f"[PF-PUBLISH-SNAPSHOT] mode=full option_rows={snap.get('option_rows') if isinstance(snap,dict) else 'N/A'} candles={snap.get('candle_count') or snap.get('candles_count') if isinstance(snap,dict) else 'N/A'} source={source}")
-            # Normalize incoming
-            inc_auth = str(snap.get("broker_auth") or snap.get("auth_status") or runtime.auth.status)
-            inc_chain = self._normalize_option_chain_rows(chain if chain is not None else snap.get("option_chain") or [])
-            inc_rows = len(inc_chain)
-            inc_candles = bool(snap.get("candles")) or int(snap.get("candle_count", 0) or 0) > 0
-            inc_source = str(snap.get("source") or source or "unknown").lower()
-            inc_quality = "DATA_OK" if (inc_auth == "AUTH_OK" and inc_rows >= runtime.min_option_chain_rows and (inc_candles or True)) else ("TOKEN_NOT_VERIFIED" if "token" in inc_auth.lower() or inc_auth in ("TOKEN_PRESENT_UNCHECKED", "VERIFYING_BROKER_TOKEN") else "OPTION_CHAIN_EMPTY" if inc_rows == 0 else "BAD_SNAPSHOT")
-
-            # BLOCKER 5: ensure full publish has correct counts in snap for logging
-            if isinstance(snap, dict):
-                if snap.get("option_rows") in (None, 0) or "option_rows" not in snap:
-                    snap["option_rows"] = inc_rows
-                if snap.get("option_chain_rows") in (None, 0) or "option_chain_rows" not in snap:
-                    snap["option_chain_rows"] = inc_rows
-                if snap.get("candles_count") in (None, 0) or "candles_count" not in snap:
-                    snap["candles_count"] = len(snap.get("candles") or []) or (1 if inc_candles else 0)
-
-            # Update runtime with best effort data (merge)
-            if inc_auth == "AUTH_OK":
-                runtime.auth.status = inc_auth
-            if inc_rows > 0:
-                runtime.option_chain = list(inc_chain) if inc_chain else runtime.option_chain
-                runtime.option_chain_rows = inc_rows
-            if inc_candles and (not runtime.candles or inc_source in ("mstock_or_dhan_historical", "live_chart_cache", "paper_forward_poller_full_chain")):
-                runtime.candles = list(snap.get("candles") or runtime.candles)
-                runtime.candle_count = len(runtime.candles)
-                runtime.candle_source = snap.get("candle_source") or snap.get("source") or runtime.candle_source
-            try:
-                if isinstance(snap, dict) and snap.get("spot"):
-                    runtime.spot = float(snap.get("spot") or runtime.spot)
-            except Exception:
-                pass
-
-            # Arbitration: do not let lower priority or downgrade overwrite good canonical
-            has_good = runtime.is_good() and runtime.last_good_snapshot is not None and runtime.last_good_snapshot_rows > 0
-            is_downgrade = (inc_rows == 0 and runtime.last_good_snapshot_rows > 0) or \
-                           (not inc_candles and runtime.last_good_snapshot_candles > 0 and runtime.last_good_snapshot_source not in ("ui_or_engine",)) or \
-                           (inc_auth != "AUTH_OK" and runtime.auth.status == "AUTH_OK") or \
-                           (inc_source in ("ui_or_engine", "live_chart", "tab_refresh", "ui_or_engine_fallback") and has_good)
-
-            source_priority_map = {
-                "unknown": 0,
-                "live_chart_candles_only_update": 1,
-                "live_chart_cache": 2,
-                "paper_forward_poll_once": 3,
-                "paper_forward_poller_loop": 4,
-                "paper_forward_poller_full_chain": 5,
-            }
-            if not isinstance(source_priority_map, dict):
-                print("[PF-PUBLISH] priority map corrupted, rebuilding")
-                source_priority_map = {
-                    "unknown": 0,
-                    "live_chart_candles_only_update": 1,
-                    "live_chart_cache": 2,
-                    "paper_forward_poll_once": 3,
-                    "paper_forward_poller_loop": 4,
-                    "paper_forward_poller_full_chain": 5,
-                }
-            incoming_prio = source_priority_map.get(inc_source or "unknown", 0)
-            last_prio = source_priority_map.get(runtime.last_good_snapshot_source or "unknown", 0)
-
-            if has_good and (is_downgrade or incoming_prio > last_prio + 1):
-                # Reject bad downgrade or low prio after good
-                runtime.reject_snapshot(snap, inc_source, "would_downgrade_good_snapshot")
-                self._pf_auth_trace("PAPER-FWD-SNAPSHOT-REJECT", source=inc_source, reason="would_downgrade_good_snapshot", incoming_rows=inc_rows, last_good_rows=runtime.last_good_snapshot_rows, incoming_auth=inc_auth, canonical_auth=runtime.auth.status, incoming_candles=inc_candles, last_good_candles=runtime.last_good_snapshot_candles)
-                # Do not call engine; just update table with current good state if needed
-                try:
-                    if self.pf_engine:
-                        rows = self.pf_engine.get_status_table()
-                        self._pf_queue_state_update(rows, source="publish_reject")
-                except Exception:
-                    pass
-                return
-
-            # Accept: update last good in runtime
-            if inc_quality in ("DATA_OK",) or (not has_good and inc_auth == "AUTH_OK"):
-                runtime.update_from_good_snapshot(snap, inc_source or "accepted", inc_chain)
-                runtime.last_accepted_snapshot_id = snap.get("snapshot_id") or f"acc_{int(time.time())}"
-
-            # Now gate on canonical auth for eval
-            if runtime.auth.status != "AUTH_OK":
-                try:
-                    self._pf_set_table_auth_block_reason(runtime.auth.status)
-                    if self.pf_engine:
-                        rows = self.pf_engine.get_status_table()
-                        self._pf_queue_state_update(rows, source="publish_auth_wait")
-                except Exception:
-                    pass
-                self._pf_auth_trace("skip_eval", reason="auth_not_terminal", status=runtime.auth.status, poll_cycle_id=self._pf_dict_get("_pf_poll_cycle_id", 0))
-                return
-
-            # Publish accepted good snapshot to engine
-            decisions = self.pf_engine.on_market_snapshot(snap or runtime.get_canonical_snapshot(), inc_chain or runtime.option_chain)
-            self._pf_remember_decisions(decisions)
-            # Sync to runtime for get_last_decision etc exposure
-            if decisions:
-                runtime._last_decision = decisions[-1]
-                runtime._decision_rows = list(decisions)
-            try:
-                rows = self.pf_engine.get_status_table()
-                self._pf_queue_state_update(rows, source="publish")
-            except Exception:
-                pass
-            # trace runtime id for debug (TASK8)
-            self._pf_auth_trace("PAPER-FWD-RUNTIME-ID", caller="publish", runtime_id=id(runtime), auth=runtime.auth.status, rows=runtime.option_chain_rows, candles=runtime.candle_count)
-        except Exception as e:
-            import traceback
-            print("[PF] publish snapshot err", e)
-            print(traceback.format_exc())
-
-    def _build_paper_snapshot_for_engine(self) -> dict:
-        """PHASE 6: Build rich snapshot (spot, full chain, candles, auth, source) for paper engine.
-        Option-chain-only is valid; do not force candles or cause generic missing_artifact.
-        Now prefers canonical _pf_runtime to avoid stale empty data (TASK1/4).
-        """
-        runtime = self._pf_dict_get("_pf_runtime")
-        if runtime is None:
-            runtime = PaperForwardRuntime()
-            self._pf_runtime = runtime
-            self._pf_auth_state = runtime.auth
-        runtime.broker_name = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        snap: Dict[str, Any] = {}
-        candle_src = runtime.candle_source or "none"
-        broker_auth = runtime.auth.status or "UNKNOWN"
-        try:
-            # Auth from canonical (read only, no reset)
-            broker_auth, auth_error, _spot = self._pf_ensure_auth_terminal(force=False)
-            if broker_auth == "AUTH_OK":
-                spot_res = self.resolve_live_spot_for_paper_forward(
-                    client=self._pf_dict_get("_client"),
-                    current=_spot,
-                    prefer_live_quote=True,
-                )
-                if spot_res.get("ok") and spot_res.get("spot"):
-                    self._pf_apply_resolved_spot(spot_res["spot"], str(spot_res.get("source") or ""))
-            # Merge from runtime first (prevent downgrade to empty)
-            if runtime.spot not in (None, 0, 0.0):
-                snap["price"] = float(runtime.spot)
-                snap["spot"] = float(runtime.spot)
-            if runtime.option_chain_rows > 0:
-                chain = runtime.option_chain
-            else:
-                chain = None
-            auth_fields = self._pf_auth_status_fields()
-            self._pf_auth_trace("PAPER-FWD-RUNTIME-ID", caller="_build", runtime_id=id(runtime), auth=runtime.auth.status, rows=runtime.option_chain_rows, candles=runtime.candle_count)
-
-            # Candles prefer runtime or live cache
-            candles = runtime.candles or self._pf_dict_get("_latest_candles") or []
-            header_candle_count = 0
-            try:
-                dash_candles_var = self._pf_dict_get("_dash_candles_var")
-                header_candle_count = int(str(dash_candles_var.get() if dash_candles_var is not None else "0") or "0")
-            except Exception:
-                header_candle_count = 0
-            if candles:
-                candle_src = runtime.candle_source or "mstock_or_dhan_historical"
-                last = candles[-1] if hasattr(candles[-1], "close") else None
-                if last:
-                    candle_close = float(getattr(last, "close", 0) or 0)
-                    snap["timestamp"] = getattr(last, "time", datetime.now(timezone.utc)).isoformat() if hasattr(last, "time") else datetime.now(timezone.utc).isoformat()
-                    snap["last"] = candle_close
-                    snap["close"] = candle_close
-                    snap["candles"] = candles
-            elif header_candle_count > 0:
-                candle_src = "historical"
-                snap["candles"] = [{} for _ in range(header_candle_count)]
-            elif runtime.candle_count > 0:
-                snap["candles"] = runtime.candles
-                candle_src = runtime.candle_source
-            if not candles and (snap.get("spot") or runtime.spot):
-                try:
-                    fetched, fetched_src, _ = self._pf_fetch_candles_readonly(
-                        self._pf_dict_get("_client"),
-                        spot=snap.get("spot") or runtime.spot,
-                    )
-                    if fetched:
-                        candles = fetched
-                        candle_src = fetched_src or candle_src
-                        snap["candles"] = candles
-                except Exception:
-                    pass
-
-            # Option chain from runtime or all known cache aliases (prefer canonical).
-            chain_source = "runtime.option_chain" if chain else ""
-            if chain is None or len(chain) == 0:
-                chain, chain_source = self._get_cached_option_chain_rows()
-            else:
-                chain = self._normalize_option_chain_rows(chain)
-            if (not chain) and broker_auth == "AUTH_OK":
-                spot_for_synth = snap.get("spot") or runtime.spot or self._pf_dict_get("_spot_ltp_live")
-                chain, synth_src = self._pf_ensure_mstock_synthetic_chain_if_needed(
-                    chain or [],
-                    spot=spot_for_synth,
-                    candles=candles,
-                    client=self._pf_dict_get("_client"),
-                )
-                if chain and synth_src == BS_CHAIN_SOURCE:
-                    chain_source = BS_CHAIN_SOURCE
-            if chain and len(chain) > 0:
-                # derive spot from chain if not present
-                spot, spot_source = self._pf_resolve_spot(chain=chain, candles=candles, current=snap.get("spot") or snap.get("price"))
-                if spot is not None:
-                    snap["price"] = float(spot)
-                    snap["spot"] = float(spot)
-                    runtime.spot = float(spot)
-                    print(f"[PF-DATA] spot_source={spot_source} spot={spot}")
-                snap["option_chain"] = list(chain) if isinstance(chain, (list, tuple)) else [chain]
-                snap["option_rows"] = len(snap["option_chain"])
-                snap["option_chain_rows"] = snap["option_rows"]
-                snap["option_chain_source"] = getattr(self, "_last_option_chain_source", "") or chain_source
-                snap["option_chain_ts"] = getattr(self, "_last_option_chain_ts", None)
-                is_synth = (
-                    snap["option_chain_source"] == BS_CHAIN_SOURCE
-                    or (chain and isinstance(chain[0], dict) and chain[0].get("synthetic"))
-                )
-                snap["synthetic"] = bool(is_synth)
-                snap["chain_source"] = BS_CHAIN_SOURCE if is_synth else snap.get("option_chain_source", "")
-                try:
-                    ts = getattr(self, "_last_option_chain_ts", None)
-                    if ts:
-                        snap["option_chain_age_sec"] = max(0.0, (datetime.now() - ts).total_seconds())
-                except Exception:
-                    pass
-                min_rows = int(os.getenv("PAPER_FORWARD_MIN_OPTION_CHAIN_ROWS", "20") or 20)
-                if is_synth:
-                    snap["option_chain_status"] = "SYNTHETIC_CHAIN_OK"
-                    snap["option_chain_error"] = ""
-                    snap["data_quality_status"] = self._pf_infer_data_quality(
-                        option_rows=int(snap["option_rows"]),
-                        candle_count=int(snap.get("candle_count", 0) or 0),
-                        spot=snap.get("spot") or snap.get("price"),
-                        chain=snap.get("option_chain"),
-                        chain_source=BS_CHAIN_SOURCE,
-                        synthetic=True,
-                        candle_source=candle_src,
-                    )
-                    self._pf_apply_real_candle_policy_to_snapshot(snap)
-                    needs_candle_fb = (
-                        self._pf_allow_synthetic_candle_fallback()
-                        and
-                        snap["data_quality_status"] in (
-                            "SYNTHETIC_CHAIN_WITH_SPOT_CANDLE_FALLBACK",
-                            "SYNTHETIC_CHAIN_READY_WAITING_FOR_CANDLES",
-                        )
-                        and int(snap.get("candle_count", 0) or 0) <= 0
-                    )
-                    if needs_candle_fb and (snap.get("spot") or snap.get("price")):
-                        fb = build_spot_candle_fallback(float(snap.get("spot") or snap.get("price") or 0))
-                        snap["candles"] = fb
-                        snap["candle_count"] = len(fb)
-                        snap["candle_source"] = "SYNTHETIC_SPOT_FALLBACK"
-                        snap["synthetic_candles"] = True
-                        candle_src = "SYNTHETIC_SPOT_FALLBACK"
-                        self._pf_synthetic_candles_active = True
-                        snap["data_quality_status"] = self._pf_infer_data_quality(
-                            option_rows=int(snap["option_rows"]),
-                            candle_count=len(fb),
-                            spot=snap.get("spot") or snap.get("price"),
-                            chain=snap.get("option_chain"),
-                            chain_source=BS_CHAIN_SOURCE,
-                            synthetic=True,
-                            candle_source="SYNTHETIC_SPOT_FALLBACK",
-                            synthetic_candles=True,
-                        )
-                else:
-                    snap["option_chain_status"] = "DATA_OK" if int(snap["option_rows"]) >= min_rows else "THIN_OPTION_CHAIN"
-                    snap["option_chain_error"] = "" if snap["option_chain_status"] == "DATA_OK" else "rows below PAPER_FORWARD_MIN_OPTION_CHAIN_ROWS"
-                    snap["data_quality_status"] = "DATA_OK" if snap["option_chain_status"] == "DATA_OK" else snap["option_chain_status"]
-                if candle_src == "none":
-                    candle_src = "option_chain_only"
-                chain_src_log = BS_CHAIN_SOURCE if is_synth else snap.get("option_chain_source", "")
-                print(
-                    f"[PF-SNAPSHOT-READY] candles={snap.get('candle_count', len(snap.get('candles', [])))} "
-                    f"option_rows={snap.get('option_rows')} chain_source={chain_src_log} "
-                    f"active_candidates={snap.get('active_candidates', getattr(self, '_pf_enabled_ready', 0))}"
-                )
-            else:
-                cache_counts = self._option_chain_cache_counts()
-                snap["option_chain"] = []
-                snap["option_rows"] = 0
-                snap["option_chain_rows"] = 0
-                snap["option_chain_source"] = getattr(self, "_last_option_chain_source", "") or ""
-                if broker_auth == "AUTH_OK":
-                    cfg_status = validate_option_chain_config_for_active_broker(self._selected_broker())
-                    if cfg_status.get("missing_keys"):
-                        # TASK 5: precise states for UI/monitor/snap
-                        mks = cfg_status.get("missing_keys") or []
-                        if any("EXPIRY" in str(m).upper() for m in mks):
-                            snap["option_chain_status"] = "WAITING_FOR_MSTOCK_EXPIRY"
-                        elif any("EXCHANGE" in str(m).upper() for m in mks):
-                            snap["option_chain_status"] = "WAITING_FOR_MSTOCK_EXCHANGE"
-                        else:
-                            snap["option_chain_status"] = "WAITING_FOR_MSTOCK_CONFIG"
-                        snap["option_chain_error"] = snap["option_chain_status"] + ": missing_keys=" + ",".join(mks)
-                    else:
-                        broker_name = self._selected_broker()
-                        if broker_name == "mstock" and is_synthetic_chain_enabled(broker_name):
-                            has_spot = snap.get("spot") not in (None, "", 0, 0.0) or runtime.spot not in (None, 0, 0.0)
-                            snap["option_chain_status"] = "SYNTHETIC_CHAIN_PENDING" if has_spot else "WAITING_FOR_SPOT"
-                            snap["option_chain_error"] = "mstock_real_chain_empty_bs_synthetic_expected"
-                        else:
-                            snap["option_chain_status"] = "DHAN_OPTION_CHAIN_UNAVAILABLE" if broker_name == "dhan" else "EMPTY_RESPONSE"
-                            snap["option_chain_error"] = getattr(self, "_last_option_chain_reason", "") or (
-                                "DHAN_OPTION_CHAIN_UNAVAILABLE" if broker_name == "dhan" else "EMPTY_RESPONSE"
-                            )
-                else:
-                    snap["option_chain_status"] = "not_fetched_auth_not_ok"
-                    snap["option_chain_error"] = f"option chain not fetched because auth_status={broker_auth}"
-                snap["option_chain_empty_reason"] = {
-                    **cache_counts,
-                    "last_fetch_status": getattr(self, "_last_option_chain_status", ""),
-                    "last_fetch_reason": getattr(self, "_last_option_chain_reason", ""),
-                    "last_fetch_error": getattr(self, "_last_option_chain_error", None),
-                }
-                now = time.time()
-                if now - float(getattr(self, "_last_pf_snapshot_empty_log_ts", 0.0) or 0.0) >= 4.0:
-                    self._last_pf_snapshot_empty_log_ts = now
-                    print(
-                        f"[PF-SNAPSHOT-EMPTY] cache_counts={cache_counts} "
-                        f"last_status={getattr(self, '_last_option_chain_status', '')} "
-                        f"reason={getattr(self, '_last_option_chain_reason', '')}"
-                    )
-                try:
-                    broker_name = self._selected_broker()
-                    reason = snap.get("option_chain_status") or ("DHAN_OPTION_CHAIN_UNAVAILABLE" if broker_name == "dhan" else "EMPTY_RESPONSE")
-                    self._option_chain_status_var.set(f"{broker_name}: {reason} rows=0")
-                except Exception:
-                    pass
-
-            # Fallback spot from UI
-            if "price" not in snap or not snap.get("price"):
-                p, spot_source = self._pf_resolve_spot(chain=chain, candles=candles)
-                if p is not None:
-                    snap["price"] = p
-                    snap["spot"] = p
-                    runtime.spot = p
-                    print(f"[PF-DATA] spot_source={spot_source} spot={p}")
-
-            snap.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
-            snap.setdefault("regime", "UNKNOWN")
-            snap.setdefault("market_regime", "UNKNOWN")
-            snap["source"] = candle_src
-            snap["broker_auth"] = runtime.auth.status or broker_auth
-            snap["auth_error"] = runtime.auth.error or auth_error
-            snap.update(auth_fields)
-            snap["broker_name"] = self._selected_broker()
-            snap["candle_source"] = candle_src
-            snap["candle_count"] = len(candles) if candles else header_candle_count or runtime.candle_count
-            if int(snap.get("candle_count", 0) or 0) <= 0:
-                snap["candle_error"] = "no live chart/scalper candle cache available" if runtime.auth.status == "AUTH_OK" else f"candle fetch skipped because auth_status={runtime.auth.status}"
-            snap["chain_fetch_attempted"] = bool(runtime.auth.status == "AUTH_OK")
-            snap["chain_skipped_reason"] = "" if runtime.auth.status == "AUTH_OK" else snap.get("option_chain_error", "")
-            snap["candle_fetch_attempted"] = bool(runtime.auth.status == "AUTH_OK")
-            snap["candle_skipped_reason"] = "" if runtime.auth.status == "AUTH_OK" else snap.get("candle_error", "")
-            snap["token_set"] = bool(os.getenv("MSTOCK_ACCESS_TOKEN") or os.getenv("DHAN_ACCESS_TOKEN"))
-            snap["data_quality_flags"] = {
-                "has_spot": snap.get("spot") not in (None, "", 0, 0.0),
-                "spot_value": snap.get("spot") or snap.get("price"),
-                "has_chain": int(snap.get("option_rows", 0) or 0) > 0,
-                "option_rows": int(snap.get("option_rows", 0) or 0),
-                "has_candles": int(snap.get("candle_count", 0) or 0) > 0,
-                "candles_count": int(snap.get("candle_count", 0) or 0),
-                "selected_broker": self._selected_broker(),
-                "missing_config_keys": validate_option_chain_config_for_active_broker(self._selected_broker()).get("missing_keys", []),
-            }
-            # TASK 9: separate counts for disabled artifacts vs runtime blockers vs ready
-            cands = getattr(self, "pf_candidates", []) or []
-            total_c = len(cands)
-            enabled_c = [c for c in cands if bool(c.get("enabled", c.get("active", False)))]
-            dis_artifact = sum(
-                1 for c in enabled_c
-                if (
-                    str(c.get("_load_status") or "").upper() in ("ARTIFACT_NOT_FOUND", "ARTIFACT_MISSING", "CANDIDATE_MISSING_ARTIFACT_PATHS")
-                    or (
-                        "ARTIFACT_NOT_FOUND" in str(c.get("last_reason", "") or "").upper()
-                        and str(c.get("_load_status") or "") not in ("candidate_loaded_ok", "LOAD_OK")
-                    )
-                )
-            )
-            en_artifact_ok = len(enabled_c) - dis_artifact
-            en_blocked_chain = 0
-            en_ready_pred = en_artifact_ok
-            if int(snap.get("option_rows", 0) or 0) <= 0:
-                en_blocked_chain = en_artifact_ok
-                en_ready_pred = 0
-            self._pf_total_candidates = total_c
-            self._pf_enabled_artifact_ok_count = en_artifact_ok
-            self._pf_disabled_missing_artifact = dis_artifact
-            self._pf_enabled_blocked_by_chain = en_blocked_chain
-            self._pf_enabled_ready = en_ready_pred
-            active_candidates = en_ready_pred or en_artifact_ok
-            print(f"[PF-CANDIDATE-COUNTS] total={total_c} enabled={len(enabled_c)} disabled_artifact={dis_artifact} enabled_artifact_ok={en_artifact_ok} enabled_blocked_chain={en_blocked_chain} enabled_ready_pred={en_ready_pred}")
-            if int(snap.get("candle_count", 0) or 0) <= 0:
-                print(f"[PF-SNAPSHOT-BLOCKED] reason=ROUTER_WAITING_FOR_CANDLES candles=0 option_rows={snap.get('option_rows', 0)}")
-            elif int(snap.get("option_rows", 0) or 0) <= 0:
-                print(f"[PF-SNAPSHOT-BLOCKED] reason=ROUTER_WAITING_FOR_OPTION_CHAIN candles={snap.get('candle_count', 0)} option_rows=0")
-            elif active_candidates <= 0:
-                print(f"[PF-SNAPSHOT-BLOCKED] reason=BLOCKED_NO_ACTIVE_ARTIFACT candles={snap.get('candle_count', 0)} option_rows={snap.get('option_rows', 0)}")
-            else:
-                print(
-                    f"[PF-SNAPSHOT-READY] candles={snap.get('candle_count', 0)} "
-                    f"option_rows={snap.get('option_rows', 0)} active_candidates={active_candidates}"
-                )
-            if snap["data_quality_flags"]["has_chain"] and not snap["data_quality_flags"]["has_spot"]:
-                p, spot_source = self._pf_resolve_spot(chain=chain, candles=candles)
-                if p is not None:
-                    snap["spot"] = p
-                    snap["price"] = p
-                    runtime.spot = p
-                    snap["data_quality_flags"]["has_spot"] = True
-                    snap["data_quality_flags"]["spot_value"] = p
-                    print(f"[PF-DATA] spot_source={spot_source} spot={p}")
-            pf_log("DEBUG", f"[PF-DATA] diagnostics_count={len(snap.get('data_quality_flags') or [])}", rate_key="pf_data_diag", rate_interval=30.0)
-            print(
-                f"[PF-SNAPSHOT] spot={snap.get('spot') or snap.get('price')} "
-                f"candles={snap.get('candle_count', 0)} option_chain_rows={snap.get('option_rows', 0)} "
-                f"source={snap.get('option_chain_source') or snap.get('source')}"
-            )
-
-            # Sync runtime with whatever we have (merge policy in publish will arbitrate)
-            if runtime.auth.status == "AUTH_OK" or not runtime.auth.validation_attempted:
-                runtime.auth.status = snap.get("broker_auth", runtime.auth.status)
-            if int(snap.get("option_rows", 0)) > runtime.option_chain_rows:
-                runtime.option_chain = snap.get("option_chain", runtime.option_chain)
-                runtime.option_chain_rows = int(snap.get("option_rows", 0))
-            if int(snap.get("candle_count", 0)) > runtime.candle_count:
-                runtime.candles = snap.get("candles", runtime.candles)
-                runtime.candle_count = int(snap.get("candle_count", 0))
-                runtime.candle_source = snap.get("candle_source", runtime.candle_source)
-            if snap.get("spot"):
-                runtime.spot = snap.get("spot")
-
-            # Update footer status
-            try:
-                status = PaperForwardDataStatus.from_snapshot(snap, chain)
-                self.after(0, lambda s=status: self._pf_apply_data_status_to_ui(s))
-                if self._pf_dict_get("pf_live_var") is not None:
-                    ds = status.as_dict()
-                    self.after(0, lambda d=ds: self.pf_live_var.set(
-                        f"Live orders: FALSE | Broker orders: FALSE | Candidates: {len(getattr(self, 'pf_candidates', []))} "
-                        f"| Active pos: 0 | DATA={d.get('data_quality_status')}"
-                    ))
-            except Exception:
-                pass
-            self._pf_auth_trace("PAPER-FWD-RUNTIME-ID", caller="_build_end", runtime_id=id(runtime), auth=runtime.auth.status, rows=runtime.option_chain_rows)
-            self._pf_attach_broker_to_snapshot(snap)
-        except Exception as e:
-            print("[PF] snapshot build err", e)
-        if snap:
-            self._pf_attach_broker_to_snapshot(snap)
-        return snap or {"timestamp": datetime.now(timezone.utc).isoformat(), "price": 0.0, "source": "empty"}
-
-    def _pf_schedule_update(self, generation: int | None = None):
-        if generation is None:
-            generation = int(self._pf_dict_get("_pf_loop_generation", 0) or 0)
-        if generation != int(self._pf_dict_get("_pf_loop_generation", 0) or 0):
-            print(f"[PF-LOOP] stale_schedule_ignored generation={generation}")
-            return
-        if self._gui_is_closing():
-            return
-        if not getattr(self, "_pf_monitor_running", False):
-            return
-        if not self._pf_dict_get("pf_engine"):
-            return
-        try:
-            self._drain_ui_queue()
-        except Exception:
-            pass
-        try:
-            self._pf_request_ui_update(source="schedule", generation=generation)
-        except Exception as e:
-            print("[PF-MONITOR] update err", e)
-        engine_thread = self._pf_dict_get("_pf_engine_thread")
-        data_thread = self._pf_dict_get("_pf_data_poller_thread")
-        running = (
-            (engine_thread is not None and engine_thread.is_alive())
-            or (data_thread is not None and data_thread.is_alive())
-        )
-        stop_event = self._pf_dict_get("_pf_stop_event")
-        stopped = bool(stop_event and stop_event.is_set()) or bool(self._pf_dict_get("_pf_user_stopped"))
-        if (running or self._pf_dict_get("pf_engine")) and not stopped and not self._gui_is_closing():
-            job_id = self._gui_schedule_tab_after(
-                "paper_forward",
-                "_pf_after_job",
-                "paper_forward_monitor_update",
-                1500,
-                self._pf_schedule_update,
-                generation,
-            )
-            self._pf_update_job = job_id
-
-    def _pf_export_summary(self):
-        if not self.pf_engine:
-            messagebox.showinfo("Info", "No engine running")
-            return
-        s = self.pf_engine.write_summary()
-        try:
-            dbg = self.pf_engine.write_debug_export(
-                extra={"ui_rows": list(getattr(self, "_pf_last_gui_rows_by_candidate", {}).values())}
-            )
-            dbg_note = f"\nDebug: {dbg}"
-        except Exception as exc:
-            dbg_note = f"\nDebug export failed: {exc}"
-        messagebox.showinfo(
-            "Exported",
-            f"Summary written to reports/. Active positions: {s.get('active_sim_positions',0)}{dbg_note}",
-        )
-
-    def _start_paper_forward_data_poller(self, generation: int | None = None):
-        """TASK 2: Safe data-only polling when main bot is idle.
-        Fetches spot/option-chain/candles read-only and feeds to pf engine.
-        Never places orders.
-        """
-        data_poller = self._pf_dict_get("_pf_data_poller_thread")
-        if data_poller and data_poller.is_alive():
-            print("[SCHEDULER] duplicate_prevented job=dhan_candle_poll" if self._selected_broker() == "dhan" else "[SCHEDULER] duplicate_prevented job=paper_forward_data_poller")
-            return
-        if generation is None:
-            generation = int(self._pf_dict_get("_pf_loop_generation", 0) or 0)
-        self._pf_data_stop = threading.Event()
-        self._pf_data_poller_thread = self._start_worker(
-            "pf_data_poller",
-            self._paper_forward_data_poller_loop,
-            args=(generation,),
-            stop_event=self._pf_data_stop,
-        )
-        self._pf_schedule_update(generation)
-        print(f"[PF-LOOP] Started safe data-only poller generation={generation} (main bot idle)")
-
-    def _pf_token_value(self) -> str:
-        # safe for bare test objects (no tk __getattr__ blowup)
-        try:
-            broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-            key = "DHAN_ACCESS_TOKEN" if broker == "dhan" else "MSTOCK_ACCESS_TOKEN"
-            return (os.getenv(key) or "").strip()
-        except Exception:
-            return ""
-
-    def _pf_token_hash_prefix(self, token: str | None = None) -> str:
-        import hashlib
-        try:
-            token = token if token is not None else self._pf_token_value()
-        except Exception:
-            token = ""
-        if not token:
-            return ""
-        try:
-            broker = self._selected_broker()
-        except Exception:
-            broker = _normalize_broker_name()
-        return hashlib.sha256(f"{broker}:{token}".encode("utf-8")).hexdigest()[:8]
-
-    def _pf_auth_trace(self, event, **kwargs):
-        print("[PF-AUTH-TRACE]", event, kwargs, flush=True)
-
-    def _pf_sync_auth_state_to_legacy(self) -> None:
-        """Keep legacy _pf_* for test compat while state is source of truth."""
-        st = self._pf_auth_state
-        if st.status == "AUTH_OK":
-            self._pf_last_valid_auth_state = {
-                "status": st.status,
-                "token_hash": st.token_hash,
-                "client_created": st.client_created,
-                "client_source": st.client_source,
-                "endpoint_used": st.endpoint_used,
-                "ts": datetime.now(timezone.utc).isoformat(),
-            }
-        self._pf_last_auth_status = st.status
-        self._pf_last_auth_error = st.error
-        self._pf_auth_validation_attempted = st.validation_attempted
-        self._pf_auth_validation_in_progress = st.validation_in_progress
-        self._pf_auth_token_hash_prefix = st.token_hash
-        self._pf_auth_success_count = st.success_count
-        self._pf_auth_failure_count = st.failure_count
-        self._pf_last_auth_endpoint = st.endpoint_used
-        self._pf_last_auth_checked_ts = st.validation_finished_ts or st.validation_started_ts or ""
-        self._pf_auth_validation_started_ts = st.validation_started_ts or ""
-        self._pf_client_created = st.client_created
-        self._pf_client_source = st.client_source
-
-    def _pf_sync_legacy_to_auth_state(self) -> None:
-        """If tests directly mutated legacy attrs, push into state (best effort)."""
-        st = self._pf_auth_state
-        # only override if legacy has a "stronger" value (e.g. test set terminal)
-        leg_status = getattr(self, "_pf_last_auth_status", None)
-        if st.status == "AUTH_OK" and leg_status in {"TOKEN_MISSING", "TOKEN_PRESENT_UNCHECKED", "UNKNOWN", ""}:
-            return
-        if leg_status and leg_status in PaperForwardAuthState.VALID_STATUSES and leg_status != st.status:
-            st.status = leg_status
-        if getattr(self, "_pf_auth_validation_attempted", False):
-            st.validation_attempted = True
-        if getattr(self, "_pf_auth_validation_in_progress", False):
-            st.validation_in_progress = True
-        if getattr(self, "_pf_auth_token_hash_prefix", ""):
-            st.token_hash = getattr(self, "_pf_auth_token_hash_prefix", st.token_hash)
-        st.error = getattr(self, "_pf_last_auth_error", st.error) or st.error
-        st.success_count = getattr(self, "_pf_auth_success_count", st.success_count) or st.success_count
-        st.failure_count = getattr(self, "_pf_auth_failure_count", st.failure_count) or st.failure_count
-        st.endpoint_used = getattr(self, "_pf_last_auth_endpoint", st.endpoint_used) or st.endpoint_used
-
-    def _pf_reset_auth_if_token_changed(self) -> None:
-        token = self._pf_token_value()
-        prefix = self._pf_token_hash_prefix(token)
-        self._pf_sync_legacy_to_auth_state()
-        st = self._pf_auth_state
-        poll_cycle_id = int(getattr(self, "_pf_poll_cycle_id", 0) or 0)
-        if not prefix:
-            if st.token_hash:
-                # token removed
-                st.token_hash = ""
-                st.status = "TOKEN_MISSING"
-                st.validation_attempted = True
-                st.validation_in_progress = False
-            self._pf_sync_auth_state_to_legacy()
-            return
-        if st.token_hash != prefix:
-            old_hash = st.token_hash
-            old_status = st.status
-            st.reset_for_token(prefix)
-            self._pf_auth_trace("token_changed_reset", old_hash=old_hash or "", new_hash=prefix, old_status=old_status, new_status=st.status, poll_cycle_id=poll_cycle_id)
-            self._pf_sync_auth_state_to_legacy()
-            return
-        self._pf_sync_auth_state_to_legacy()
-
-    def _pf_auth_terminal_status(self) -> str:
-        self._pf_reset_auth_if_token_changed()
-        self._pf_sync_legacy_to_auth_state()
-        st = self._pf_auth_state
-        poll_cycle_id = int(getattr(self, "_pf_poll_cycle_id", 0) or 0)
-        current = st.status
-        self._pf_auth_trace("status_read_for_label", old_status=current, auth_validation_attempted=st.validation_attempted, auth_validation_in_progress=st.validation_in_progress, token_present=bool(st.token_hash), token_hash_prefix=st.token_hash, client_exists=st.client_created, poll_cycle_id=poll_cycle_id)
-        self._pf_sync_auth_state_to_legacy()
-        return current
-
-    def _pf_ensure_auth_terminal(self, force: bool = False) -> tuple[str, str, float | None]:
-        """TASK 3 + 4: Verify token ONCE per token value. Always terminate. Use PaperForwardAuthState as source."""
-        self._pf_reset_auth_if_token_changed()
-        self._pf_sync_legacy_to_auth_state()
-        token = self._pf_token_value()
-        st = self._pf_auth_state
-        poll_cycle_id = int(getattr(self, "_pf_poll_cycle_id", 0) or 0)
-        token_hash = self._pf_token_hash_prefix(token) if token else ""
-        token_present = bool(token)
-
-        self._pf_auth_trace("poll_cycle_start", old_status=st.status, token_present=token_present, token_hash_prefix=token_hash or st.token_hash, client_exists=st.client_created, poll_cycle_id=poll_cycle_id)
-
-        if not token:
-            st.set_terminal("TOKEN_MISSING", "No access token configured")
-            st.validation_attempted = True
-            st.validation_in_progress = False
-            self._pf_auth_trace("auth_skipped_reason", old_status="TOKEN_MISSING", new_status="TOKEN_MISSING", auth_validation_attempted=True, reason="no_token", poll_cycle_id=poll_cycle_id)
-            self._pf_auth_trace("verify_final_status", old_status="TOKEN_MISSING", new_status="TOKEN_MISSING", auth_validation_attempted=True, auth_validation_in_progress=False, token_present=False, token_hash_prefix="", client_exists=False, poll_cycle_id=poll_cycle_id)
-            self._pf_sync_auth_state_to_legacy()
-            return st.status, st.error, None
-
-        # On token change handled in reset; now apply guard per TASK2: same hash + attempted => preserve terminal
-        if token_hash and st.token_hash == token_hash and st.validation_attempted and not force:
-            if st.is_terminal():
-                self._pf_auth_trace("status_preserved", terminal_status=st.status, token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-                self._pf_sync_auth_state_to_legacy()
-                return st.status, st.error, None
-            # still pending? fall through only if not terminal yet (shouldn't happen)
-
-        # If already terminal and not forcing re-verify, return it (TASK2 / TASK3)
-        if not force and st.is_terminal() and st.validation_attempted:
-            self._pf_auth_trace("auth_skipped_reason", old_status=st.status, new_status=st.status, auth_validation_attempted=st.validation_attempted, reason="terminal_state", token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-            self._pf_sync_auth_state_to_legacy()
-            return st.status, st.error, None
-
-        # Start verification (only if not attempted or force)
-        if not st.validation_attempted or force:
-            st.token_hash = token_hash
-            st.set_verifying(datetime.now(timezone.utc).isoformat())
-            self._pf_auth_trace("token_loaded", hash=token_hash, status=st.status, poll_cycle_id=poll_cycle_id)
-            self._pf_auth_trace("verify_start", status="VERIFYING_BROKER_TOKEN", token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-
-        # Timeout guard (TASK4)
-        if st.validation_in_progress:
-            timeout = float(os.getenv("AUTH_VERIFY_TIMEOUT_SEC", os.getenv("PAPER_FORWARD_AUTH_TIMEOUT_SEC", "10") or 10))
-            started = st.validation_started_ts
-            try:
-                if started:
-                    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(started.replace("Z", "+00:00"))).total_seconds()
-                    if elapsed > timeout:
-                        st.set_terminal("AUTH_FAILED", "auth_validation_timeout", "auth_validation")
-                        self._pf_auth_trace("auth_timeout", old_status="VERIFYING_BROKER_TOKEN", new_status=st.status, error="auth_validation_timeout", poll_cycle_id=poll_cycle_id)
-                        self._pf_auth_trace("verify_final_status", status=st.status, attempted=st.validation_attempted, in_progress=False, error=st.error, poll_cycle_id=poll_cycle_id)
-                        self._pf_sync_auth_state_to_legacy()
-                        return st.status, st.error, None
-            except Exception:
-                pass
-
-        if st.validation_in_progress and not (force or not st.validation_attempted):
-            # still in progress within timeout, don't re-enter
-            self._pf_sync_auth_state_to_legacy()
-            return st.status, st.error, None
-
-        # Perform the one-time verification
-        client = None
-        client_err = ""
-        try:
-            self._pf_auth_trace("client_reuse_attempt", token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-            client, cstatus, client_err = self._pf_get_or_create_data_client()
-            if client is not None:
-                st.client_created = True
-                st.client_source = cstatus or "reused"
-                self._pf_auth_trace("client_reuse_success", client_source=st.client_source, poll_cycle_id=poll_cycle_id)
-            else:
-                self._pf_auth_trace("client_create_attempt", token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-                if not client:
-                    self._pf_auth_trace("client_create_failed", error=client_err or cstatus or "no_client", poll_cycle_id=poll_cycle_id)
-        except Exception as ce:
-            client = None
-            client_err = str(ce)
-            self._pf_auth_trace("client_create_failed", error=client_err, poll_cycle_id=poll_cycle_id)
-
-        try:
-            if client is None:
-                # TASK4 emergency: never leave in VERIFYING
-                err = client_err or cstatus or "Could not construct/verify m.Stock read-only client"
-                terminal = cstatus if str(cstatus or "") in {"TOKEN_MISSING", "CREDENTIALS_MISSING", "AUTH_FAILED", "SDK_IMPORT_FAILED"} else "BROKER_CLIENT_INIT_FAILED"
-                st.set_terminal(terminal, err, "client_init")
-                self._pf_auth_trace("verify_exception", status=st.status, error=err, poll_cycle_id=poll_cycle_id)
-                self._pf_auth_trace("verify_final_status", status=st.status, attempted=True, in_progress=False, error=err, poll_cycle_id=poll_cycle_id)
-                self._pf_sync_auth_state_to_legacy()
-                return st.status, st.error, None
-
-            self._pf_auth_trace("token_attach_attempt", token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-            # attach done in get/create
-            self._pf_auth_trace("token_attach_success", token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-
-            broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-            verifier_name = "verify_dhan_token_read_only" if broker == "dhan" else "verify_mstock_token_read_only"
-            self._pf_auth_trace("verify_endpoint_start", endpoint=verifier_name, broker=broker, poll_cycle_id=poll_cycle_id)
-
-            # call the verifier (it may do multiple read-only attempts internally)
-            result = verify_dhan_token_read_only(client) if broker == "dhan" else verify_mstock_token_read_only(client)
-
-            term_status = result.status if result.ok else (result.status if result.status in ("SESSION_EXPIRED", "AUTH_FAILED", "BROKER_CLIENT_INIT_FAILED") else "AUTH_FAILED")
-            term_err = result.error_message or ""
-            if not result.ok and not term_status.startswith(("AUTH_FAILED", "SESSION_EXPIRED", "BROKER_CLIENT_INIT_FAILED")):
-                term_status = "AUTH_FAILED"
-            st.set_terminal(term_status, term_err, result.endpoint_used or "")
-            if result.ok:
-                self._pf_auth_trace("verify_result", status="AUTH_OK", endpoint=result.endpoint_used or "", poll_cycle_id=poll_cycle_id)
-            else:
-                self._pf_auth_trace("verify_result", status=term_status, error=term_err, endpoint=result.endpoint_used or "", poll_cycle_id=poll_cycle_id)
-
-        except Exception as exc:
-            st.set_terminal("AUTH_FAILED", str(exc)[:200], "auth_validation_exception")
-            self._pf_auth_trace("verify_exception", status=st.status, error=str(exc), poll_cycle_id=poll_cycle_id)
-        finally:
-            # CRITICAL: always terminal after attempt
-            if st.status == "VERIFYING_BROKER_TOKEN":
-                st.set_terminal("AUTH_FAILED", "verify_did_not_terminate", "unknown")
-            st.validation_attempted = True
-            st.validation_in_progress = False
-            self._pf_auth_trace("verify_final_status", status=st.status, attempted=st.validation_attempted, in_progress=st.validation_in_progress, endpoint=st.endpoint_used, error=st.error, poll_cycle_id=poll_cycle_id)
-
-        self._pf_sync_auth_state_to_legacy()
-        return st.status, st.error, getattr(result, 'spot', None) if 'result' in locals() else None
-
-    @staticmethod
-    def _pf_env_bool(name: str, default: bool = False) -> bool:
-        raw = os.getenv(name)
-        if raw is None:
-            return bool(default)
-        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-    def _pf_allow_synthetic_candle_fallback(self) -> bool:
-        return self._pf_env_bool("PF_ALLOW_SYNTHETIC_CANDLE_FALLBACK", False)
-
-    def _pf_apply_real_candle_policy_to_snapshot(self, snap: dict) -> None:
-        allow_synthetic = self._pf_allow_synthetic_candle_fallback()
-        snap["allow_synthetic_candle_fallback"] = allow_synthetic
-        snap["require_real_candles"] = not allow_synthetic
-        if allow_synthetic:
-            return
-        candle_source = str(snap.get("candle_source") or snap.get("source") or "").upper()
-        if bool(snap.get("synthetic_candles")) or candle_source == "SYNTHETIC_SPOT_FALLBACK":
-            snap["candles"] = []
-            snap["candle_count"] = 0
-            snap["candle_source"] = "none"
-            snap["source"] = "none"
-            snap["synthetic_candles"] = False
-            snap["candle_error"] = "waiting_for_real_candles"
-        if snap.get("data_quality_status") == "SYNTHETIC_CHAIN_WITH_SPOT_CANDLE_FALLBACK":
-            cc = int(snap.get("candle_count") or len(snap.get("candles") or []) or 0)
-            try:
-                from synthetic_option_chain import load_bs_config
-                min_c = int(load_bs_config().get("min_candles_for_prediction", 20))
-            except Exception:
-                min_c = 20
-            if cc < min_c:
-                snap["data_quality_status"] = "WAITING_FOR_CANDLES"
-
-    def _pf_attach_broker_to_snapshot(self, snap: dict) -> None:
-        """Expose authenticated broker client + live chain for paper PnL marking."""
-        try:
-            state = object.__getattribute__(self, "__dict__")
-        except Exception:
-            state = {}
-        auth = str(snap.get("broker_auth") or "")
-        if not auth:
-            rt = state.get("_pf_runtime")
-            if rt is not None and hasattr(rt, "auth"):
-                auth = str(getattr(rt.auth, "status", "") or "")
-        auth_ok = auth == "AUTH_OK"
-        client = state.get("_client") if auth_ok else None
-        snap["broker_client"] = client
-        live_chain = state.get("_broker_live_option_chain") or []
-        if live_chain:
-            snap["broker_live_option_chain"] = list(live_chain)
-        snap["use_broker_option_prices"] = str(os.getenv("PF_USE_BROKER_OPTION_PRICES", "true")).strip().lower() in ("1", "true", "yes", "on")
-        self._pf_apply_real_candle_policy_to_snapshot(snap)
-
-    def _pf_auth_status_fields(self) -> dict:
-        self._pf_enforce_auth_timeout()
-        self._pf_sync_legacy_to_auth_state()
-        st = self._pf_auth_state
-        if st.status == "AUTH_OK" and not st.token_hash:
-            last_valid = getattr(self, "_pf_last_valid_auth_state", None) or {}
-            st.token_hash = str(last_valid.get("token_hash") or self._pf_token_hash_prefix() or "")
-            st.client_created = bool(last_valid.get("client_created", st.client_created))
-        started = str(st.validation_started_ts or "")
-        elapsed = None
-        try:
-            if started:
-                elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(started.replace("Z", "+00:00"))).total_seconds()
-        except Exception:
-            elapsed = None
-        fields = {
-            "auth_validation_attempted": st.validation_attempted,
-            "auth_validation_in_progress": st.validation_in_progress,
-            "auth_validation_started_ts": started,
-            "auth_validation_elapsed_sec": elapsed,
-            "auth_validation_endpoint": st.endpoint_used,
-            "auth_last_checked_ts": st.validation_finished_ts or "",
-            "auth_success_count": st.success_count,
-            "auth_failure_count": st.failure_count,
-            "token_present": bool(st.token_hash),
-            "token_hash_prefix": st.token_hash,
-            "client_created": st.client_created,
-            "client_source": st.client_source or "none",
-            "broker_auth": st.status,
-            "auth_status": st.status,
-            "auth_error": st.error,
-        }
-        poll_cycle_id = int(getattr(self, "_pf_poll_cycle_id", 0) or 0)
-        self._pf_auth_trace("status_read_for_footer", old_status=st.status, auth_validation_attempted=st.validation_attempted, auth_validation_in_progress=st.validation_in_progress, token_present=bool(st.token_hash), token_hash_prefix=st.token_hash, client_exists=st.client_created, runtime_id=id(getattr(self, "_pf_runtime", None)), client_id=id(getattr(self, "_client", None)) if getattr(self, "_client", None) is not None else 0, poll_cycle_id=poll_cycle_id)
-        self._pf_sync_auth_state_to_legacy()
-        return fields
-
-    def _pf_get_or_create_data_client(self):
-        """Return a read-only broker client for paper-forward data polling."""
-        broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        if broker == "dhan":
-            try:
-                self._set_env_from_fields()
-            except Exception:
-                pass
-        token_key = "DHAN_ACCESS_TOKEN" if broker == "dhan" else "MSTOCK_ACCESS_TOKEN"
-        token = (os.getenv(token_key) or "").strip()
-        state = getattr(self, "__dict__", {})
-        poll_cycle_id = int(state.get("_pf_poll_cycle_id", 0))
-        token_hash = self._pf_token_hash_prefix(token) if token else ""
-        existing = state.get("_client")
-        if existing is not None:
-            existing_name = type(existing).__name__.lower()
-            if (broker == "dhan" and "dhan" not in existing_name) or (broker == "mstock" and "dhan" in existing_name):
-                existing = None
-        if existing is not None:
-            if token:
-                try:
-                    setattr(existing, "access_token", token)
-                    if hasattr(existing, "_raw"):
-                        setattr(existing._raw, "access_token", token)
-                        if hasattr(existing._raw, "set_access_token"):
-                            existing._raw.set_access_token(token)
-                except Exception:
-                    pass
-            self._pf_client_created = True
-            self._pf_client_source = "reused_app_client"
-            self._pf_auth_trace("client_reuse_success", old_status=str(state.get("_pf_last_auth_status") or ""), broker=broker, client_exists=True, token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-            return existing, "reused_app_client", ""
-        scalper = state.get("_scalper")
-        for attr in ("client", "_client", "broker", "_broker"):
-            c = getattr(scalper, attr, None) if scalper is not None else None
-            if c is not None:
-                cname = type(c).__name__.lower()
-                if (broker == "dhan" and "dhan" not in cname) or (broker == "mstock" and "dhan" in cname):
-                    continue
-                self._client = c
-                self._pf_client_created = True
-                self._pf_client_source = f"reused_scalper_{attr}"
-                self._pf_auth_trace("client_reuse_success", old_status=str(state.get("_pf_last_auth_status") or ""), broker=broker, client_exists=True, token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-                return c, f"reused_scalper_{attr}", ""
-        if broker == "dhan":
-            client_id = os.getenv("DHAN_CLIENT_ID", "").strip()
-            under_id = os.getenv("DHAN_UNDERLYING_SECURITY_ID", os.getenv("DHAN_UNDER_SECURITY_ID", "")).strip()
-            if not client_id or not under_id:
-                missing = []
-                if not client_id:
-                    missing.append("DHAN_CLIENT_ID")
-                if not under_id:
-                    missing.append("DHAN_UNDERLYING_SECURITY_ID")
-                return None, "CREDENTIALS_MISSING", "missing " + ",".join(missing)
-        if not token:
-            return None, "TOKEN_MISSING", f"{token_key} is not set"
-        try:
-            self._pf_auth_trace("client_create_attempt", old_status=str(state.get("_pf_last_auth_status") or ""), broker=broker, token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-            if broker == "dhan":
-                try:
-                    self._set_env_from_fields()
-                except Exception:
-                    pass
-                client = self._build_dhan_client() if hasattr(self, "_build_dhan_client") else None
-            else:
-                api_cfg = load_api_config()
-                client = MStockTypeBClient(api_cfg)
-            try:
-                setattr(client, "access_token", token)
-                if hasattr(client, "_raw"):
-                    setattr(client._raw, "access_token", token)
-                    if hasattr(client._raw, "set_access_token"):
-                        client._raw.set_access_token(token)
-            except Exception:
-                pass
-            self._client = client
-            self._pf_client_created = True
-            self._pf_client_source = f"{broker}_env_token_client"
-            self._pf_auth_trace("client_create_success", old_status=str(state.get("_pf_last_auth_status") or ""), broker=broker, client_exists=True, token_hash_prefix=token_hash, poll_cycle_id=poll_cycle_id)
-            if broker == "dhan" and hasattr(client, "auth_status") and client.auth_status() not in {"AUTH_OK", "UNKNOWN"}:
-                return None, client.auth_status(), getattr(client, "_init_error", "") or "Dhan client is not ready"
-            return client, f"created_{broker}_data_client", ""
-        except Exception as e:
-            self._pf_client_created = False
-            self._pf_client_source = "none"
-            self._pf_auth_trace("client_create_failed", old_status=str(state.get("_pf_last_auth_status") or ""), broker=broker, error=str(e), poll_cycle_id=poll_cycle_id)
-            return None, "BROKER_CLIENT_INIT_FAILED", str(e)
-
-    def _pf_validate_broker_auth_readonly(self, client) -> tuple[str, str, float | None]:
-        """Legacy direct call path; delegates to state."""
-        self._pf_sync_legacy_to_auth_state()
-        st = self._pf_auth_state
-        broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        token = (os.getenv("DHAN_ACCESS_TOKEN" if broker == "dhan" else "MSTOCK_ACCESS_TOKEN") or "").strip()
-        checked_ts = datetime.now(timezone.utc).isoformat()
-        poll_cycle_id = int(getattr(self, "_pf_poll_cycle_id", 0) or 0)
-        token_hash = self._pf_token_hash_prefix(token) if token else ""
-        st.validation_in_progress = True
-        st.validation_started_ts = checked_ts
-        verifier_name = "verify_dhan_token_read_only" if broker == "dhan" else "verify_mstock_token_read_only"
-        self._pf_auth_trace("verify_endpoint_start", old_status=st.status, endpoint=verifier_name, broker=broker, token_hash_prefix=token_hash, client_exists=bool(client), poll_cycle_id=poll_cycle_id)
-        if not token:
-            st.set_terminal("TOKEN_MISSING", "No access token configured", "none")
-            print("[PAPER-FWD-AUTH] token_present=false client_created=false validation_endpoint=none status=TOKEN_MISSING")
-            self._pf_auth_trace("verify_endpoint_failed", old_status="VERIFYING_BROKER_TOKEN", new_status=st.status, error=st.error, endpoint="none", poll_cycle_id=poll_cycle_id)
-            self._pf_auth_trace("verify_final_status", status=st.status, attempted=True, in_progress=False, token_present=False, poll_cycle_id=poll_cycle_id)
-            self._pf_sync_auth_state_to_legacy()
-            return st.status, st.error, None
-        if client is None:
-            st.set_terminal("BROKER_CLIENT_INIT_FAILED", "Broker client construction failed", "none")
-            print(f"[PAPER-FWD-AUTH] token_present=true client_created=false validation_endpoint=none status={st.status} error={st.error}")
-            self._pf_auth_trace("verify_endpoint_failed", old_status="VERIFYING_BROKER_TOKEN", new_status=st.status, error=st.error, endpoint="none", poll_cycle_id=poll_cycle_id)
-            self._pf_auth_trace("verify_final_status", status=st.status, attempted=True, in_progress=False, token_present=bool(token), token_hash_prefix=token_hash, client_exists=False, poll_cycle_id=poll_cycle_id)
-            self._pf_sync_auth_state_to_legacy()
-            return st.status, st.error, None
-        try:
-            self._pf_auth_trace("verify_start", old_status=st.status, new_status="VERIFYING_BROKER_TOKEN", auth_validation_in_progress=True, token_hash_prefix=token_hash, client_exists=True, poll_cycle_id=poll_cycle_id)
-            result = verify_dhan_token_read_only(client) if broker == "dhan" else verify_mstock_token_read_only(client)
-            self._pf_auth_trace("verify_endpoint_success" if (result and result.ok) else "verify_endpoint_failed", old_status="VERIFYING_BROKER_TOKEN", new_status=(result.status if result.ok else result.status), endpoint=getattr(result, 'endpoint_used', ''), error=(getattr(result, 'error_message', '') if not getattr(result, 'ok', False) else ''), poll_cycle_id=poll_cycle_id)
-        finally:
-            st.validation_in_progress = False
-            st.validation_attempted = True
-        status = result.status if result.ok else f"{result.status}:{result.error_message[:120]}"
-        error = result.error_message
-        st.set_terminal(status, error, result.endpoint_used)
-        self._pf_auth_trace("verify_final_status", status=st.status, attempted=True, in_progress=False, token_present=bool(token), token_hash_prefix=token_hash, client_exists=True, endpoint=result.endpoint_used, error=error if not result.ok else "", poll_cycle_id=poll_cycle_id)
-        self._pf_sync_auth_state_to_legacy()
-        return st.status, st.error, result.spot
-
-    def _pf_enforce_auth_timeout(self) -> None:
-        self._pf_sync_legacy_to_auth_state()
-        st = self._pf_auth_state
-        poll_cycle_id = int(getattr(self, "_pf_poll_cycle_id", 0) or 0)
-        if not st.validation_in_progress:
-            return
-        timeout = float(os.getenv("AUTH_VERIFY_TIMEOUT_SEC", os.getenv("PAPER_FORWARD_AUTH_TIMEOUT_SEC", "10") or 10))
-        started = str(st.validation_started_ts or "")
-        try:
-            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(started.replace("Z", "+00:00"))).total_seconds()
-        except Exception:
-            elapsed = timeout + 1
-        if elapsed > timeout:
-            old = st.status
-            st.set_terminal("AUTH_FAILED", "auth_validation_timeout", "auth_validation")
-            self._pf_auth_trace("auth_timeout", old_status=old, new_status=st.status, auth_validation_attempted=True, auth_validation_in_progress=False, token_hash_prefix=st.token_hash, poll_cycle_id=poll_cycle_id)
-            self._pf_sync_auth_state_to_legacy()
-
-    def _option_chain_cache_counts(self) -> dict:
-        def _count(obj: Any) -> int:
-            try:
-                if obj is None:
-                    return 0
-                if hasattr(obj, "to_dict") and hasattr(obj, "columns"):
-                    return len(obj)
-                if isinstance(obj, dict):
-                    for key in ("option_chain", "optionChain", "option_chain_data", "rows", "data", "records", "values", "result", "oc"):
-                        val = obj.get(key)
-                        if isinstance(val, (list, tuple)):
-                            return len(val)
-                    return 1 if any(k in obj for k in ("strike", "strikePrice", "strike_price", "option_type", "CE", "PE", "symbol", "tradingsymbol")) else 0
-                if isinstance(obj, (list, tuple)):
-                    return len([r for r in obj if isinstance(r, dict)])
-            except Exception:
-                return 0
-            return 0
-
-        state = getattr(self, "__dict__", {})
-        scalper = state.get("_scalper") or state.get("scalper")
-        return {
-            "ui__latest_option_chain_rows": _count(getattr(self, "_latest_option_chain_rows", None)),
-            "ui__option_chain_data": _count(getattr(self, "_option_chain_data", None)),
-            "ui_option_chain_data": _count(getattr(self, "option_chain_data", None)),
-            "ui_latest_option_chain": _count(getattr(self, "latest_option_chain", None)),
-            "ui__latest_option_chain_cache": _count(getattr(self, "_latest_option_chain_cache", None)),
-            "ui__last_option_chain_rows": _count(getattr(self, "_last_option_chain_rows", None)),
-            "ui__paper_forward_option_chain_rows": _count(getattr(self, "_paper_forward_option_chain_rows", None)),
-            "scalper__option_chain_data": _count(getattr(scalper, "_option_chain_data", None) if scalper is not None else None),
-            "scalper_option_chain_data": _count(getattr(scalper, "option_chain_data", None) if scalper is not None else None),
-            "scalper_latest_option_chain": _count(getattr(scalper, "latest_option_chain", None) if scalper is not None else None),
-        }
-
-    def _normalize_option_chain_rows(self, raw, *, resolved_spot: float | None = None):
-        """
-        Convert broker-specific option-chain response into list[dict].
-        Robust to int, bad types from candle-only updates (BLOCKER 1).
-        """
-        if raw is None or isinstance(raw, (int, float, str, bool)):
-            print(f"[OC-NORMALIZE-WARN] invalid_chain_type type={type(raw)} source=unknown")
-            return []
-        raw_type = type(raw).__name__
-        try:
-            raw_len = len(raw) if raw is not None and hasattr(raw, "__len__") else 0
-        except Exception:
-            raw_len = 0
-
-        def _df_to_rows(obj: Any) -> list:
-            if hasattr(obj, "to_dict") and hasattr(obj, "columns"):
-                try:
-                    return obj.to_dict("records")
-                except Exception:
-                    return []
-            return []
-
-        def _extract(obj: Any, depth: int = 0) -> list:
-            if obj is None or depth > 8:
-                return []
-            df_rows = _df_to_rows(obj)
-            if df_rows:
-                return df_rows
-            if isinstance(obj, (list, tuple)):
-                out = []
-                for item in obj:
-                    if isinstance(item, dict) and ("CE" in item or "PE" in item):
-                        strike = item.get("strike") or item.get("strikePrice") or item.get("strike_price")
-                        for opt_type in ("CE", "PE"):
-                            leg = item.get(opt_type)
-                            if isinstance(leg, dict):
-                                row = dict(leg)
-                                row.setdefault("strike", strike)
-                                row.setdefault("option_type", opt_type)
-                                out.append(row)
-                        continue
-                    nested = _extract(item, depth + 1)
-                    if nested:
-                        out.extend(nested)
-                    elif isinstance(item, dict):
-                        out.append(item)
-                return out
-            if isinstance(obj, dict):
-                if "CE" in obj or "PE" in obj:
-                    strike = obj.get("strike") or obj.get("strikePrice") or obj.get("strike_price")
-                    out = []
-                    for opt_type in ("CE", "PE"):
-                        leg = obj.get(opt_type)
-                        if isinstance(leg, dict):
-                            row = dict(leg)
-                            row.setdefault("strike", strike)
-                            row.setdefault("option_type", opt_type)
-                            out.append(row)
-                    if out:
-                        return out
-                for key in ("option_chain", "optionChain", "option_chain_data", "data", "records", "oc", "result", "values", "rows"):
-                    if key in obj:
-                        nested = _extract(obj.get(key), depth + 1)
-                        if nested:
-                            return nested
-                return [obj] if any(k in obj for k in ("strike", "strikePrice", "strike_price", "option_type", "type", "symbol", "tradingsymbol", "tsym")) else []
-            return []
-
-        def _first(row: dict, keys: tuple[str, ...]):
-            for key in keys:
-                val = row.get(key)
-                if val not in (None, ""):
-                    return val
-            return None
-
-        rows = []
-        for item in _extract(raw):
-            if not isinstance(item, dict):
-                print(f"[OC-NORMALIZE-WARN] invalid row type={type(item)} ")
-                continue
-            out = dict(item)
-            symbol = _first(out, ("symbol", "trading_symbol", "tradingsymbol", "tradingSymbol", "tsym", "tokenName"))
-            strike = _first(out, ("strike", "strike_price", "strikePrice"))
-            opt_type = _first(out, ("option_type", "type", "opt_type", "ce_pe", "right", "optionType"))
-            expiry = _first(out, ("expiry", "expiry_date", "expiryDate", "expDate"))
-            ltp = _first(out, ("ltp", "LTP", "last_price", "lastPrice", "last_price_value", "last_traded_price", "lastTradedPrice", "close", "traded_price", "option_ltp"))
-            bid = _first(out, ("bid", "best_bid", "best_bid_price", "bid_price", "bidPrice"))
-            ask = _first(out, ("ask", "best_ask", "best_ask_price", "ask_price", "askPrice", "offer"))
-            token = _first(out, ("token", "symbolToken", "symboltoken", "instrumentToken", "instrumenttoken", "instrument_token", "security_id", "securityId", "securityid", "scrip_token", "scripToken"))
-            volume = _first(out, ("volume", "traded_volume", "tradedVolume", "totalTradedVolume"))
-            oi = _first(out, ("oi", "open_interest", "openInterest"))
-            spot_value = None
-            spot_source = ""
-            if resolved_spot is not None and is_valid_nifty_underlying_spot(resolved_spot):
-                spot_value = float(resolved_spot)
-                spot_source = "resolved_nifty_spot"
-            else:
-                for key in ("underlying_price", "underlyingValue", "underlying_value", "underlying_ltp", "spot"):
-                    candidate = _to_float_or_none(out.get(key))
-                    if candidate is not None and is_valid_nifty_underlying_spot(candidate):
-                        spot_value = candidate
-                        spot_source = f"row.{key}"
-                        break
-            if opt_type is None:
-                text = str(symbol or out.get("name") or "").upper()
-                if text.endswith("CE"):
-                    opt_type = "CE"
-                elif text.endswith("PE"):
-                    opt_type = "PE"
-            opt_text = str(opt_type or "").strip().upper()
-            if opt_text in ("CALL", "C"):
-                opt_text = "CE"
-            elif opt_text in ("PUT", "P"):
-                opt_text = "PE"
-            if symbol not in (None, ""):
-                out.setdefault("symbol", symbol)
-                out.setdefault("trading_symbol", symbol)
-            if strike not in (None, ""):
-                out.setdefault("strike", strike)
-                out.setdefault("strike_price", strike)
-            if opt_text:
-                out.setdefault("option_type", opt_text)
-                out.setdefault("type", opt_text)
-            if expiry not in (None, ""):
-                out.setdefault("expiry", expiry)
-                out.setdefault("expiry_date", expiry)
-            if ltp not in (None, ""):
-                out.setdefault("ltp", ltp)
-                out.setdefault("last_price", ltp)
-                out.setdefault("option_ltp", ltp)
-                out.setdefault("ctx_option_price", ltp)
-            if bid not in (None, ""):
-                out.setdefault("bid", bid)
-                out.setdefault("best_bid", bid)
-            if ask not in (None, ""):
-                out.setdefault("ask", ask)
-                out.setdefault("best_ask", ask)
-            if token not in (None, ""):
-                out.setdefault("token", token)
-                out.setdefault("symbolToken", token)
-                out.setdefault("security_id", token)
-            exch = _first(out, ("exchange", "exch_seg", "exch", "segment"))
-            if exch not in (None, ""):
-                out.setdefault("exchange", str(exch).strip().upper())
-            elif str(opt_text or "").upper() in ("CE", "PE"):
-                out.setdefault("exchange", "NFO")
-            if volume not in (None, ""):
-                out.setdefault("volume", volume)
-            if oi not in (None, ""):
-                out.setdefault("oi", oi)
-                out.setdefault("open_interest", oi)
-            opt_premium = _to_float_or_none(ltp) or option_premium_from_row(out)
-            if opt_premium is None:
-                out["chain_source"] = out.get("chain_source") or "CONTRACT_MASTER_ONLY"
-                out["marking_allowed"] = False
-            if spot_value is not None:
-                out = apply_resolved_spot_to_option_row(out, spot_value, option_ltp=opt_premium)
-                out["_spot_source"] = spot_source
-            elif opt_premium is not None:
-                out["ltp"] = opt_premium
-                out["option_ltp"] = opt_premium
-                out["ctx_option_price"] = opt_premium
-                out.setdefault("last_price", opt_premium)
-            for greek in ("iv", "delta", "gamma", "theta", "vega"):
-                val = _first(out, (greek, greek.upper()))
-                if val not in (None, ""):
-                    out.setdefault(greek, val)
-            rows.append(out)
-
-        print(f"[OC-NORMALIZE] raw_type={raw_type} raw_len={raw_len} normalized_rows={len(rows)}")
-        if rows:
-            print(f"[OC-NORMALIZE] sample_keys={sorted(list(rows[0].keys()))[:30]}")
-            log_option_row_check(rows[0], resolved_spot=resolved_spot)
-        return rows
-
-    def _set_latest_option_chain_cache(self, rows, source: str = "", reason: str = ""):
-        """
-        Normalize and store latest option chain rows in every location used by:
-        - Live Dashboard
-        - Live Chart
-        - Paper Forward Monitor
-        - Candidate Promotion
-        - Footer / telemetry
-        """
-        error = None
-        try:
-            normalized = self._normalize_option_chain_rows(rows)
-        except Exception as exc:
-            normalized = []
-            error = f"{type(exc).__name__}: {exc}"
-            reason = reason or error
-        status = "OK" if normalized else "EMPTY"
-        try:
-            state = object.__getattribute__(self, "__dict__")
-        except Exception:
-            state = {}
-        lock = state.get("_market_data_lock")
-        if lock is None:
-            lock = threading.RLock()
-            self._market_data_lock = lock
-        with lock:
-            for attr in (
-                "_option_chain_data",
-                "option_chain_data",
-                "latest_option_chain",
-                "_latest_option_chain",
-                "_latest_option_chain_rows",
-                "_latest_option_chain_cache",
-                "_last_option_chain_rows",
-                "_paper_forward_option_chain_rows",
-            ):
-                try:
-                    setattr(self, attr, list(normalized))
-                except Exception:
-                    pass
-            scalper = state.get("_scalper") or state.get("scalper")
-            if scalper is not None:
-                for attr in ("_option_chain_data", "option_chain_data", "latest_option_chain", "_option_chain_cache", "_last_option_chain"):
-                    try:
-                        setattr(scalper, attr, list(normalized))
-                    except Exception:
-                        pass
-            self._last_option_chain_status = status
-            self._last_option_chain_rows_count = len(normalized)
-            self._last_option_chain_source = source
-            self._last_option_chain_reason = reason
-            self._last_option_chain_ts = datetime.now()
-            self._last_snapshot_update_ts = self._last_option_chain_ts.strftime("%H:%M:%S")
-            self._last_option_chain_error = error
-            rt = state.get("_pf_runtime")
-            if rt is not None and normalized:
-                rt.option_chain = list(normalized)
-                rt.option_chain_rows = len(normalized)
-                rt.option_chain_expiry = next((r.get("expiry") or r.get("expiry_date") for r in normalized if isinstance(r, dict) and (r.get("expiry") or r.get("expiry_date"))), rt.option_chain_expiry)
-                chain_spot, chain_spot_source = derive_spot_from_option_chain_payload(normalized)
-                live_spot = float(getattr(self, "_spot_ltp_live", 0.0) or 0.0)
-                if self._pf_live_spot_is_fresh() and is_valid_nifty_underlying_spot(live_spot):
-                    rt.spot = live_spot
-                    sample_ltp = option_premium_from_row(normalized[0]) if normalized else None
-                    validate_and_log_spot_integrity(
-                        snapshot_spot=live_spot,
-                        chain_spot=chain_spot,
-                        option_ltp=sample_ltp,
-                        row=normalized[0] if normalized else None,
-                    )
-                    print(
-                        f"[PF-DATA] spot_source=live_ltp_authoritative spot={live_spot:.2f} "
-                        f"chain_spot={chain_spot if chain_spot is not None else 'n/a'}"
-                    )
-                elif chain_spot is not None and is_valid_nifty_underlying_spot(chain_spot):
-                    rt.spot = chain_spot
-                    self._spot_ltp_live = chain_spot
-                    self.ui_call(self._safe_label_set, getattr(self, "_dash_spot_var", None), f"{chain_spot:.2f}", tab="paper_forward")
-                    validate_and_log_spot_integrity(
-                        snapshot_spot=chain_spot,
-                        chain_spot=chain_spot,
-                        option_ltp=option_premium_from_row(normalized[0]) if normalized else None,
-                        row=normalized[0] if normalized else None,
-                    )
-                    print(f"[PF-DATA] spot_source={chain_spot_source} spot={chain_spot}")
-                elif live_spot > 0 and is_valid_nifty_underlying_spot(live_spot):
-                    rt.spot = live_spot
-                    validate_and_log_spot_integrity(
-                        snapshot_spot=live_spot,
-                        chain_spot=chain_spot,
-                        option_ltp=option_premium_from_row(normalized[0]) if normalized else None,
-                    )
-                    print(f"[PF-DATA] spot_source=stale_live_spot spot={live_spot:.2f} chain_spot_invalid={chain_spot}")
-        broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        print(f"[OC-CACHE] source={source} rows={len(normalized)} status={status} reason={reason}")
-        print(
-            f"[PF-CHAIN-SOURCE] source={source or '-'} raw_rows={len(rows) if isinstance(rows, (list, tuple)) else 0} "
-            f"normalized_rows={len(normalized)} broker={broker}"
-        )
-        # TASK 4+6: also write canonical PF cache (already done above) + rich top-bar status + [PF-CHAIN-CACHE-WRITE]
-        try:
-            ce = sum(1 for r in normalized if str(r.get("option_type", "")).upper() == "CE")
-            pe = sum(1 for r in normalized if str(r.get("option_type", "")).upper() == "PE")
-            strikes = len({r.get("strike_price") or r.get("strike") for r in normalized if (r.get("strike_price") or r.get("strike"))})
-            atm = ""
-            # last refresh ts
-            ts_str = ""
-            try:
-                ts = getattr(self, "_last_option_chain_ts", None)
-                if ts:
-                    ts_str = ts.strftime("%H:%M:%S") if hasattr(ts, "strftime") else str(ts)[:8]
-            except Exception:
-                ts_str = ""
-            is_bs_synth = (
-                str(source or "").upper() == BS_CHAIN_SOURCE
-                or (normalized and bool(normalized[0].get("synthetic")))
-            )
-            if normalized:
-                if is_bs_synth:
-                    label = f"BS SYNTH rows={len(normalized)} CE={ce} PE={pe}"
-                else:
-                    label = f"READY rows={len(normalized)} CE={ce} PE={pe}"
-                if ts_str:
-                    label += f" @ {ts_str}"
-                self.ui_call(self._safe_label_set, getattr(self, "_option_chain_status_var", None), label, tab="paper_forward")
-                print(f"[PF-CHAIN-CACHE-WRITE] source={source or broker} rows={len(normalized)} ts={ts_str or 'now'} ce={ce} pe={pe} strikes={strikes}")
-            else:
-                self.ui_call(
-                    self._safe_label_set,
-                    getattr(self, "_option_chain_status_var", None),
-                    f"EMPTY reason={reason or 'OPTION_CHAIN_EMPTY_RESPONSE'}",
-                    tab="paper_forward",
-                )
-        except Exception:
-            pass
-        try:
-            last_ts = datetime.now().strftime("%H:%M:%S")
-            if normalized:
-                if is_bs_synth:
-                    text = f"BS SYNTH rows={len(normalized)} CE={ce} PE={pe} at {last_ts}"
-                else:
-                    text = f"{broker}: DATA_OK rows={len(normalized)} at {last_ts}"
-            else:
-                fallback_reason = reason or ("DHAN_OPTION_CHAIN_UNAVAILABLE" if broker == "dhan" else "MSTOCK_EMPTY_RESPONSE")
-                text = f"{broker}: {fallback_reason} rows=0 at {last_ts}"
-            self.after(0, lambda t=text: self._option_chain_status_var.set(t))
-        except Exception:
-            pass
-        return list(normalized)
-
-    def _get_cached_option_chain_rows(self) -> tuple[list[dict], str]:
-        lock = getattr(self, "_market_data_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._market_data_lock = lock
-        with lock:
-            sources = [
-                ("ui._paper_forward_option_chain_rows", getattr(self, "_paper_forward_option_chain_rows", None)),
-                ("ui._latest_option_chain_rows", getattr(self, "_latest_option_chain_rows", None)),
-                ("ui._last_option_chain_rows", getattr(self, "_last_option_chain_rows", None)),
-                ("ui._latest_option_chain_cache", getattr(self, "_latest_option_chain_cache", None)),
-                ("ui._option_chain_data", getattr(self, "_option_chain_data", None)),
-                ("ui.option_chain_data", getattr(self, "option_chain_data", None)),
-                ("ui.latest_option_chain", getattr(self, "latest_option_chain", None)),
-            ]
-            state = getattr(self, "__dict__", {})
-            scalper = state.get("_scalper") or state.get("scalper")
-            if scalper is not None:
-                sources.extend([
-                    ("scalper._option_chain_data", getattr(scalper, "_option_chain_data", None)),
-                    ("scalper.option_chain_data", getattr(scalper, "option_chain_data", None)),
-                    ("scalper.latest_option_chain", getattr(scalper, "latest_option_chain", None)),
-                    ("scalper._option_chain_cache", getattr(scalper, "_option_chain_cache", None)),
-                    ("scalper._last_option_chain", getattr(scalper, "_last_option_chain", None)),
-                ])
-        for source, raw in sources:
-            rows = self._normalize_option_chain_rows(raw)
-            print(
-                f"[PF-CHAIN-SOURCE] source={source} raw_rows={len(raw) if isinstance(raw, (list, tuple)) else 0} "
-                f"normalized_rows={len(rows)} broker={self._selected_broker() if hasattr(self, '_selected_broker') else _normalize_broker_name()}"
-            )
-            if rows:
-                return rows, source
-        return [], ""
-
-    def _pf_enrich_option_chain_tokens(self, rows: list[dict], *, client=None) -> list[dict]:
-        if not rows:
-            return rows
-        sm = None
-        if client is not None and hasattr(client, "_get_scripmaster"):
-            try:
-                sm = client._get_scripmaster()
-            except Exception:
-                sm = None
-        if sm is None:
-            return rows
-        try:
-            from scripmaster import contract_dict_from_scrip_row, parse_option_tradingsymbol
-        except Exception:
-            try:
-                from src.scripmaster import contract_dict_from_scrip_row, parse_option_tradingsymbol  # type: ignore
-            except Exception:
-                return rows
-        enriched_n = 0
-        for out in rows:
-            if not isinstance(out, dict):
-                continue
-            tok = str(
-                out.get("token")
-                or out.get("symbolToken")
-                or out.get("security_id")
-                or ""
-            ).strip()
-            if tok and tok.isdigit():
-                continue
-            sym = str(out.get("trading_symbol") or out.get("symbol") or out.get("tradingsymbol") or "")
-            row = None
-            if sym and hasattr(sm, "lookup_option_contract"):
-                row = sm.lookup_option_contract(tradingsymbol=sym, exch="NFO")
-            if row is None and sym:
-                parsed = parse_option_tradingsymbol(sym)
-                if parsed and hasattr(sm, "lookup_option_contract"):
-                    row = sm.lookup_option_contract(
-                        underlying=str(parsed.get("underlying") or ""),
-                        expiry=parsed.get("expiry"),
-                        strike=parsed.get("strike"),
-                        option_type=str(parsed.get("option_type") or ""),
-                        exch="NFO",
-                    )
-            if row is None:
-                try:
-                    strike_i = int(float(out.get("strike_price") or out.get("strike") or 0))
-                except Exception:
-                    strike_i = None
-                exp_raw = out.get("expiry") or out.get("expiry_date")
-                exp_date = None
-                if exp_raw and hasattr(sm, "lookup_option_contract"):
-                    try:
-                        from scripmaster import _parse_date
-                        exp_date = _parse_date(exp_raw)
-                    except Exception:
-                        exp_date = None
-                opt = str(out.get("option_type") or out.get("type") or "").upper()
-                if strike_i and exp_date:
-                    row = sm.lookup_option_contract(
-                        underlying=str(out.get("symbol_root") or "NIFTY"),
-                        expiry=exp_date,
-                        strike=strike_i,
-                        option_type=opt,
-                        exch="NFO",
-                    )
-            if row is not None:
-                payload = contract_dict_from_scrip_row(row)
-                for k, v in payload.items():
-                    if v in (None, ""):
-                        continue
-                    if k in ("trading_symbol", "symbol", "tradingsymbol", "token", "symbolToken", "security_id", "exchange"):
-                        out[k] = v
-                    elif not out.get(k):
-                        out[k] = v
-                enriched_n += 1
-        if enriched_n:
-            print(f"[OC-TOKEN-ENRICH] rows={len(rows)} enriched={enriched_n}")
-        return rows
-
-    def _pf_chain_spot_valid(self, chain, spot=None) -> bool:
-        if spot is not None and is_valid_nifty_underlying_spot(spot):
-            return True
-        if not chain:
-            return False
-        chain_spot, _ = derive_spot_from_option_chain_payload(chain)
-        if chain_spot is not None:
-            return is_valid_nifty_underlying_spot(chain_spot)
-        if isinstance(chain, list) and chain and isinstance(chain[0], dict):
-            row_spot = chain[0].get("spot") or chain[0].get("underlying_price")
-            return is_valid_nifty_underlying_spot(row_spot)
-        return False
-
-    def _pf_infer_data_quality(
-        self,
-        *,
-        option_rows: int,
-        candle_count: int,
-        spot,
-        chain=None,
-        chain_source: str = "",
-        synthetic: bool = False,
-        candle_source: str = "",
-        synthetic_candles: bool = False,
-        broker_ltp_used: bool = False,
-    ) -> str:
-        return infer_paper_forward_data_quality(
-            option_rows=option_rows,
-            candle_count=candle_count,
-            spot=spot,
-            chain_source=chain_source,
-            synthetic=synthetic,
-            candle_source=candle_source or str(getattr(self, "_last_candle_source", "") or ""),
-            synthetic_candles=synthetic_candles,
-            broker_ltp_used=broker_ltp_used,
-            chain_spot_valid=self._pf_chain_spot_valid(chain, spot),
-        )
-
-    def _pf_normalize_option_chain_rows(self, chain, spot=None, *, client=None) -> list[dict]:
-        resolved = _to_float_or_none(spot)
-        if resolved is not None and not is_valid_nifty_underlying_spot(resolved):
-            resolved = None
-        rows = self._normalize_option_chain_rows(chain, resolved_spot=resolved)
-        if resolved is not None:
-            rows = [
-                apply_resolved_spot_to_option_row(
-                    out,
-                    resolved,
-                    option_ltp=option_premium_from_row(out),
-                )
-                for out in rows
-            ]
-        rows = self._pf_enrich_option_chain_tokens(rows, client=client)
-        return rows
-
-    def _pf_is_live_spot_source(self, source: str = "") -> bool:
-        src = str(source or "").strip().lower()
-        return src in {"mstock_ltp", "dhan_ltp"} or src.endswith("_ltp")
-
-    def _pf_live_spot_is_fresh(self, max_age_sec: float | None = None) -> bool:
-        try:
-            spot = float(getattr(self, "_spot_ltp_live", 0.0) or 0.0)
-            ts = float(getattr(self, "_spot_ltp_live_ts", 0.0) or 0.0)
-            if spot <= 0 or ts <= 0:
-                return False
-            if max_age_sec is None:
-                max_age_sec = float(getattr(self, "_spot_live_stale_sec", 3.0) or 3.0)
-            return (time.time() - ts) <= float(max_age_sec)
-        except Exception:
-            return False
-
-    def resolve_live_spot_for_paper_forward(self, *, client=None, current=None, chain=None, candles=None, prefer_live_quote: bool = False) -> dict:
-        """Central Paper Forward spot resolver (UI wrapper)."""
-        try:
-            state = object.__getattribute__(self, "__dict__")
-        except Exception:
-            state = {}
-        broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        result = resolve_live_spot_for_paper_forward(
-            app_state=state,
-            client=client or state.get("_client"),
-            broker=broker,
-            current=current,
-            chain=chain,
-            candles=candles,
-            spot_quote_key_fn=self._spot_quote_key,
-            allow_option_chain_spot=False,
-            prefer_live_quote=prefer_live_quote,
-        )
-        if result.ok and result.spot is not None:
-            self._spot_ltp_live = float(result.spot)
-            self._last_spot_source = result.source
-            if self._pf_is_live_spot_source(result.source):
-                self._spot_ltp_live_ts = float(time.time())
-            rt = state.get("_pf_runtime")
-            if rt is not None:
-                rt.spot = float(result.spot)
-            self.ui_call(self._safe_label_set, getattr(self, "_dash_spot_var", None), f"{float(result.spot):.2f}", tab="paper_forward")
-            if not result.stale:
-                write_spot_cache(float(result.spot), result.source)
-        return result.as_dict()
-
-    def _pf_apply_resolved_spot(self, spot: float | None, source: str = "") -> None:
-        if spot in (None, "", 0, 0.0):
-            return
-        try:
-            state = object.__getattribute__(self, "__dict__")
-        except Exception:
-            state = {}
-        self._spot_ltp_live = float(spot)
-        if source:
-            self._last_spot_source = source
-        if self._pf_is_live_spot_source(source):
-            self._spot_ltp_live_ts = float(time.time())
-        rt = state.get("_pf_runtime")
-        if rt is not None:
-            rt.spot = float(spot)
-        self.ui_call(self._safe_label_set, getattr(self, "_dash_spot_var", None), f"{float(spot):.2f}", tab="paper_forward")
-        self._pf_clear_stale_spot_block_reasons()
-
-    def _pf_clear_stale_spot_block_reasons(self) -> None:
-        stale = {
-            "spot_missing", "WAITING_FOR_SPOT", "WAITING_FOR_MARKET_DATA", "option_chain_empty",
-            "WAITING_FOR_OPTION_CHAIN_FETCH", "WAITING_FOR_OPTION_CHAIN", "EMPTY_RESPONSE",
-            "OPTION_CHAIN_EMPTY_RESPONSE",
-        }
-        try:
-            for c in getattr(self, "pf_candidates", []) or []:
-                lr = str(c.get("last_reason", "") or c.get("disabled_reason", "") or "")
-                if lr in stale or lr.lower() in {s.lower() for s in stale}:
-                    c["last_reason"] = "synthetic_chain_ready"
-                    c["disabled_reason"] = ""
-        except Exception:
-            pass
-        eng = getattr(self, "pf_engine", None)
-        if eng is not None and hasattr(eng, "_state"):
-            try:
-                for cid, st in eng._state.items():
-                    r = str(st.get("last_no_trade_reason", "") or "")
-                    if r in stale or r.lower() in {s.lower() for s in stale}:
-                        st["last_no_trade_reason"] = "synthetic_chain_ready"
-            except Exception:
-                pass
-
-    def _pf_try_synthetic_option_chain(
-        self,
-        *,
-        broker: str,
-        spot: float | None,
-        expiry: str,
-        candles: list | None = None,
-        client=None,
-    ) -> tuple[list[dict], str, str, str]:
-        """Generate Black-Scholes synthetic chain when broker returns empty (paper/sim only)."""
-        if not is_synthetic_chain_enabled(broker):
-            return [], "EMPTY_RESPONSE", "synthetic_chain_disabled", expiry
-        spot_f = _to_float_or_none(spot)
-        if spot_f is None or spot_f <= 0:
-            resolved = self.resolve_live_spot_for_paper_forward(client=client, candles=candles)
-            spot_f = _to_float_or_none(resolved.get("spot"))
-        if spot_f is None or spot_f <= 0:
-            print("[BS-CHAIN-GENERATE] blocked reason=no_spot")
-            return [], "BLOCKED_NO_SPOT", "synthetic_chain_requires_spot", expiry
-        if not expiry:
-            print("[BS-CHAIN-GENERATE] blocked reason=no_expiry")
-            return [], "BLOCKED_NO_EXPIRY", "synthetic_chain_requires_expiry", expiry
-        try:
-            rows, meta = generate_synthetic_option_chain(
-                spot=spot_f,
-                expiry=expiry,
-                candles=candles or getattr(self, "_latest_candles", None) or [],
-                underlying=os.getenv("MSTOCK_UNDERLYING", "NIFTY") or "NIFTY",
-            )
-        except Exception as exc:
-            print(f"[BS-CHAIN-GENERATE] error={exc}")
-            return [], "SYNTHETIC_CHAIN_FAILED", str(exc), expiry
-        if not rows:
-            return [], "EMPTY_RESPONSE", "synthetic_chain_empty", expiry
-        source = BS_CHAIN_SOURCE
-        rows = self._pf_normalize_option_chain_rows(rows, spot=spot_f)
-        rows = self._set_latest_option_chain_cache(rows, source=source, reason="black_scholes_synthetic")
-        self._last_synthetic_chain_meta = meta
-        self._chain_source = source
-        self._synthetic_chain_active = True
-        client = getattr(self, "_client", None)
-        if client is not None:
-            client._paper_forward_chain_source = source  # type: ignore[attr-defined]
-            client._live_order_allowed = False  # type: ignore[attr-defined]
-        ce = sum(1 for r in rows if str(r.get("option_type", "")).upper() == "CE")
-        pe = sum(1 for r in rows if str(r.get("option_type", "")).upper() == "PE")
-        print(f"[PF-CHAIN-CACHE-WRITE] source={source} rows={len(rows)} ce={ce} pe={pe}")
-        print(f"[MSTOCK-CHAIN-FETCH] status=EMPTY_RESPONSE rows=0 -> synthetic_fallback rows={len(rows)}")
-        return rows, "SYNTHETIC_CHAIN_OK", "", str(meta.get("expiry") or expiry)
-
-    def _pf_ensure_mstock_synthetic_chain_if_needed(
-        self,
-        chain: list | None,
-        *,
-        spot=None,
-        candles=None,
-        client=None,
-    ) -> tuple[list[dict], str]:
-        """For mstock + empty real chain: generate BS synthetic chain (paper/sim only)."""
-        if chain and len(chain) > 0:
-            return list(chain), str(getattr(self, "_last_option_chain_source", "") or "cached")
-        broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        if broker != "mstock" or not is_synthetic_chain_enabled(broker):
-            return list(chain or []), "broker_chain_unavailable"
-        cfg = validate_option_chain_config_for_active_broker(broker)
-        expiry = str(
-            cfg.get("selected_expiry")
-            or os.getenv("MSTOCK_OPTION_EXPIRY")
-            or os.getenv("MSTOCK_TARGET_EXPIRY")
-            or ""
-        )
-        synth_rows, synth_status, synth_err, _ = self._pf_try_synthetic_option_chain(
-            broker=broker,
-            spot=spot,
-            expiry=expiry,
-            candles=candles,
-            client=client or getattr(self, "_client", None),
-        )
-        if synth_rows:
-            print(f"[PF-MSTOCK-SYNTH-FALLBACK] status={synth_status} rows={len(synth_rows)} expiry={expiry}")
-            return synth_rows, BS_CHAIN_SOURCE
-        if synth_err:
-            print(f"[PF-MSTOCK-SYNTH-FALLBACK] failed status={synth_status} error={synth_err}")
-        return list(chain or []), "synthetic_unavailable"
-
-    def _pf_fetch_full_option_chain_readonly(self, client, spot=None) -> tuple[list[dict], str, str, str]:
-        broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        try:
-            state = object.__getattribute__(self, "__dict__")
-        except Exception:
-            state = {}
-        ttl = float(getattr(self, "_option_chain_cache_ttl_sec", 10.0) or 10.0)
-        now = time.time()
-        if getattr(self, "_option_chain_fetch_in_progress", False):
-            cached, src = self._get_cached_option_chain_rows()
-            if cached:
-                print(f"[OC-FETCH] skipped reason=fetch_in_progress using_cache rows={len(cached)} source={src}")
-                return cached, "DATA_OK", "", ""
-        elif now - float(getattr(self, "_last_option_chain_fetch_ts", 0.0) or 0.0) < ttl:
-            cached, src = self._get_cached_option_chain_rows()
-            if cached:
-                print(f"[OC-FETCH] skipped reason=cache_ttl ttl_sec={ttl} rows={len(cached)} source={src}")
-                return cached, "DATA_OK", "", ""
-        self._option_chain_fetch_in_progress = True
-        underlying = str(os.getenv("MSTOCK_UNDERLYING") or os.getenv("MSTOCK_SYMBOL") or "NIFTY")
-        if spot in (None, "", 0, 0.0):
-            resolved = self.resolve_live_spot_for_paper_forward(client=client, current=spot)
-            spot = resolved.get("spot")
-            if spot is not None:
-                self._pf_apply_resolved_spot(spot, str(resolved.get("source") or ""))
-        # TASK 1+3+7: auto-sync GUI target expiry + exchange into env
-        try:
-            if hasattr(self, "target_expiry_var"):
-                tgt = str(self.target_expiry_var.get() or "").strip()
-                if tgt and not os.getenv("MSTOCK_OPTION_EXPIRY"):
-                    os.environ["MSTOCK_OPTION_EXPIRY"] = tgt
-                    print(f"[MSTOCK-CONFIG] auto-synced MSTOCK_OPTION_EXPIRY from GUI target_expiry_var={tgt}")
-            if hasattr(self, "_tb_expiry_var"):
-                tbe = str(self._tb_expiry_var.get() or "").strip()
-                if tbe and not os.getenv("MSTOCK_OPTION_EXPIRY"):
-                    os.environ["MSTOCK_OPTION_EXPIRY"] = tbe
-            # Exchange from underlying_exchange_var (common GUI field) or scrip related
-            gui_ex = ""
-            underlying_exchange_var = state.get("underlying_exchange_var")
-            if underlying_exchange_var is not None:
-                gui_ex = str(underlying_exchange_var.get() or "").strip()
-            if gui_ex:
-                gui_norm = str(gui_ex).strip().upper()
-                if gui_norm in {"NSE", "NSECASH", "NSECM"}:
-                    os.environ.setdefault("MSTOCK_UNDERLYING_EXCHANGE_ID", gui_ex)
-                    os.environ.setdefault("MSTOCK_UNDERLYING_EXCHANGE", gui_ex)
-                    os.environ.setdefault("MSTOCK_EXCHANGE", gui_ex)
-                    for k in ("MSTOCK_OPTION_EXCHANGE_ID", "MSTOCK_OPTION_EXCHANGE", "MSTOCK_SCRIPMASTER_EXCH"):
-                        os.environ.setdefault(k, "NFO")
-                    print(f"[MSTOCK-CONFIG] underlying_exchange={gui_ex} option_exchange=NFO (GUI NSE does not override NFO)")
-                elif gui_norm in {"NFO", "NSEFNO", "NSEFO", "5"} and not any(os.getenv(k) for k in ("MSTOCK_OPTION_EXCHANGE_ID", "MSTOCK_OPTION_EXCHANGE", "MSTOCK_SCRIPMASTER_EXCH")):
-                    os.environ["MSTOCK_OPTION_EXCHANGE_ID"] = "NFO"
-                    os.environ["MSTOCK_OPTION_EXCHANGE"] = "NFO"
-                    os.environ["MSTOCK_SCRIPMASTER_EXCH"] = "NFO"
-                    print(f"[MSTOCK-CONFIG] auto-synced option exchange from GUI={gui_ex}")
-        except Exception:
-            pass
-
-        # Central resolve + persist (TASK 1+3)
-        try:
-            from mstock_client import resolve_mstock_option_exchange as _res_ex
-        except Exception:
-            from src.mstock_client import resolve_mstock_option_exchange as _res_ex  # type: ignore
-        gui_ex = ""
-        try:
-            underlying_exchange_var = state.get("underlying_exchange_var")
-            if underlying_exchange_var is not None:
-                gui_ex = str(underlying_exchange_var.get() or "").strip()
-        except Exception:
-            pass
-        ex_res = _res_ex(underlying=underlying, gui_exchange=gui_ex)
-        if ex_res.get("exchange_id"):
-            for k in ("MSTOCK_OPTION_EXCHANGE_ID", "MSTOCK_OPTION_EXCHANGE", "MSTOCK_SCRIPMASTER_EXCH"):
-                if not os.getenv(k):
-                    os.environ[k] = ex_res["exchange_id"]
-            underlying_exchange_var = state.get("underlying_exchange_var")
-            if underlying_exchange_var is not None and not underlying_exchange_var.get():
-                try:
-                    underlying_exchange_var.set(ex_res["exchange_id"])
-                except Exception:
-                    pass
-
-        config_status = validate_option_chain_config_for_active_broker(broker)
-        underlying = str(config_status.get("underlying") or "NIFTY")
-        if client is None:
-            self._option_chain_fetch_in_progress = False
-            return [], "broker_not_authenticated", "broker client is not available", ""
-
-        missing = list(config_status.get("missing_keys") or [])
-        prev_had_exchange_missing = "MSTOCK_OPTION_EXCHANGE_ID" in state.get("_pf_last_missing", [])
-        if missing:
-            # TASK 2+5: specific waiting states
-            if any("EXPIRY" in m.upper() for m in missing):
-                reason = "WAITING_FOR_MSTOCK_EXPIRY"
-            elif any("EXCHANGE" in m.upper() for m in missing):
-                reason = "WAITING_FOR_MSTOCK_EXCHANGE"
-            else:
-                reason = "WAITING_FOR_MSTOCK_CONFIG"
-            msg = f"{reason}: missing_keys={','.join(missing)}"
-            print(f"[PF-CONFIG] broker={broker} status={reason} missing_keys={missing}")
-            self._set_latest_option_chain_cache([], source=f"{broker}_paper_forward_fetch", reason=msg)
-            self._pf_last_missing = missing
-            self._option_chain_fetch_in_progress = False
-            self._last_option_chain_fetch_ts = time.time()
-            return [], reason, msg, str(config_status.get("selected_expiry") or "")
-        else:
-            # TASK 4: if exchange was the blocker and now resolved, force fetch + reset stale reasons
-            if prev_had_exchange_missing or not state.get("_pf_forced_chain_after_exchange", False):
-                print("[PF-STATE-RESET] reason=mstock_exchange_resolved")
-                self._pf_forced_chain_after_exchange = True
-                # Clear stale reasons on candidates
-                try:
-                    for c in getattr(self, "pf_candidates", []) or []:
-                        lr = str(c.get("last_reason", "") or c.get("disabled_reason", "")).upper()
-                        if "DATA_NOT_READY" in lr or "BROKER_CONFIG" in lr or "WAITING_FOR_MSTOCK_EXCHANGE" in lr:
-                            c["last_reason"] = "WAITING_FOR_OPTION_CHAIN_FETCH"
-                            c["disabled_reason"] = ""
-                except Exception:
-                    pass
-                print(f"[PF-START] triggering_option_chain_fetch=true (exchange resolved)")
-        # Even if no missing, proceed to client.get_option_chain (CSV/derive path does not need TOKEN)
-        try:
-            broker_name = type(client).__name__
-            expiry_hint = str(config_status.get("selected_expiry") or "nearest")
-            print(f"[OC-FETCH] broker={broker} client={broker_name} expiry={expiry_hint} underlying={underlying} spot={spot}")
-            try:
-                from mstock_client import route_mstock_exchange
-            except Exception:
-                from src.mstock_client import route_mstock_exchange  # type: ignore
-            if broker == "mstock":
-                route_mstock_exchange("option_chain")
-            chain = client.get_option_chain(underlying) if client is not None and hasattr(client, "get_option_chain") else []
-            rows = self._pf_normalize_option_chain_rows(chain, spot=spot, client=client)
-            if spot in (None, "", 0, 0.0):
-                derived_spot, spot_source = derive_spot_from_option_chain_payload(chain)
-                if derived_spot is None:
-                    derived_spot, spot_source = derive_spot_from_option_chain_payload(rows)
-                if derived_spot is not None and is_valid_nifty_underlying_spot(derived_spot):
-                    spot = derived_spot
-                    rows = [
-                        apply_resolved_spot_to_option_row(
-                            row,
-                            derived_spot,
-                            option_ltp=option_premium_from_row(row),
-                        )
-                        for row in rows
-                    ]
-                    rt = getattr(self, "_pf_runtime", None)
-                    if rt is not None:
-                        rt.spot = derived_spot
-                    self._spot_ltp_live = derived_spot
-                    validate_and_log_spot_integrity(
-                        snapshot_spot=derived_spot,
-                        chain_spot=derived_spot,
-                        option_ltp=option_premium_from_row(rows[0]) if rows else None,
-                    )
-                    print(f"[PF-DATA] spot_source={spot_source} spot={derived_spot}")
-                elif derived_spot is not None:
-                    print(f"[PF-DATA] spot_source=INVALID_UNDERLYING_SPOT rejected={derived_spot}")
-            if rows:
-                rows = self._pf_enrich_option_chain_quotes(client, rows, spot=spot)
-                self._broker_live_option_chain = list(rows)
-                rows = self._set_latest_option_chain_cache(rows, source=f"{broker}_paper_forward_fetch", reason="broker_get_option_chain")
-                expiry = next((r.get("expiry") for r in rows if r.get("expiry")), "")
-                status = "DATA_OK" if len(rows) >= int(os.getenv("PAPER_FORWARD_MIN_OPTION_CHAIN_ROWS", "20")) else "FALLBACK_SINGLE_ROW"
-                print(f"[OC-FETCH] success rows={len(rows)}")
-                print(f"[PAPER-FWD-CHAIN] underlying={underlying} rows={len(rows)} status={status} expiry={expiry or '-'}")
-                self._option_chain_fetch_in_progress = False
-                self._last_option_chain_fetch_ts = time.time()
-                return rows, status, "", str(expiry or "")
-            keys = sorted(list(chain.keys())) if isinstance(chain, dict) else []
-            reason = "DHAN_OPTION_CHAIN_UNAVAILABLE" if broker == "dhan" else "EMPTY_RESPONSE"
-            print(f"[MSTOCK-CHAIN-FETCH] status=EMPTY_RESPONSE rows=0")
-            print(f"[OC-FETCH] empty response keys={keys} reason={reason}:get_option_chain returned no rows")
-            expiry_hint = str(config_status.get("selected_expiry") or os.getenv("MSTOCK_OPTION_EXPIRY") or os.getenv("MSTOCK_TARGET_EXPIRY") or "")
-            candles = getattr(self, "_latest_candles", None) or []
-            if broker == "mstock" and reason == "EMPTY_RESPONSE":
-                synth_rows, synth_status, synth_err, synth_exp = self._pf_try_synthetic_option_chain(
-                    broker=broker,
-                    spot=spot,
-                    expiry=expiry_hint,
-                    candles=candles,
-                    client=client,
-                )
-                if synth_rows:
-                    self._option_chain_fetch_in_progress = False
-                    self._last_option_chain_fetch_ts = time.time()
-                    return synth_rows, synth_status, synth_err, synth_exp
-            self._set_latest_option_chain_cache([], source=f"{broker}_paper_forward_fetch", reason=reason)
-            print(f"[PAPER-FWD-CHAIN] underlying={underlying} rows=0 status={reason} error=get_option_chain returned no rows")
-            self._option_chain_fetch_in_progress = False
-            self._last_option_chain_fetch_ts = time.time()
-            return [], reason, f"{reason}:get_option_chain returned no rows", ""
-        except Exception as e:
-            print(f"[OC-FETCH] error type={type(e).__name__} message={e}")
-            self._last_option_chain_error = f"{type(e).__name__}: {e}"
-            self._set_latest_option_chain_cache([], source="paper_forward_fetch", reason=str(e))
-            print(f"[PAPER-FWD-CHAIN] underlying={underlying} rows=0 status=OPTION_CHAIN_FETCH_FAILED error={e}")
-            self._option_chain_fetch_in_progress = False
-            self._last_option_chain_fetch_ts = time.time()
-            return [], "OPTION_CHAIN_FETCH_FAILED", f"option_chain_http_error:{e}", ""
-
-    def _pf_enrich_option_chain_quotes(self, client, rows: list[dict], spot=None) -> list[dict]:
-        if not rows or client is None or not hasattr(client, "fetch_option_quote_for_paper"):
-            return rows
-        try:
-            if spot in (None, "", 0, 0.0):
-                return rows
-            spot_f = float(spot)
-            with_strike = []
-            for row in rows:
-                try:
-                    with_strike.append((abs(float(row.get("strike") or row.get("strike_price") or 0) - spot_f), row))
-                except Exception:
-                    pass
-            selected = [r for _, r in sorted(with_strike, key=lambda x: x[0])[:44]]
-            enriched = 0
-            for row in selected:
-                token = str(
-                    row.get("token")
-                    or row.get("symbolToken")
-                    or row.get("symboltoken")
-                    or row.get("instrumentToken")
-                    or row.get("instrumenttoken")
-                    or row.get("instrument_token")
-                    or row.get("security_id")
-                    or row.get("securityId")
-                    or row.get("securityid")
-                    or row.get("scrip_token")
-                    or row.get("scripToken")
-                    or ""
-                ).strip()
-                symbol = str(row.get("symbol") or row.get("trading_symbol") or row.get("tradingsymbol") or "").strip()
-                exchange = str(row.get("exchange") or row.get("exch_seg") or "NFO").strip().upper() or "NFO"
-                if not token or not symbol:
-                    continue
-                quote = client.fetch_option_quote_for_paper(exchange, token, symbol) or {}
-                if quote:
-                    for src, dst in (("ltp", "ltp"), ("bid_price", "bid"), ("ask_price", "ask"), ("bid_qty", "bid_qty"), ("ask_qty", "ask_qty")):
-                        if quote.get(src) not in (None, ""):
-                            row[dst] = quote.get(src)
-                    enriched += 1
-            if enriched:
-                print(f"[OC-FALLBACK] building chain from quotes strikes={max(1, len(selected)//2)} rows={len(rows)}")
-        except Exception as exc:
-            print(f"[PF-DATA] option_chain_error=quote_enrich_failed:{exc}")
-        return rows
-
-    def _pf_resolve_spot(self, chain=None, candles=None, client=None, current=None) -> tuple[float | None, str]:
-        resolved = self.resolve_live_spot_for_paper_forward(
-            client=client,
-            current=current,
-            chain=chain,
-            candles=candles,
-            prefer_live_quote=True,
-        )
-        spot = _to_float_or_none(resolved.get("spot"))
-        source = str(resolved.get("source") or "")
-        if spot is not None:
-            self._pf_apply_resolved_spot(spot, source)
-        return spot, source
-
-    def _pf_fetch_candles_readonly(self, client, spot=None) -> tuple[list, str, str]:
-        broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        result = resolve_paper_forward_candles(
-            app_state=getattr(self, "__dict__", {}),
-            client=client,
-            broker=broker,
-            spot=_to_float_or_none(spot),
-            allow_synthetic_fallback=self._pf_allow_synthetic_candle_fallback(),
-        )
-        if result.ok and result.candles:
-            self._pf_synthetic_candles_active = bool(result.synthetic_candles)
-            src = "SYNTHETIC_SPOT_FALLBACK" if result.synthetic_candles else result.source
-            return list(result.candles), src, ""
-        self._pf_synthetic_candles_active = False
-        err = result.error or ("waiting_for_real_candles" if not self._pf_allow_synthetic_candle_fallback() else "no candles")
-        return [], result.source or "none", err
-
-    def _pf_status_label_from_data_status(self, ds: dict) -> str:
-        auth = str(ds.get("broker_auth") or "")
-        quality = str(ds.get("data_quality_status") or "")
-        attempted = bool(ds.get("auth_validation_attempted"))
-        in_progress = bool(ds.get("auth_validation_in_progress"))
-        if auth == "TOKEN_MISSING" or auth == "CREDENTIALS_MISSING" or auth == "BROKER_CLIENT_MISSING":
-            return "WAITING_FOR_BROKER_AUTH"
-        if auth == "BROKER_CLIENT_INIT_FAILED" or auth.startswith("BROKER_CLIENT_INIT_FAILED"):
-            return "BROKER_CLIENT_INIT_FAILED"
-        # TASK2: once attempted for this token, never map back to VERIFYING or show unchecked as verifying
-        if auth in ("TOKEN_PRESENT_UNCHECKED", "TOKEN_SET_NOT_VERIFIED"):
-            if attempted:
-                # fall to quality or auth_failed mapping below
-                pass
-            else:
-                return "VERIFYING_BROKER_TOKEN"
-        if auth == "VERIFYING_BROKER_TOKEN" and in_progress and not attempted:
-            return "VERIFYING_BROKER_TOKEN"
-        if auth.startswith("SESSION_EXPIRED"):
-            return "BROKER_SESSION_EXPIRED"
-        if auth.startswith("AUTH_FAILED"):
-            return "BROKER_AUTH_FAILED"
-        if quality == "TOKEN_NOT_VERIFIED":
-            return "BROKER_AUTH_FAILED" if attempted else "VERIFYING_BROKER_TOKEN"
-        if auth == "BROKER_IP_MISMATCH" or quality == "BROKER_IP_MISMATCH":
-            return "BROKER_IP_MISMATCH"
-        if quality == "SESSION_EXPIRED":
-            return "BROKER_SESSION_EXPIRED"
-        if quality == "OPTION_CHAIN_EMPTY":
-            broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-            if broker == "mstock" and is_synthetic_chain_enabled(broker):
-                if getattr(self, "_synthetic_chain_active", False):
-                    return "SYNTHETIC_CHAIN_READY_WAITING_FOR_CANDLES"
-                return "WAITING_FOR_SPOT"
-            return "WAITING_FOR_OPTION_CHAIN"
-        if quality == "SYNTHETIC_CHAIN_OK":
-            return "READY_FOR_PREDICTION"
-        if quality == "SYNTHETIC_CHAIN_WITH_SYNTHETIC_CANDLES":
-            return "READY_FOR_PREDICTION"
-        if quality == "SYNTHETIC_CHAIN_WITH_SPOT_CANDLE_FALLBACK":
-            return "READY_FOR_PREDICTION" if self._pf_allow_synthetic_candle_fallback() else "WAITING_FOR_CANDLES"
-        if quality == "SYNTHETIC_CHAIN_READY_WAITING_FOR_CANDLES":
-            return "WAITING_FOR_CANDLES"
-        if quality == "WAITING_FOR_CANDLES":
-            return "WAITING_FOR_CANDLES"
-        if quality == "WAITING_FOR_SPOT" or quality == "SPOT_MISSING":
-            return "WAITING_FOR_SPOT"
-        if quality in ("BROKER_CONFIG_MISSING", "WAITING_FOR_MSTOCK_CONFIG"):
-            return "BROKER_CONFIG_MISSING"
-        if "WAITING_FOR_MSTOCK_EXPIRY" in quality:
-            return "WAITING_FOR_MSTOCK_EXPIRY"
-        if "WAITING_FOR_MSTOCK_EXCHANGE" in quality:
-            return "WAITING_FOR_MSTOCK_EXCHANGE"
-        if quality == "OPTION_CHAIN_FETCH_ERROR":
-            return "OPTION_CHAIN_FETCH_ERROR"
-        if quality == "THIN_OPTION_CHAIN":
-            return "DEGRADED_THIN_OPTION_CHAIN"
-        if quality in ("CANDLES_MISSING", "CANDLES_MISSING_NONFATAL"):
-            return "CANDLES_MISSING_NONFATAL"
-        if quality == "DATA_OK":
-            return "READY_FOR_PREDICTION"
-        return "WAITING_FOR_MARKET_DATA"
-
-    @staticmethod
-    def _pf_format_last_tick(value) -> str:
-        if value in (None, "", 0, 0.0):
-            return "n/a"
-        try:
-            if isinstance(value, datetime):
-                dt = value
-            else:
-                text = str(value).strip()
-                if not text or text.lower() in ("none", "nan", "n/a"):
-                    return "n/a"
-                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-            if dt.tzinfo is not None:
-                dt = dt.astimezone()
-            return dt.strftime("%H:%M:%S")
-        except Exception:
-            return "n/a"
 
     def _set_dash_last_tick(self, value, *, source: str = "") -> None:
         if value in (None, "", 0, 0.0):
@@ -22695,655 +17461,6 @@ class ScalperUI(tk.Tk):
         self._dash_last_tick_epoch = epoch
         self._dash_last_tick_var.set(dt.strftime("%H:%M:%S"))
 
-    def _pf_apply_data_status_to_ui(self, status: PaperForwardDataStatus) -> None:
-        ds = status.as_dict()
-        try:
-            if ds.get("spot") not in (None, "", 0, 0.0):
-                self._dash_spot_var.set(f"{float(ds.get('spot')):.2f}")
-            else:
-                self._dash_spot_var.set("n/a")
-            candle_count = int(ds.get("candle_count", 0) or 0)
-            candle_src = str(ds.get("candle_source") or "").upper()
-            if candle_src in ("SYNTHETIC_SPOT_FALLBACK",) or bool(self._pf_dict_get("_pf_synthetic_candles_active", False)):
-                self._dash_candles_var.set(f"{candle_count} SYNTH")
-            elif candle_count > 0:
-                self._dash_candles_var.set(f"{candle_count} LIVE")
-            else:
-                self._dash_candles_var.set(str(candle_count))
-            self._set_dash_last_tick(ds.get("last_tick_ts"), source="paper_forward")
-            oc_rows = int(ds.get("option_chain_rows") or 0)
-            chain_src = str(ds.get("option_chain_source") or ds.get("chain_source") or "")
-            is_synth = chain_src == BS_CHAIN_SOURCE or bool(self._pf_dict_get("_synthetic_chain_active", False))
-            if is_synth and oc_rows > 0:
-                ce = sum(1 for r in (self._pf_dict_get("_paper_forward_option_chain_rows") or []) if str(r.get("option_type", "")).upper() == "CE")
-                pe = oc_rows - ce
-                self._option_chain_status_var.set(f"BS SYNTH rows={oc_rows} CE={ce} PE={pe}")
-            else:
-                oc_label = "OK" if oc_rows > 0 else "EMPTY"
-                self._option_chain_status_var.set(f"{oc_label} rows={oc_rows}")
-            cfg_status = validate_option_chain_config_for_active_broker(self._selected_broker())
-            client_health = {}
-            try:
-                client = getattr(self, "_client", None) or self._pf_dict_get("_pf_client") or self._pf_dict_get("client")
-                if client is not None and hasattr(client, "get_broker_auth_status"):
-                    client_health = client.get_broker_auth_status() or {}
-            except Exception:
-                client_health = {}
-            if client_health.get("broker_ip_mismatch") or client_health.get("broker_data_status") == "BROKER_IP_MISMATCH":
-                ds["broker_auth"] = "BROKER_IP_MISMATCH"
-                ds["data_quality_status"] = "BROKER_IP_MISMATCH"
-                self._option_chain_status_var.set("BROKER_IP_MISMATCH")
-            missing = ",".join(cfg_status.get("missing_keys") or []) or "none"
-            spot_source = self._pf_dict_get("_last_spot_source", "") or str(cfg_status.get("spot_source") or "")
-            ex = cfg_status.get("exchange_id") or os.getenv("MSTOCK_OPTION_EXCHANGE_ID") or "NFO"
-            synth_candles = (
-                str(ds.get("candle_source") or "").upper() == "SYNTHETIC_SPOT_FALLBACK"
-                or bool(self._pf_dict_get("_pf_synthetic_candles_active", False))
-            )
-            synth_txt = (
-                f" chain_source={BS_CHAIN_SOURCE} synthetic=true"
-                f" candle_source={ds.get('candle_source', 'none')}"
-                f" synthetic_candles={'true' if synth_candles else 'false'}"
-                f" data_quality={ds.get('data_quality_status', '')}"
-                if is_synth
-                else ""
-            )
-            self.pf_broker_status_var.set(
-                f"broker={cfg_status.get('broker')} auth={ds.get('broker_auth')} "
-                f"missing_config_keys={missing} expiry={cfg_status.get('selected_expiry')} exchange={ex}"
-                f"{synth_txt} underlying={cfg_status.get('underlying')} spot_source={spot_source} | "
-                f"{client_health.get('broker_status_message') or status.footer_text()}"
-            )
-            try:
-                bs_banner = getattr(self, "_pf_bs_warning_banner", None)
-                if bs_banner is not None:
-                    if is_synth:
-                        bs_banner.pack(fill="x", padx=8, pady=2)
-                    else:
-                        bs_banner.pack_forget()
-            except Exception:
-                pass
-            self.pf_status_var.set(self._pf_status_label_from_data_status(ds))
-            poll_cycle_id = int(self._pf_dict_get("_pf_poll_cycle_id", 0))
-            self._pf_auth_trace("status_read_for_footer", old_status=str(ds.get("broker_auth") or ""), auth_validation_attempted=bool(ds.get("auth_validation_attempted")), auth_validation_in_progress=bool(ds.get("auth_validation_in_progress")), token_present=bool(ds.get("token_present")), token_hash_prefix=str(ds.get("token_hash_prefix") or ""), client_exists=bool(ds.get("client_created")), poll_cycle_id=poll_cycle_id)
-            rt = getattr(self, "_pf_runtime", None)
-            if rt:
-                self._pf_auth_trace("PAPER-FWD-RUNTIME-ID", caller="footer_status", runtime_id=id(rt), auth=rt.auth.status, rows=rt.option_chain_rows)
-        except Exception:
-            pass
-
-    def _trigger_paper_forward_data_poll_once(self) -> None:
-        self._start_worker("pf_poll_once", self._paper_forward_data_poll_once)
-
-    def _paper_forward_data_poll_once(self) -> None:
-        state = getattr(self, "__dict__", {})
-        self._pf_poll_cycle_id = int(state.get("_pf_poll_cycle_id", 0)) + 1
-        pf_log("DEBUG", "[PF-DATA] refresh start", rate_key="pf_data_refresh", rate_interval=10.0)
-        auth_status, auth_error, spot = self._pf_ensure_auth_terminal(force=False)
-        st = self._pf_auth_state
-        client = getattr(self, "__dict__", {}).get("_client")
-        auth_ok = (st.status == "AUTH_OK")
-        chain, chain_status, chain_error, chain_expiry = [], "not_fetched_auth_not_ok", f"option chain not fetched because auth_status={st.status}", ""
-        candles, candle_src, candle_error = [], "none", f"candle fetch skipped because auth_status={st.status}"
-        chain_fetch_attempted = False
-        candle_fetch_attempted = False
-        if auth_ok:
-            spot_res = self.resolve_live_spot_for_paper_forward(client=client, current=spot, prefer_live_quote=True)
-            spot = _to_float_or_none(spot_res.get("spot"))
-            if spot is not None:
-                self._pf_apply_resolved_spot(spot, str(spot_res.get("source") or ""))
-                print(f"[PF-DATA] spot_source={spot_res.get('source')} spot={spot}")
-            candle_fetch_attempted = True
-            candles, candle_src, candle_error = self._pf_fetch_candles_readonly(client, spot=spot)
-            if candles:
-                self._latest_candles = list(candles)
-            chain_fetch_attempted = True
-            chain, chain_status, chain_error, chain_expiry = self._pf_fetch_full_option_chain_readonly(client, spot=spot)
-            if not spot:
-                spot, spot_source = self._pf_resolve_spot(chain=chain, candles=candles, client=client, current=spot)
-                if spot is not None:
-                    print(f"[PF-DATA] spot_source={spot_source} spot={spot}")
-        else:
-            self._pf_set_table_auth_block_reason(st.status)
-            self._pf_auth_trace("skip_market_fetch", reason="auth_not_ok", status=st.status, poll_cycle_id=self._pf_poll_cycle_id)
-        auth_fields = self._pf_auth_status_fields()
-        snap = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "price": spot or 0,
-            "spot": spot,
-            "spot_source": getattr(self, "_last_spot_source", "") or "",
-            "broker_auth": st.status,
-            "auth_error": st.error,
-            "broker_name": self._selected_broker(),
-            "source": candle_src,
-            "candle_source": candle_src,
-            "candle_count": len(candles or []),
-            "candle_error": candle_error,
-            "candles": candles,
-            "option_chain": chain,
-            "option_chain_status": "not_fetched_auth_not_ok" if not auth_ok else (chain_status if chain_status != "FALLBACK_SINGLE_ROW" else "THIN_OPTION_CHAIN"),
-            "option_chain_error": chain_error,
-            "option_chain_expiry": chain_expiry,
-            "chain_fetch_attempted": chain_fetch_attempted,
-            "chain_skipped_reason": "" if chain_fetch_attempted else chain_error,
-            "candle_fetch_attempted": candle_fetch_attempted,
-            "candle_skipped_reason": "" if candle_fetch_attempted else candle_error,
-            "min_option_chain_rows": int(os.getenv("PAPER_FORWARD_MIN_OPTION_CHAIN_ROWS", "20") or 20),
-            "token_set": bool(self._pf_token_value()),
-        }
-        snap.update(auth_fields)
-        self._pf_attach_broker_to_snapshot(snap)
-        if chain:
-            snap["option_chain_source"] = getattr(self, "_last_option_chain_source", "") or (
-                BS_CHAIN_SOURCE if chain_status == "SYNTHETIC_CHAIN_OK" else "broker_fetch"
-            )
-            snap["option_rows"] = len(chain)
-            snap["option_chain_rows"] = len(chain)
-        if chain and str(snap.get("option_chain_source") or "") == BS_CHAIN_SOURCE:
-            snap["synthetic"] = True
-            snap["chain_source"] = BS_CHAIN_SOURCE
-            snap["data_quality_status"] = self._pf_infer_data_quality(
-                option_rows=len(chain),
-                candle_count=len(candles or []),
-                spot=spot,
-                chain=chain,
-                chain_source=BS_CHAIN_SOURCE,
-                synthetic=True,
-                candle_source=candle_src,
-            )
-            self._pf_apply_real_candle_policy_to_snapshot(snap)
-            needs_candle_fb = (
-                self._pf_allow_synthetic_candle_fallback()
-                and
-                snap["data_quality_status"] in (
-                    "SYNTHETIC_CHAIN_WITH_SPOT_CANDLE_FALLBACK",
-                    "SYNTHETIC_CHAIN_READY_WAITING_FOR_CANDLES",
-                )
-                and not candles
-                and spot
-            )
-            if needs_candle_fb:
-                fb = build_spot_candle_fallback(float(spot))
-                snap["candles"] = fb
-                snap["candle_count"] = len(fb)
-                snap["candle_source"] = "SYNTHETIC_SPOT_FALLBACK"
-                snap["synthetic_candles"] = True
-                self._pf_synthetic_candles_active = True
-                snap["data_quality_status"] = self._pf_infer_data_quality(
-                    option_rows=len(chain),
-                    candle_count=len(fb),
-                    spot=spot,
-                    chain=chain,
-                    chain_source=BS_CHAIN_SOURCE,
-                    synthetic=True,
-                    candle_source="SYNTHETIC_SPOT_FALLBACK",
-                    synthetic_candles=True,
-                )
-        if self._selected_broker() == "dhan":
-            print(
-                "[PF-DHAN-SNAPSHOT] "
-                f"has_chain={bool(chain)} option_rows={len(chain or [])} "
-                f"has_candles={bool(candles)} candles_count={len(candles or [])} "
-                f"spot={spot} active_candidate={getattr(self, '_pf_active_candidate_id', '') or '-'}"
-            )
-        # Update canonical (poller highest prio)
-        rt = getattr(self, "_pf_runtime", None)
-        if rt and auth_ok:
-            rt.update_from_good_snapshot(snap, "paper_forward_poller_full_chain", chain)
-            self._pf_auth_trace("PAPER-FWD-RUNTIME-ID", caller="poller", runtime_id=id(rt), auth=rt.auth.status, rows=rt.option_chain_rows)
-        status = PaperForwardDataStatus.from_snapshot(snap, chain)
-        self._pf_log_data_status(
-            spot=spot,
-            option_rows=len(chain or []),
-            candles=len(candles or []),
-            extra=f"option_chain_error={chain_error}" if chain_error else "",
-        )
-        self.after(0, lambda s=status: self._pf_apply_data_status_to_ui(s))
-        if auth_ok:
-            self._publish_market_snapshot_to_paper_forward(snap, chain, source="paper_forward_poller_full_chain")
-        else:
-            try:
-                if self.pf_engine:
-                    rows = self.pf_engine.get_status_table()
-                    self._pf_queue_state_update(rows, source="poll_once_auth_wait")
-            except Exception:
-                pass
-        try:
-            self._set_latest_option_chain_cache(chain, source="paper_forward_poll_once", reason=chain_error or chain_status)
-            with getattr(self, "_market_data_lock", threading.RLock()):
-                if candles:
-                    self._latest_candles = candles
-            if rt:
-                rt.option_chain = list(chain) if chain else rt.option_chain
-                rt.candles = list(candles) if candles else rt.candles
-        except Exception:
-            pass
-
-    def _pf_verify_token_button(self) -> None:
-        def worker() -> None:
-            status = "AUTH_FAILED"
-            error = ""
-            endpoint = ""
-            try:
-                self._pf_auth_validation_attempted = False
-                bstate = getattr(self, "__dict__", {})
-                pcid = int(bstate.get("_pf_poll_cycle_id", 0))
-                self._pf_auth_trace("verify_start", old_status=str(bstate.get("_pf_last_auth_status", "") or ""), new_status="VERIFYING_BROKER_TOKEN", force=True, poll_cycle_id=pcid)
-                auth_status, error, spot = self._pf_ensure_auth_terminal(force=True)
-                endpoint = str(getattr(self, "__dict__", {}).get("_pf_last_auth_endpoint") or "")
-                status = auth_status
-                auth_fields = self._pf_auth_status_fields()
-                ds = PaperForwardDataStatus(
-                    broker_name=self._selected_broker(),
-                    broker_auth=auth_status,
-                    auth_error=error,
-                    spot=spot,
-                    option_chain_status="not_fetched_auth_not_ok" if auth_status != "AUTH_OK" else "",
-                    option_chain_error="" if auth_status == "AUTH_OK" else f"option chain not fetched because auth_status={auth_status}",
-                    candle_error="" if auth_status == "AUTH_OK" else f"candle fetch skipped because auth_status={auth_status}",
-                    auth_last_checked_ts=auth_fields.get("auth_last_checked_ts"),
-                    auth_validation_attempted=bool(auth_fields.get("auth_validation_attempted")),
-                    auth_validation_in_progress=bool(auth_fields.get("auth_validation_in_progress")),
-                    auth_validation_endpoint=str(auth_fields.get("auth_validation_endpoint") or ""),
-                    auth_success_count=int(auth_fields.get("auth_success_count") or 0),
-                    auth_failure_count=int(auth_fields.get("auth_failure_count") or 0),
-                    token_present=bool(auth_fields.get("token_present")),
-                    token_hash_prefix=str(auth_fields.get("token_hash_prefix") or ""),
-                    client_created=bool(auth_fields.get("client_created")),
-                )
-                self.after(0, lambda s=ds: self._pf_apply_data_status_to_ui(s))
-                bstate2 = getattr(self, "__dict__", {})
-                pcid2 = int(bstate2.get("_pf_poll_cycle_id", 0))
-                self._pf_auth_trace("verify_final_status", old_status="VERIFYING_BROKER_TOKEN", new_status=auth_status, endpoint=endpoint, error=error, auth_validation_attempted=True, poll_cycle_id=pcid2)
-                if auth_status == "AUTH_OK":
-                    self._trigger_paper_forward_data_poll_once()
-            except Exception as exc:
-                status = f"AUTH_FAILED:{str(exc)[:120]}"
-                error = str(exc)
-                bstate3 = getattr(self, "__dict__", {})
-                pcid3 = int(bstate3.get("_pf_poll_cycle_id", 0))
-                self._pf_auth_trace("verify_exception", old_status="VERIFYING_BROKER_TOKEN", new_status=status, error=str(exc), poll_cycle_id=pcid3)
-            finally:
-                self.after(0, lambda: messagebox.showinfo("Paper Forward Verify Token", f"{status}\nendpoint={endpoint or '-'}\nerror={error or '-'}"))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _pf_debug_runtime_state(self):
-        """TASK8: Hard diagnostics for canonical state."""
-        rt = getattr(self, "_pf_runtime", None)
-        if not rt:
-            messagebox.showinfo("PF Debug", "No _pf_runtime yet")
-            return
-        bs_cfg = load_bs_config()
-        info = {
-            "runtime_id": id(rt),
-            "auth_status": rt.auth.status,
-            "token_hash": rt.auth.token_hash,
-            "client_exists": bool(rt.client or getattr(self, "_client", None)),
-            "spot_source": getattr(self, "_last_spot_source", ""),
-            "chain_source": getattr(self, "_chain_source", BS_CHAIN_SOURCE if getattr(self, "_synthetic_chain_active", False) else ""),
-            "synthetic_chain_rows": rt.option_chain_rows,
-            "candle_source": rt.candle_source,
-            "candle_rows": rt.candle_count,
-            "synthetic_candle_enabled": bool(bs_cfg.get("allow_candle_fallback")),
-            "synthetic_candles_active": bool(getattr(self, "_pf_synthetic_candles_active", False)),
-            "option_chain_rows": rt.option_chain_rows,
-            "candle_count": rt.candle_count,
-            "last_good_quality": rt.last_good_snapshot_quality,
-            "last_good_source": rt.last_good_snapshot_source,
-            "last_good_rows": rt.last_good_snapshot_rows,
-            "last_good_candles": rt.last_good_snapshot_candles,
-            "last_accepted_id": rt.last_accepted_snapshot_id,
-            "last_rejected_id": rt.last_rejected_snapshot_id,
-            "bad_rejected": rt.bad_snapshots_rejected,
-            "snapshots_received": rt.snapshots_received,
-            "reason_counts": dict(rt.last_reason_counts),
-            "live_order_guard": "PASS",
-            "last_gui_update_ts": getattr(self, "__dict__", {}).get("_pf_last_gui_update_ts"),
-            "last_gui_row_count": getattr(self, "__dict__", {}).get("_pf_last_gui_row_count"),
-            "last_gui_sample": getattr(self, "__dict__", {}).get("_pf_last_gui_sample"),
-            "gui_loops": self._pf_gui_loop_diagnostics(),
-        }
-        try:
-            if getattr(self, "pf_tree", None):
-                children = list(self.pf_tree.get_children())
-                info["tree_row_count"] = len(children)
-                if children:
-                    info["tree_first_row"] = self.pf_tree.item(children[0]).get("values")
-        except Exception:
-            pass
-        print("[PF-DEBUG-RUNTIME]", info)
-        try:
-            if self.pf_engine:
-                eng_diag = self.pf_engine.get_diagnostics() or {}
-                info["engine_snapshots"] = eng_diag.get("snapshots_received")
-                info["engine_evals"] = eng_diag.get("evaluations_count")
-                info["prediction_attempted_count"] = eng_diag.get("predictions_attempted")
-                info["prediction_success_count"] = eng_diag.get("predictions_success")
-                info["entries_open_positions_count"] = sum(
-                    int(s.get("total_entries") or 0) for s in getattr(self.pf_engine, "_state", {}).values()
-                )
-                info["open_positions_count"] = sum(
-                    1 for s in getattr(self.pf_engine, "_state", {}).values() if s.get("open_position")
-                )
-                info["engine_data_status"] = eng_diag.get("data_status", {}).get("data_quality_status")
-                info["predict_allowed_count"] = sum(
-                    1 for c in getattr(self.pf_engine, "candidates", []) if c.get("enabled", True)
-                ) if info.get("candle_rows", 0) >= int(bs_cfg.get("min_candles_for_prediction", 20)) else 0
-                info["duplicate_entry_blocked"] = eng_diag.get("duplicate_entry_blocked")
-                info["entry_cooldown_blocked"] = eng_diag.get("entry_cooldown_blocked")
-                info["signal_dedupe_blocked"] = eng_diag.get("signal_dedupe_blocked")
-                info["open_positions_by_candidate"] = eng_diag.get("open_positions_by_candidate")
-                info["live_order_guard"] = eng_diag.get("live_order_guard", "PASS")
-                info["reason_counts"] = eng_diag.get("reason_counts", info.get("reason_counts", {}))
-                rt.last_reason_counts = info["reason_counts"]
-        except Exception:
-            pass
-        messagebox.showinfo("PF Runtime Debug (see console for full)", str(info)[:1500])
-
-    def _pf_diagnose_mstock_chain(self):
-        """TASK 9/11: Enhanced Diagnose m.Stock Option Chain with scripmaster details + resolved exchange."""
-        broker = self._selected_broker() if hasattr(self, "_selected_broker") else _normalize_broker_name()
-        auth = "UNKNOWN"
-        st = getattr(self, "_pf_auth_state", None) or getattr(self, "_pf_runtime", None)
-        if st and hasattr(st, "status"):
-            auth = st.status
-        elif st and isinstance(st, dict):
-            auth = st.get("broker_auth", "UNKNOWN")
-        cfg = validate_option_chain_config_for_active_broker(broker)
-        under = cfg.get("underlying", "NIFTY")
-        exp = cfg.get("selected_expiry", "missing")
-        exch = cfg.get("exchange_id") or "NFO"
-        exch_src = cfg.get("exchange_source", "resolver/default")
-        missing = cfg.get("missing_keys", [])
-        tok_p = cfg.get("option_token_present", False)
-        attempted = bool(getattr(self, "_last_option_chain_ts", None)) or bool(getattr(self, "_paper_forward_option_chain_rows", None))
-        raw_rows = 0
-        ce = pe = 0
-        sm_path = "unknown"
-        sm_total = 0
-        nifty_pre = 0
-        final_blocker = "none"
-        try:
-            client = getattr(self, "_client", None)
-            if client and hasattr(client, "get_option_chain"):
-                raw = client.get_option_chain(under) or []
-                raw_rows = len(raw)
-                ce = sum(1 for r in raw if str(r.get("option_type","")).upper()=="CE")
-                pe = sum(1 for r in raw if str(r.get("option_type","")).upper()=="PE")
-            # scripmaster stats
-            sm = None
-            try:
-                sm = client._get_scripmaster() if client and hasattr(client, "_get_scripmaster") else None
-            except Exception:
-                pass
-            if sm:
-                sm_path = getattr(sm, "csv_path", str(getattr(sm, "_csv_path", "unknown")))
-                try:
-                    allr = sm._load() if hasattr(sm, "_load") else []
-                    sm_total = len(allr)
-                    nifty_pre = sum(1 for r in allr if "NIFTY" in str(getattr(r, "symbol_root", "")).upper())
-                except Exception:
-                    pass
-        except Exception as e:
-            raw_rows = f"err:{e}"
-        norm_rows = len(getattr(self, "_paper_forward_option_chain_rows", None) or getattr(self, "_latest_option_chain_rows", None) or [])
-        norm_ce = sum(1 for r in (getattr(self, "_paper_forward_option_chain_rows", None) or []) if str(r.get("option_type", "")).upper() == "CE")
-        norm_pe = norm_rows - norm_ce
-        last_err = getattr(self, "_last_option_chain_error", "") or getattr(self, "_last_option_chain_reason", "") or ""
-        real_chain_status = "EMPTY_RESPONSE" if (isinstance(raw_rows, int) and raw_rows == 0) else ("FETCHED" if raw_rows else str(raw_rows))
-        bs_enabled = is_synthetic_chain_enabled(broker)
-        bs_meta = getattr(self, "_last_synthetic_chain_meta", None) or {}
-        final_chain_source = getattr(self, "_last_option_chain_source", "") or (
-            BS_CHAIN_SOURCE if norm_rows > 0 and bs_meta else ""
-        )
-        synthetic_cache_written = bool(norm_rows > 0 and final_chain_source == BS_CHAIN_SOURCE)
-        if norm_rows == 0:
-            final_blocker = "OPTION_CHAIN_EMPTY_RESPONSE" if not missing else "WAITING_FOR_MSTOCK_EXCHANGE" if "EXCHANGE" in str(missing) else "WAITING_FOR_OPTION_CHAIN_FETCH"
-        elif final_chain_source == BS_CHAIN_SOURCE:
-            candle_n = int(getattr(getattr(self, "_pf_runtime", None), "candle_count", 0) or 0)
-            final_blocker = "READY_SYNTHETIC_CHAIN" if candle_n > 0 else "BLOCKED_NO_CANDLES"
-        else:
-            final_blocker = "READY_REAL_CHAIN"
-        spot_diag = {}
-        try:
-            spot_diag = self.resolve_live_spot_for_paper_forward(client=getattr(self, "_client", None))
-        except Exception as exc:
-            spot_diag = {"ok": False, "error_code": str(exc)}
-        candle_diag = {}
-        try:
-            from paper_forward_spot import resolve_paper_forward_candles
-            cr = resolve_paper_forward_candles(
-                app_state=getattr(self, "__dict__", {}),
-                client=getattr(self, "_client", None),
-                broker=broker,
-                spot=spot_diag.get("spot"),
-                allow_synthetic_fallback=self._pf_allow_synthetic_candle_fallback(),
-            )
-            candle_diag = cr.as_dict()
-        except Exception as exc:
-            candle_diag = {"ok": False, "error": str(exc)}
-        summary = (
-            f"broker={broker} auth={auth}\n"
-            f"spot_resolver={spot_diag}\n"
-            f"candle_resolver={candle_diag}\n"
-            f"underlying={under} expiry={exp} exchange={exch} (source={exch_src})\n"
-            f"option_token_present={tok_p} missing_keys={missing}\n"
-            f"sm_path={sm_path} sm_total={sm_total} nifty_pre_expiry={nifty_pre}\n"
-            f"real_chain_fetch_status={real_chain_status} real_chain_rows={raw_rows}\n"
-            f"bs_synthetic_enabled={bs_enabled} bs_iv={bs_meta.get('iv', '-')} bs_spot={bs_meta.get('spot', '-')}\n"
-            f"bs_expiry={bs_meta.get('expiry', exp)} bs_dte_days={bs_meta.get('dte_days', '-')}\n"
-            f"bs_rows={bs_meta.get('rows', norm_rows)} bs_ce_rows={bs_meta.get('ce_rows', norm_ce)} bs_pe_rows={bs_meta.get('pe_rows', norm_pe)}\n"
-            f"synthetic_chain_cache_written={synthetic_cache_written} final_chain_source={final_chain_source or 'none'}\n"
-            f"fetch_attempted={attempted} normalized_rows={norm_rows} CE={norm_ce} PE={norm_pe}\n"
-            f"last_error={last_err or 'none'} final_readiness={final_blocker}"
-        )
-        print("[PF-DIAG-MSTOCK-CHAIN]", summary.replace("\n", " | "))
-        try:
-            messagebox.showinfo("m.Stock Option Chain Diagnose (see logs for full)", summary)
-        except Exception:
-            pass
-
-    def _pf_set_table_auth_block_reason(self, auth_status: str) -> None:
-        """TASK5: update candidate table last_reason to auth block reason exactly once, without calling on_market or incrementing evals."""
-        eng = self._pf_dict_get("pf_engine")
-        if not eng or not hasattr(eng, "_state"):
-            return
-        reason_map = {
-            "TOKEN_PRESENT_UNCHECKED": "token_verification_pending",
-            "VERIFYING_BROKER_TOKEN": "token_verification_pending",
-            "AUTH_FAILED": "broker_auth_failed",
-            "SESSION_EXPIRED": "session_expired",
-            "BROKER_CLIENT_INIT_FAILED": "broker_client_init_failed",
-            "TOKEN_MISSING": "token_missing",
-            "CREDENTIALS_MISSING": "credentials_missing",
-        }
-        reason = reason_map.get(auth_status, "auth_not_terminal")
-        try:
-            if hasattr(eng, "_reason_counts"):
-                eng._reason_counts[reason] = eng._reason_counts.get(reason, 0) + 1
-            if hasattr(eng, "_auth_wait_cycles"):
-                eng._auth_wait_cycles = int(getattr(eng, "_auth_wait_cycles", 0)) + 1
-            for cid, st in getattr(eng, "_state", {}).items():
-                if not st.get("last_no_trade_reason") or "auth" in str(st.get("last_no_trade_reason")).lower() or "token" in str(st.get("last_no_trade_reason")).lower() or "pending" in str(st.get("last_no_trade_reason")).lower():
-                    st["last_no_trade_reason"] = reason
-                    st["last_signal"] = "NO_TRADE"
-                    st["confidence"] = None
-                    st["predict_attempted"] = False
-                    st["last_update"] = datetime.now(timezone.utc).isoformat()
-                    cs = getattr(eng, "_candidate_states", {}).get(cid)
-                    if cs is not None:
-                        cs.final_signal = "NO_TRADE"
-                        cs.confidence = None
-                        cs.predict_attempted = False
-                        cs.reason_code = reason
-                        cs.reason_detail = reason
-                        cs.last_eval_ts = st["last_update"]
-        except Exception:
-            pass
-
-    def _paper_forward_data_poller_loop(self, generation: int = 0):
-        """Background safe poller for paper forward data (auth, chain, spot, candles)."""
-        stop = self._pf_data_stop
-        interval = 5.0
-        while not (stop and stop.is_set()) and generation == int(getattr(self, "_pf_loop_generation", 0) or 0):
-            try:
-                pf_log("DEBUG", "[PF-DATA] refresh start", rate_key="pf_data_refresh", rate_interval=10.0)
-                state = getattr(self, "__dict__", {})
-                self._pf_poll_cycle_id = int(state.get("_pf_poll_cycle_id", 0)) + 1
-                # ensure always drives to terminal once per token (TASK3)
-                auth_status, auth_error, spot = self._pf_ensure_auth_terminal(force=False)
-                st = self._pf_auth_state
-                client = getattr(self, "__dict__", {}).get("_client")
-
-                auth_ok = (st.status == "AUTH_OK")
-                chain, chain_status, chain_error, chain_expiry = [], "not_fetched_auth_not_ok", f"option chain not fetched because auth_status={st.status}", ""
-                candles, candle_src, candle_error = [], "none", ""
-                chain_fetch_attempted = False
-                candle_fetch_attempted = False
-
-                if auth_ok:
-                    spot_res = self.resolve_live_spot_for_paper_forward(client=client, current=spot, prefer_live_quote=True)
-                    spot = _to_float_or_none(spot_res.get("spot"))
-                    if spot is not None:
-                        self._pf_apply_resolved_spot(spot, str(spot_res.get("source") or ""))
-                        print(f"[PF-DATA] spot_source={spot_res.get('source')} spot={spot}")
-                    candle_fetch_attempted = True
-                    candles, candle_src, candle_error = self._pf_fetch_candles_readonly(client, spot=spot)
-                    if candles:
-                        self._latest_candles = list(candles)
-                    chain_fetch_attempted = True
-                    chain, chain_status, chain_error, chain_expiry = self._pf_fetch_full_option_chain_readonly(client, spot=spot)
-                    if not spot:
-                        spot, spot_source = self._pf_resolve_spot(chain=chain, candles=candles, client=client, current=spot)
-                        if spot is not None:
-                            print(f"[PF-DATA] spot_source={spot_source} spot={spot}")
-                else:
-                    # TASK6: do not call broker data endpoints repeatedly when auth not OK
-                    candle_error = f"candle fetch skipped because auth_status={st.status}"
-                    self._pf_auth_trace("skip_market_fetch", reason="auth_not_ok", status=st.status, poll_cycle_id=self._pf_poll_cycle_id)
-                    # set table reason without triggering evals (TASK5)
-                    self._pf_set_table_auth_block_reason(st.status)
-
-                # Build and publish
-                auth_fields = self._pf_auth_status_fields()
-                snap = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "price": spot or 0,
-                    "spot": spot,
-                    "spot_source": getattr(self, "_last_spot_source", "") or "",
-                    "broker_auth": st.status,
-                    "auth_error": st.error,
-                    "broker_name": self._selected_broker(),
-                    "source": candle_src,
-                    "candle_source": candle_src,
-                    "candle_count": len(candles or []),
-                    "candle_error": candle_error,
-                    "candles": candles,
-                    "option_chain": chain,
-                    "option_chain_status": "not_fetched_auth_not_ok" if not auth_ok else (chain_status if chain_status != "FALLBACK_SINGLE_ROW" else "THIN_OPTION_CHAIN"),
-                    "option_chain_error": chain_error,
-                    "option_chain_expiry": chain_expiry,
-                    "chain_fetch_attempted": chain_fetch_attempted,
-                    "chain_skipped_reason": "" if chain_fetch_attempted else chain_error,
-                    "candle_fetch_attempted": candle_fetch_attempted,
-                    "candle_skipped_reason": "" if candle_fetch_attempted else candle_error,
-                    "min_option_chain_rows": int(os.getenv("PAPER_FORWARD_MIN_OPTION_CHAIN_ROWS", "20") or 20),
-                    "token_set": bool(self._pf_token_value()),
-                    "auth_validation_attempted": st.validation_attempted,
-                }
-                snap.update(auth_fields)
-                self._pf_attach_broker_to_snapshot(snap)
-                if chain:
-                    snap["option_chain_source"] = getattr(self, "_last_option_chain_source", "") or (
-                        BS_CHAIN_SOURCE if chain_status == "SYNTHETIC_CHAIN_OK" else "broker_fetch"
-                    )
-                    snap["option_rows"] = len(chain)
-                    snap["option_chain_rows"] = len(chain)
-                if chain and str(snap.get("option_chain_source") or "") == BS_CHAIN_SOURCE:
-                    snap["synthetic"] = True
-                    snap["chain_source"] = BS_CHAIN_SOURCE
-                    snap["data_quality_status"] = self._pf_infer_data_quality(
-                        option_rows=len(chain),
-                        candle_count=len(candles or []),
-                        spot=spot,
-                        chain=chain,
-                        chain_source=BS_CHAIN_SOURCE,
-                        synthetic=True,
-                        candle_source=candle_src,
-                    )
-                    self._pf_apply_real_candle_policy_to_snapshot(snap)
-                    if self._pf_allow_synthetic_candle_fallback() and snap["data_quality_status"] == "SYNTHETIC_CHAIN_WITH_SPOT_CANDLE_FALLBACK" and not candles and spot:
-                        fb = build_spot_candle_fallback(float(spot))
-                        snap["candles"] = fb
-                        snap["candle_count"] = len(fb)
-                        snap["candle_source"] = "SYNTHETIC_SPOT_FALLBACK"
-                elif spot and not chain:
-                    snap["data_quality_status"] = "WAITING_FOR_SPOT" if not spot else self._pf_infer_data_quality(
-                        option_rows=0, candle_count=len(candles or []), spot=spot, chain=chain, synthetic=False, candle_source=candle_src
-                    )
-                if self._selected_broker() == "dhan":
-                    print(
-                        "[PF-DHAN-SNAPSHOT] "
-                        f"has_chain={bool(chain)} option_rows={len(chain or [])} "
-                        f"has_candles={bool(candles)} candles_count={len(candles or [])} "
-                        f"spot={spot} active_candidate={getattr(self, '_pf_active_candidate_id', '') or '-'}"
-                    )
-                rt = getattr(self, "_pf_runtime", None)
-                if rt and auth_ok:
-                    rt.update_from_good_snapshot(snap, "paper_forward_poll_once", chain)
-                status = PaperForwardDataStatus.from_snapshot(snap, chain)
-                self._pf_log_data_status(
-                    spot=spot,
-                    option_rows=len(chain or []),
-                    candles=len(candles or []),
-                    extra=f"option_chain_error={chain_error}" if chain_error else "",
-                )
-                self.after(0, lambda s=status, g=generation: self._pf_apply_data_status_to_ui(s) if g == int(getattr(self, "_pf_loop_generation", 0) or 0) else None)
-                if auth_ok:
-                    self._publish_market_snapshot_to_paper_forward(snap, chain, source="paper_forward_poll_once")
-                else:
-                    # TASK5: do not publish full snapshot (avoids on_market + evals)
-                    try:
-                        rows = (self.pf_engine.get_status_table() if self.pf_engine else [])
-                        self._pf_queue_state_update(rows, source="poller_auth_wait", generation=generation)
-                    except Exception:
-                        pass
-                try:
-                    self._set_latest_option_chain_cache(chain, source="paper_forward_poller_loop", reason=chain_error or chain_status)
-                    with getattr(self, "_market_data_lock", threading.RLock()):
-                        if candles:
-                            self._latest_candles = candles
-                except Exception:
-                    pass
-
-            except Exception as e:
-                print("[PAPER-FWD-DATA] poller loop err", e)
-            time.sleep(interval)
-        print(f"[PF-LOOP] data_poller_exit generation={generation}")
-
-    def _stop_paper_forward_data_poller(self):
-        if getattr(self, "_pf_data_stop", None):
-            self._pf_data_stop.set()
-        try:
-            self._gui_cancel_tab_after("_pf_after_job", tab="paper_forward", reason="stop_poller")
-            app_jobs = getattr(self, "_app_after_ids", {})
-            if isinstance(app_jobs, dict):
-                for name in ("paper_forward_monitor_update", "pf_throttled_apply", "pf_auto_start"):
-                    old_app = app_jobs.pop(name, None)
-                    if old_app:
-                        try:
-                            self.after_cancel(old_app)
-                            print(f"[GUI-AFTER] tab=paper_forward action=cancel job_id={old_app} reason=stop_poller name={name}")
-                        except Exception:
-                            pass
-            self._pf_update_job = None
-        except Exception:
-            pass
-        if getattr(self, "pf_status_var", None) is not None:
-            self.pf_status_var.set("STOPPED")
-
-# end of added Paper Forward Monitor methods
 
 
 # =============================================================================
@@ -23354,7 +17471,7 @@ class ScalperUI(tk.Tk):
         frame = self.candidate_promo_frame
 
         # Header + safety banner
-        ttk.Label(frame, text="Candidate Promotion / Deployment â€” STRICT GATES â€” NO REAL ORDERS BY DEFAULT",
+        ttk.Label(frame, text="Candidate Promotion / Deployment - STRICT GATES - NO REAL ORDERS BY DEFAULT",
                   font=("Segoe UI", 11, "bold"), foreground="red").pack(anchor="w", padx=8, pady=4)
 
         banner = ttk.Label(
@@ -23369,9 +17486,7 @@ class ScalperUI(tk.Tk):
         ctrl.pack(fill="x", padx=8, pady=4)
 
         ttk.Button(ctrl, text="Reload Candidates", command=self._cp_reload).pack(side="left", padx=3)
-        ttk.Button(ctrl, text="Run Paperâ†’Shadow Promotion", command=self._cp_run_paper_to_shadow).pack(side="left", padx=3)
-        ttk.Button(ctrl, text="Start Shadow Mode", command=self._cp_start_shadow).pack(side="left", padx=3)
-        ttk.Button(ctrl, text="Run Shadowâ†’Live Dry-run", command=self._cp_run_shadow_to_dry).pack(side="left", padx=3)
+        ttk.Button(ctrl, text="Refresh Paper Candidates", command=self._cp_reload).pack(side="left", padx=3)
         ttk.Button(ctrl, text="Enable Live Dry-run (env)", command=self._cp_enable_dry_run).pack(side="left", padx=3)
         ttk.Button(ctrl, text="Disable Live / Dry-run", command=self._cp_disable_live).pack(side="left", padx=3)
         ttk.Button(ctrl, text="EMERGENCY STOP", command=self._cp_emergency_stop).pack(side="left", padx=3)
@@ -23430,324 +17545,11 @@ class ScalperUI(tk.Tk):
         except Exception as _e_panel:
             print("[UI] live safety panel init warning:", _e_panel)
 
-    def _cp_reload(self):
-        self._cp_refresh_table()
-        self._cp_set_status("Candidates reloaded from paper, shadow, and live whitelist configs")
-
-    def _cp_set_status(self, text: str) -> None:
-        var = getattr(self, "cp_status_var", None)
-        if var is None:
-            return
-        try:
-            var.set(text)
-        except Exception:
-            pass
-
-    def _cp_load_paper_forward_candidates(self) -> List[Candidate]:
-        """Expose paper-forward candidates in the deployment tab before promotion."""
-        path = CONFIG_DIR / "paper_forward_candidates.json"
-        if not path.exists():
-            return []
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            rows = payload.get("candidates", payload if isinstance(payload, list) else [])
-        except Exception as exc:
-            self._cp_set_status(f"Could not read paper_forward_candidates.json: {type(exc).__name__}: {exc}")
-            return []
-
-        out: List[Candidate] = []
-        for row in rows or []:
-            if not isinstance(row, dict):
-                continue
-            cid = str(row.get("candidate_id") or "").strip()
-            if not cid:
-                continue
-            is_paper = bool(row.get("paper_forward_only")) or str(row.get("classification") or "").lower() == "paper_forward_only"
-            if not is_paper:
-                continue
-            out.append(
-                Candidate(
-                    candidate_id=cid,
-                    model_path=str(row.get("model_path") or ""),
-                    artifact_path=str(row.get("artifact_dir") or row.get("artifact_path") or ""),
-                    status=STATUS_PAPER_FORWARD,
-                    allowed_modes=["paper_forward"],
-                    enabled=bool(row.get("enabled", True)),
-                    live_whitelisted=False,
-                    last_block_reason=str(row.get("disabled_reason") or row.get("_load_status") or ""),
-                )
-            )
-        return out
-
-    def _cp_refresh_table(self, *, force: bool = False):
-        if not self._is_ui_alive(getattr(self, "cp_tree", None)):
-            return
-        if not force and self._throttle_ui_update("candidate_promotion", 1.0):
-            return
-        if getattr(self, "_cp_lifecycle_worker_running", False):
-            return
-        self._cp_lifecycle_worker_running = True
-
-        def worker() -> None:
-            try:
-                rows = load_paper_forward_candidate_rows("config/paper_forward_candidates.json")
-                live_ids = [c.candidate_id for c in load_live_whitelist() if getattr(c, "live_whitelisted", False)]
-                statuses = evaluate_candidate_rows(rows, config={"live_1lot_whitelist": live_ids})
-                write_lifecycle_report(statuses)
-            except Exception as exc:
-                def fail() -> None:
-                    self._cp_lifecycle_worker_running = False
-                    self._cp_set_status(f"Candidate lifecycle refresh failed: {type(exc).__name__}: {exc}")
-                self.ui_call(fail)
-                return
-
-            def apply() -> None:
-                self._cp_lifecycle_worker_running = False
-                self._cp_lifecycle_statuses = statuses
-                payloads: List[Dict[str, Any]] = []
-                for st in statuses:
-                    vals = (
-                        st.candidate_id,
-                        f"{st.family}/{st.side}",
-                        st.current_stage,
-                        st.next_stage or "-",
-                        "Y" if st.can_advance else "N",
-                        "Y" if st.can_be_live_deployed else "N",
-                        st.block_reason or "-",
-                        "; ".join(st.missing_requirements[:3]) or "-",
-                        st.artifact_status,
-                        st.data_status,
-                        st.confidence_health,
-                        f"{st.trades}/{st.days}",
-                        str(st.last_updated)[:19],
-                    )
-                    payloads.append({"iid": st.candidate_id, "values": vals, "tags": (lifecycle_row_tag(st),)})
-                self._cp_tree_iid_map = self._upsert_tree_rows(
-                    self.cp_tree,
-                    payloads,
-                    iid_map=getattr(self, "_cp_tree_iid_map", None),
-                    tab="candidate_promotion",
-                )
-                self._cp_update_button_states()
-                visible = sum(1 for st in statuses if lifecycle_status_visible(st, "qualified"))
-                self._cp_set_status(f"Lifecycle loaded {len(statuses)} candidates | visible_by_default={visible}")
-            self.ui_call(apply)
-
-        threading.Thread(target=worker, daemon=True, name="candidate-lifecycle-promotion").start()
-
-    def _cp_update_button_states(self) -> None:
-        statuses = list(getattr(self, "_cp_lifecycle_statuses", []) or [])
-        stage_counts: Dict[str, int] = {}
-        for st in statuses:
-            stage_counts[st.current_stage] = stage_counts.get(st.current_stage, 0) + 1
-        rules = {
-            "Promote Eligible to Shadow": any(st.current_stage == "SHADOW_ELIGIBLE" and st.can_advance for st in statuses),
-            "Promote Eligible to Live Dry-Run": any(st.current_stage == "LIVE_DRY_RUN_ELIGIBLE" for st in statuses),
-            "Promote Best Candidate to LIVE 1-Lot": sum(1 for st in statuses if st.current_stage == "LIVE_1_LOT_ELIGIBLE") == 1,
-            "Archive Blocked Candidates": any(st.current_stage in {"DISABLED", "INVALID_CONFIG", "ARTIFACT_MISSING"} for st in statuses),
-            "Export Lifecycle Report": bool(statuses),
-        }
-        for label, enabled in rules.items():
-            btn = (getattr(self, "cp_buttons", {}) or {}).get(label)
-            if btn is not None:
-                try:
-                    btn.configure(state="normal" if enabled else "disabled")
-                except Exception:
-                    pass
-        self._cp_button_disable_reason = (
-            "stage_counts=" + ", ".join(f"{k}:{v}" for k, v in sorted(stage_counts.items()))
-        )
-
-    def _cp_run_script(self, args: List[str], title: str, timeout: int = 180) -> None:
-        self._cp_set_status(f"Running {title}...")
-        def worker() -> None:
-            try:
-                import subprocess
-                res = subprocess.run(args, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=timeout)
-                out = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
-            except Exception as exc:
-                self.ui_call(lambda: messagebox.showerror(title, str(exc)))
-                self.ui_call(lambda: self._cp_set_status(f"{title} failed: {type(exc).__name__}: {exc}"))
-                return
-            def apply() -> None:
-                if res.returncode == 0:
-                    self._cp_set_status(f"{title} finished")
-                    messagebox.showinfo(title, out[-3000:] or f"{title} finished")
-                else:
-                    self._cp_set_status(f"{title} failed with exit code {res.returncode}")
-                    messagebox.showerror(title, out[-3000:] or f"{title} failed with exit code {res.returncode}")
-                self._cp_refresh_table(force=True)
-            self.ui_call(apply)
-        threading.Thread(target=worker, daemon=True, name=f"cp-script-{title}").start()
-
-    def _cp_auto_repair_config(self) -> None:
-        self._cp_run_script([sys.executable, "scripts/repair_candidate_lifecycle_config.py", "--apply"], "Auto Repair Candidate Config", timeout=180)
-
-    def _cp_archive_blocked(self) -> None:
-        self._cp_auto_repair_config()
-
-    def _cp_promote_eligible_to_shadow(self) -> None:
-        if not any(st.current_stage == "SHADOW_ELIGIBLE" and st.can_advance for st in getattr(self, "_cp_lifecycle_statuses", []) or []):
-            messagebox.showwarning("Promote Eligible to Shadow", getattr(self, "_cp_button_disable_reason", "No eligible candidate"))
-            return
-        self._cp_run_script([sys.executable, "-m", "scripts.promote_paper_to_shadow"], "Promote Eligible to Shadow", timeout=180)
-
-    def _cp_promote_eligible_to_dryrun(self) -> None:
-        if not any(st.current_stage == "LIVE_DRY_RUN_ELIGIBLE" for st in getattr(self, "_cp_lifecycle_statuses", []) or []):
-            messagebox.showwarning("Promote Eligible to Live Dry-Run", getattr(self, "_cp_button_disable_reason", "No eligible candidate"))
-            return
-        os.environ["LIVE_MODE"] = "true"
-        os.environ["LIVE_ORDER_DRY_RUN"] = "true"
-        os.environ["ORDER_PLACEMENT_ENABLED"] = "false"
-        self._cp_run_script([sys.executable, "-m", "scripts.promote_shadow_to_live_dryrun"], "Promote Eligible to Live Dry-Run", timeout=180)
-
-    def _cp_promote_best_to_live_1lot(self) -> None:
-        eligible = [st for st in getattr(self, "_cp_lifecycle_statuses", []) or [] if st.current_stage == "LIVE_1_LOT_ELIGIBLE"]
-        if len(eligible) != 1:
-            messagebox.showwarning("Promote Best Candidate to LIVE 1-Lot", "LIVE_1_LOT requires exactly one eligible/whitelisted candidate.")
-            return
-        os.environ["REQUIRE_MANUAL_CONFIRM"] = "true"
-        os.environ["ORDER_PLACEMENT_ENABLED"] = "false"
-        self._cp_run_script([sys.executable, "-m", "scripts.promote_live_dryrun_to_1lot", "--candidate-id", eligible[0].candidate_id], "Promote Best Candidate to LIVE 1-Lot", timeout=180)
-
-    def _cp_export_lifecycle_report(self) -> None:
-        statuses = list(getattr(self, "_cp_lifecycle_statuses", []) or [])
-        if not statuses:
-            self._cp_refresh_table(force=True)
-            return
-        try:
-            json_path, csv_path = write_lifecycle_report(statuses)
-            messagebox.showinfo("Export Lifecycle Report", f"Wrote:\n{json_path}\n{csv_path}")
-        except Exception as exc:
-            messagebox.showerror("Export Lifecycle Report", str(exc))
-
-    def _cp_run_paper_to_shadow(self):
-        try:
-            import subprocess
-            res = subprocess.run(
-                [sys.executable, "-m", "scripts.promote_paper_to_shadow", "--min-trades", "3", "--min-days", "1"],
-                cwd=str(Path(__file__).parent.parent),
-                capture_output=True, text=True, timeout=120
-            )
-            out = (res.stdout or "") + "\n" + (res.stderr or "")
-            messagebox.showinfo("Paperâ†’Shadow", out[-2000:] or "Promotion script finished. See reports/.")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-        self._cp_refresh_table()
-
-    def _cp_run_shadow_to_dry(self):
-        try:
-            import subprocess
-            res = subprocess.run(
-                [sys.executable, "-m", "scripts.promote_shadow_to_live_dryrun", "--min-shadow-trades", "2"],
-                cwd=str(Path(__file__).parent.parent),
-                capture_output=True, text=True, timeout=120
-            )
-            out = (res.stdout or "") + "\n" + (res.stderr or "")
-            messagebox.showinfo("Shadowâ†’DryRun", out[-2000:] or "Promotion finished.")
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-        self._cp_refresh_table()
-
-    def _cp_start_shadow(self):
-        if getattr(self, "cp_shadow_engine", None) is None:
-            try:
-                self.cp_shadow_engine = ShadowEngine(candidate_file="config/shadow_candidates.json")
-            except Exception as e:
-                messagebox.showerror("Shadow init failed", str(e))
-                return
-        if self.cp_shadow_thread and self.cp_shadow_thread.is_alive():
-            return
-        self.cp_shadow_stop = threading.Event()
-        self.cp_shadow_thread = threading.Thread(target=self._cp_shadow_loop, daemon=True)
-        self.cp_shadow_thread.start()
-        self.cp_status_var.set("SHADOW MODE RUNNING (virtual only, live_order_sent=false always)")
-
-    def _cp_shadow_loop(self):
-        eng = self.cp_shadow_engine
-        stop = self.cp_shadow_stop
-        while eng and not (stop and stop.is_set()):
-            try:
-                snap = getattr(self, "_build_paper_snapshot_for_engine", lambda: {})() or {}
-                chain = getattr(self, "_option_chain_data", None) or getattr(self, "_latest_option_chain", None)
-                rows = eng.on_market_snapshot(snap or {}, chain if isinstance(chain, list) else None)
-                # Update log viewer with last few
-                self._cp_append_log_samples(rows[-3:] if rows else [])
-            except Exception as _e:
-                pass
-            time.sleep(4.0)
-
-    def _cp_append_log_samples(self, rows: List[Dict[str, Any]]):
-        try:
-            self.cp_log_text.delete("1.0", "end")
-            for r in rows:
-                self.cp_log_text.insert("end", json.dumps({k: r.get(k) for k in ("candidate_id", "virtual_pnl", "blocked_reason", "live_order_sent")}, default=str) + "\n")
-        except Exception:
-            pass
-
-    def _cp_enable_dry_run(self):
-        os.environ["LIVE_MODE"] = "true"
-        os.environ["LIVE_ORDER_DRY_RUN"] = "true"
-        os.environ["ORDER_PLACEMENT_ENABLED"] = "false"
-        self.live_disabled = False
-        self.cp_status_var.set("LIVE DRY-RUN ENABLED (payloads built + logged, NO real orders)")
-        try:
-            p = execute_dry_run_if_requested(candidate_id="gui-button", symbol="NIFTY", side="SELL", quantity=65, order_type="LIMIT", price=42.5, expiry="2026-06-25", option_type="PE")
-            self._cp_append_log_samples([{"candidate_id": "dryrun-button", "virtual_pnl": 0, "blocked_reason": "", "live_order_sent": False, "payload": p}])
-        except Exception:
-            pass
-        try:
-            self._refresh_live_safety()
-        except Exception:
-            pass
-
-    def _cp_disable_live(self):
-        for k in ("LIVE_MODE", "LIVE_ORDER_DRY_RUN", "ORDER_PLACEMENT_ENABLED", "MSTOCK_ENABLE_LIVE_TRADING", "SCALPER_ALLOW_LIVE_ORDERS"):
-            if k in os.environ:
-                os.environ[k] = "false"
-        self.live_disabled = True
-        self.cp_status_var.set("All live/dry-run flags set to false. Safe mode.")
-        try:
-            self._refresh_live_safety()
-        except Exception:
-            pass
-
-    def _cp_emergency_stop(self):
-        os.environ["SCALPER_KILL_SWITCH"] = "1"
-        os.environ["ORDER_PLACEMENT_ENABLED"] = "false"
-        os.environ["LIVE_ORDER_DRY_RUN"] = "true"
-        # Runtime internal flag used by engines / router paths
-        self.live_disabled = True
-        if self.cp_shadow_stop:
-            self.cp_shadow_stop.set()
-        # Stop any running paper/shadow engines if present on self
-        for eng_name in ("pf_engine", "cp_shadow_engine"):
-            eng = getattr(self, eng_name, None)
-            if eng and hasattr(eng, "stop"):
-                try: eng.stop()
-                except Exception: pass
-        # Write structured emergency log (JSONL friendly)
-        try:
-            em = LOGS_DIR / f"emergency_stop_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-            rec = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "event": "EMERGENCY_STOP",
-                "live_disabled": True,
-                "order_placement_forced_false": True,
-                "note": "New entries blocked. Square-off only if SQUARE_OFF_ON_EMERGENCY=true. No auto orders.",
-            }
-            em.write_text(json.dumps(rec) + "\n", encoding="utf-8")
-        except Exception:
-            pass
-        self.cp_status_var.set("!!! EMERGENCY STOP ACTIVE â€” live_disabled=true, kill=1, placement=false, no auto square-off !!!")
-        messagebox.showwarning("EMERGENCY STOP", "LIVE DISABLED. New entries blocked. Real order placement disabled. Check logs/emergency_stop_*.jsonl. Square-off only if explicitly configured.")
-
-    # --- Live Safety / Mode Panel (added to promo tab for visibility) ---
     def _build_live_safety_panel(self, parent_frame):
         lf = ttk.LabelFrame(parent_frame, text="Live Safety Dashboard")
         lf.pack(fill="x", padx=8, pady=4)
 
-        self.live_mode_var = tk.StringVar(value="PAPER / SHADOW (safe)")
+        self.live_mode_var = tk.StringVar(value="PAPER (safe)")
         self.dry_run_var = tk.StringVar(value="LIVE_ORDER_DRY_RUN: ?")
         self.placement_var = tk.StringVar(value="ORDER_PLACEMENT_ENABLED: ?")
         self.kill_var = tk.StringVar(value="KILL_SWITCH: ?")
@@ -23802,7 +17604,7 @@ class ScalperUI(tk.Tk):
         self.dry_run_var.set(f"LIVE_ORDER_DRY_RUN: {dry}")
         self.placement_var.set(f"ORDER_PLACEMENT_ENABLED: {place}")
         self.kill_var.set(f"KILL_SWITCH: {kill}")
-        mode = "LIVE_1_LOT" if (live and not dry and place and not kill) else ("LIVE_DRY_RUN" if (live and dry) else "PAPER/SHADOW (safe)")
+        mode = "LIVE_1_LOT" if (live and not dry and place and not kill) else ("LIVE_DRY_RUN" if (live and dry) else "PAPER (safe)")
         self.live_mode_var.set(mode)
 
         wl = load_live_whitelist()
@@ -23847,109 +17649,6 @@ class ScalperUI(tk.Tk):
         self.pending_order_var.set("REJECTED - no live order will be sent")
         messagebox.showwarning("Rejected", "Manual confirmation rejected. No order will be placed.")
 
-    def _cp_run_paper_to_shadow(self):
-        self._cp_set_status("Running Paper -> Shadow promotion...")
-        try:
-            import subprocess
-            res = subprocess.run(
-                [sys.executable, "-m", "scripts.promote_paper_to_shadow", "--min-trades", "3", "--min-days", "1"],
-                cwd=str(REPO_ROOT),
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            out = (res.stdout or "") + "\n" + (res.stderr or "")
-            if res.returncode == 0:
-                self._cp_set_status("Paper -> Shadow promotion finished. See reports/ for details.")
-                messagebox.showinfo("Paper -> Shadow", out[-2000:] or "Promotion script finished. See reports/.")
-            else:
-                self._cp_set_status(f"Paper -> Shadow failed with exit code {res.returncode}")
-                messagebox.showerror("Paper -> Shadow", out[-3000:] or f"Promotion failed with exit code {res.returncode}")
-        except Exception as exc:
-            self._cp_set_status(f"Paper -> Shadow error: {type(exc).__name__}: {exc}")
-            messagebox.showerror("Paper -> Shadow", str(exc))
-        self._cp_refresh_table()
-
-    def _cp_run_shadow_to_dry(self):
-        self._cp_set_status("Running Shadow -> Live Dry-run promotion...")
-        try:
-            import subprocess
-            res = subprocess.run(
-                [sys.executable, "-m", "scripts.promote_shadow_to_live_dryrun", "--min-shadow-trades", "2"],
-                cwd=str(REPO_ROOT),
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            out = (res.stdout or "") + "\n" + (res.stderr or "")
-            if res.returncode == 0:
-                self._cp_set_status("Shadow -> Live Dry-run promotion finished. See reports/ for details.")
-                messagebox.showinfo("Shadow -> Live Dry-run", out[-2000:] or "Promotion finished.")
-            else:
-                self._cp_set_status(f"Shadow -> Live Dry-run failed with exit code {res.returncode}")
-                messagebox.showerror("Shadow -> Live Dry-run", out[-3000:] or f"Promotion failed with exit code {res.returncode}")
-        except Exception as exc:
-            self._cp_set_status(f"Shadow -> Live Dry-run error: {type(exc).__name__}: {exc}")
-            messagebox.showerror("Shadow -> Live Dry-run", str(exc))
-        self._cp_refresh_table()
-
-    def _cp_start_shadow(self):
-        if getattr(self, "cp_shadow_engine", None) is None:
-            try:
-                self.cp_shadow_engine = ShadowEngine(candidate_file="config/shadow_candidates.json")
-            except Exception as exc:
-                self._cp_set_status(f"Shadow init failed: {type(exc).__name__}: {exc}")
-                messagebox.showerror("Shadow init failed", str(exc))
-                return
-        thread = getattr(self, "cp_shadow_thread", None)
-        if thread is not None and thread.is_alive():
-            self._cp_set_status("Shadow mode already running")
-            return
-        self.cp_shadow_stop = threading.Event()
-        self.cp_shadow_thread = threading.Thread(target=self._cp_shadow_loop, daemon=True)
-        self.cp_shadow_thread.start()
-        self._cp_set_status("SHADOW MODE RUNNING (virtual only, live_order_sent=false always)")
-
-    def _cp_shadow_loop(self):
-        eng = getattr(self, "cp_shadow_engine", None)
-        stop = getattr(self, "cp_shadow_stop", None)
-        while eng is not None and not (stop and stop.is_set()):
-            try:
-                snap = getattr(self, "_build_paper_snapshot_for_engine", lambda: {})() or {}
-                chain = getattr(self, "_option_chain_data", None) or getattr(self, "_latest_option_chain", None)
-                rows = eng.on_market_snapshot(snap or {}, chain if isinstance(chain, list) else None)
-                self._run_on_ui_thread(self._cp_append_log_samples, rows[-3:] if rows else [], tab="candidate_promotion")
-            except Exception as exc:
-                self._run_on_ui_thread(
-                    self._cp_set_status,
-                    f"Shadow loop error: {type(exc).__name__}: {exc}",
-                    tab="candidate_promotion",
-                )
-            time.sleep(4.0)
-
-    def _cp_append_log_samples(self, rows: List[Dict[str, Any]]):
-        if threading.current_thread() is not threading.main_thread():
-            self.ui_call(self._cp_append_log_samples, list(rows or []))
-            return
-        text = getattr(self, "cp_log_text", None)
-        if text is None or not self._is_ui_alive(text):
-            return
-        try:
-            text.delete("1.0", "end")
-            for row in rows or []:
-                if not isinstance(row, dict):
-                    continue
-                payload = {
-                    key: row.get(key)
-                    for key in ("candidate_id", "virtual_pnl", "blocked_reason", "live_order_sent", "validation_error")
-                    if key in row
-                }
-                if "payload" in row and isinstance(row["payload"], dict):
-                    payload["payload"] = row["payload"]
-                text.insert("end", json.dumps(payload, default=str) + "\n")
-        except Exception as exc:
-            self._cp_set_status(f"Log update failed: {type(exc).__name__}: {exc}")
-
     def _refresh_live_safety(self):
         try:
             from candidate_lifecycle import (
@@ -23974,14 +17673,14 @@ class ScalperUI(tk.Tk):
         self.dry_run_var.set(f"LIVE_ORDER_DRY_RUN: {dry}")
         self.placement_var.set(f"ORDER_PLACEMENT_ENABLED: {place}")
         self.kill_var.set(f"KILL_SWITCH: {kill}")
-        mode = "LIVE_1_LOT" if (live and not dry and place and not kill) else ("LIVE_DRY_RUN" if (live and dry) else "PAPER/SHADOW (safe)")
+        mode = "LIVE_1_LOT" if (live and not dry and place and not kill) else ("LIVE_DRY_RUN" if (live and dry) else "PAPER (safe)")
         self.live_mode_var.set(mode)
 
         whitelist = load_live_whitelist()
         active = next((c for c in whitelist if c.live_whitelisted and c.status in ("LIVE_1_LOT", "LIVE_SCALED")), None)
         self.cand_var.set(f"Active live cand: {active.candidate_id if active else 'none'} (status={active.status if active else 'N/A'})")
         self.broker_var.set("Broker: token present" if os.getenv("MSTOCK_ACCESS_TOKEN") else "Broker: NO TOKEN")
-        self.chain_var.set("Chain fresh: use Paper Forward / Shadow mode to populate live data")
+        self.chain_var.set("Chain fresh: use Paper mode to populate live data")
         self.trades_var.set("Trades today: see live reconciliation and dry-run logs")
         self.guard_var.set("Last guard: see order logs")
         self.recon_var.set("Last recon: see live_reconciliation_*.jsonl")
@@ -23991,101 +17690,6 @@ class ScalperUI(tk.Tk):
             self.pending_order_var.set("Pending: select candidate + snapshot, then confirm to arm 1-lot")
         else:
             self.manual_frame.pack_forget()
-
-    def _cp_enable_dry_run(self):
-        os.environ["LIVE_MODE"] = "true"
-        os.environ["LIVE_ORDER_DRY_RUN"] = "true"
-        os.environ["ORDER_PLACEMENT_ENABLED"] = "false"
-        self.live_disabled = False
-        self._cp_set_status("LIVE DRY-RUN ENABLED (payloads built and logged; no real orders)")
-        try:
-            payload = execute_dry_run_if_requested(
-                candidate_id="gui-button",
-                symbol="NIFTY",
-                exchange="NFO",
-                symbol_token=os.getenv("MSTOCK_OPTION_TOKEN", ""),
-                side="SELL",
-                quantity=65,
-                order_type="LIMIT",
-                price=42.5,
-                expiry=os.getenv("MSTOCK_OPTION_EXPIRY", "2026-06-25"),
-                option_type="PE",
-                ltp=42.5,
-            )
-            self._cp_append_log_samples([
-                {
-                    "candidate_id": "dryrun-button",
-                    "virtual_pnl": 0,
-                    "blocked_reason": payload.get("reason", ""),
-                    "validation_error": payload.get("validation_error", ""),
-                    "live_order_sent": False,
-                    "payload": payload,
-                }
-            ])
-        except Exception as exc:
-            self._cp_set_status(f"Dry-run enable/log error: {type(exc).__name__}: {exc}")
-        try:
-            self._refresh_live_safety()
-        except Exception:
-            pass
-
-    def _cp_disable_live(self):
-        for key in (
-            "LIVE_MODE",
-            "LIVE_ORDER_DRY_RUN",
-            "ORDER_PLACEMENT_ENABLED",
-            "MSTOCK_ENABLE_LIVE_TRADING",
-            "MSTOCK_ENABLE_LIVE_ORDERS",
-            "SCALPER_ALLOW_LIVE_ORDERS",
-            "MANUAL_CONFIRMED_PENDING",
-        ):
-            if key in os.environ:
-                os.environ[key] = "false" if key != "MANUAL_CONFIRMED_PENDING" else ""
-        self.live_disabled = True
-        self._cp_set_status("All live and dry-run flags disabled. Safe mode.")
-        try:
-            self._refresh_live_safety()
-        except Exception:
-            pass
-
-    def _cp_emergency_stop(self):
-        os.environ["SCALPER_KILL_SWITCH"] = "1"
-        os.environ["ORDER_PLACEMENT_ENABLED"] = "false"
-        os.environ["LIVE_ORDER_DRY_RUN"] = "true"
-        os.environ["MANUAL_CONFIRMED_PENDING"] = ""
-        self.live_disabled = True
-        stop = getattr(self, "cp_shadow_stop", None)
-        if stop is not None:
-            stop.set()
-        for eng_name in ("pf_engine", "cp_shadow_engine"):
-            eng = getattr(self, eng_name, None)
-            if eng is not None and hasattr(eng, "stop"):
-                try:
-                    eng.stop()
-                except Exception:
-                    pass
-        try:
-            LOGS_DIR.mkdir(parents=True, exist_ok=True)
-            path = LOGS_DIR / f"emergency_stop_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-            record = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "event": "EMERGENCY_STOP",
-                "live_disabled": True,
-                "order_placement_forced_false": True,
-                "note": "New entries blocked. No automatic orders.",
-            }
-            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-        except Exception as exc:
-            self._cp_set_status(f"Emergency stop active; log write failed: {type(exc).__name__}: {exc}")
-        else:
-            self._cp_set_status("EMERGENCY STOP ACTIVE: kill=1, placement=false, no automatic orders")
-        messagebox.showwarning(
-            "EMERGENCY STOP",
-            "Live order placement is disabled. New entries are blocked. Check logs/emergency_stop_*.jsonl.",
-        )
-
-    # end of Candidate Promotion tab methods + live safety panel
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
@@ -24108,7 +17712,6 @@ def main() -> None:
             registry=registry,
             risk_manager=risk,
             kill_switch=bool(getattr(cfg, "ml_disable_all", False)),
-            shadow_mode_enabled=bool(args.ml_shadow_mode),
             paper_mode_enabled=bool(args.ml_paper_mode),
             min_confidence_threshold=float(getattr(cfg, "ml_min_confidence_threshold", 0.0) or 0.0),
             max_predictions_per_day=int(getattr(cfg, "ml_max_predictions_per_day", 1000) or 1000),

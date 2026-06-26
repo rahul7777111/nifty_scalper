@@ -55,6 +55,15 @@ def load_ensemble_feature_names(artifact_dir: Path) -> list[str]:
             vals = payload.get(key)
             if isinstance(vals, list) and vals:
                 return [str(x) for x in vals if str(x).strip()]
+    ensemble_config = artifact_dir / "ensemble_config.json"
+    if ensemble_config.is_file():
+        try:
+            payload = json.loads(ensemble_config.read_text(encoding="utf-8"))
+            vals = payload.get("feature_columns")
+            if isinstance(vals, list) and vals:
+                return [str(x) for x in vals if str(x).strip()]
+        except Exception:
+            pass
     return []
 
 
@@ -138,6 +147,24 @@ def load_ensemble_selected_threshold(artifact_dir: Path) -> float | None:
                 return float(match.group(1))
         except Exception:
             continue
+    ensemble_config = artifact_dir / "ensemble_config.json"
+    if ensemble_config.is_file():
+        try:
+            payload = json.loads(ensemble_config.read_text(encoding="utf-8"))
+            val = payload.get("ensemble_threshold")
+            if val is not None:
+                return float(val)
+        except Exception:
+            pass
+    ensemble_metrics = artifact_dir / "ensemble_metrics.json"
+    if ensemble_metrics.is_file():
+        try:
+            payload = json.loads(ensemble_metrics.read_text(encoding="utf-8"))
+            val = payload.get("ensemble_threshold")
+            if val is not None:
+                return float(val)
+        except Exception:
+            pass
     return None
 
 
@@ -222,7 +249,22 @@ def _config_model_path_exists(repo_root: Path, config_path: Path) -> bool:
     if not cand:
         return False
     model_path = _resolve_repo_path(repo_root, str(cand.get("model_path") or cand.get("artifact_path") or ""))
-    return bool(model_path and model_path.is_file())
+    if not (model_path and model_path.is_file()):
+        return False
+    feature_source = _resolve_repo_path(repo_root, str(cand.get("feature_order_source") or cand.get("feature_schema_path") or ""))
+    artifact_dir = _resolve_repo_path(repo_root, str(cand.get("artifact_dir") or ""))
+    return bool((feature_source and feature_source.is_file()) or (artifact_dir and artifact_dir.is_dir()))
+
+
+def _discover_raw_ensemble_dir(repo_root: Path) -> tuple[Path | None, Path | None]:
+    artifact_dir = repo_root / "models" / "all_combined_parquet_rf_xgb_ensemble"
+    if not artifact_dir.is_dir():
+        return None, None
+    for name in ("xgboost_model_cuda.pkl", "xgboost_model.pkl", "random_forest_model.pkl"):
+        artifact_path = artifact_dir / name
+        if artifact_path.is_file():
+            return artifact_path, artifact_dir
+    return None, None
 
 
 def discover_latest_ensemble_gui_retrain_root(repo_root: Path) -> Path | None:
@@ -245,7 +287,7 @@ def discover_ensemble_test_target(
 ) -> dict[str, Any]:
     """Resolve the ensemble config/artifact and backtest defaults for the GUI Test button."""
     last_config_path = Path(last_config) if last_config else None
-    if last_config_path and last_config_path.is_file():
+    if last_config_path and last_config_path.is_file() and _config_model_path_exists(repo_root, last_config_path):
         cand = _candidate_from_config(repo_root, last_config_path) or {}
         return {
             "config_path": str(last_config_path),
@@ -294,6 +336,24 @@ def discover_ensemble_test_target(
                 "source": "latest_gui_retrain",
             }
 
+    raw_ensemble_artifact, raw_ensemble_dir = _discover_raw_ensemble_dir(repo_root)
+    raw_ensemble_target: dict[str, Any] | None = None
+    raw_ensemble_key = ("", -1.0)
+    if raw_ensemble_artifact is not None and raw_ensemble_dir is not None:
+        raw_ensemble_key = _artifact_freshness_key(raw_ensemble_artifact)
+        raw_ensemble_target = {
+            "config_path": "",
+            "artifact_path": str(raw_ensemble_artifact),
+            "candidate_id": "",
+            "dataset_hint": resolve_dataset_path(
+                repo_root,
+                _dataset_hint_from_artifact_dir(raw_ensemble_dir),
+            ),
+            "selected_threshold": load_ensemble_selected_threshold(raw_ensemble_dir),
+            "max_trades_per_day": 1,
+            "source": "raw_ensemble_dir",
+        }
+
     static_config = repo_root / "config" / ENSEMBLE_DYNAMIC_CONFIG_NAME
     if static_config.is_file() and _config_model_path_exists(repo_root, static_config):
         static_candidate = _candidate_from_config(repo_root, static_config) or {}
@@ -318,6 +378,10 @@ def discover_ensemble_test_target(
     if latest_gui_target is not None:
         return latest_gui_target
 
+    if raw_ensemble_target is not None:
+        if latest_gui_target is None or raw_ensemble_key >= latest_gui_artifact_key:
+            return raw_ensemble_target
+
     return {
         "error": "Retrain the ensemble first or select a model artifact/config path.",
     }
@@ -336,6 +400,8 @@ def materialize_ensemble_dynamic_candidate(
 
         metrics_payload = _load_ensemble_metrics(artifact_dir)
         raw_threshold = (metrics_payload.get("selected_threshold_from_validation") or {}).get("threshold")
+        if raw_threshold is None:
+            raw_threshold = load_ensemble_selected_threshold(artifact_dir)
         wrapper_threshold = float(raw_threshold) if raw_threshold is not None else 0.45
         source_threshold = float(raw_threshold) if raw_threshold is not None else wrapper_threshold
 
@@ -346,7 +412,13 @@ def materialize_ensemble_dynamic_candidate(
         wrapper_dir.mkdir(parents=True, exist_ok=True)
 
         model_rel = os.path.relpath(artifact_path, wrapper_dir).replace("/", "\\")
-        metrics_path = next(iter(sorted(artifact_dir.glob("*xgb_rf_ensemble*profitable_trade_label*_metrics.json"), reverse=True)), None)
+        metrics_path = next(
+            iter(
+                list(sorted(artifact_dir.glob("*xgb_rf_ensemble*profitable_trade_label*_metrics.json"), reverse=True))
+                + [p for p in (artifact_dir / "ensemble_metrics.json",) if p.exists()]
+            ),
+            None,
+        )
         metrics_rel = (
             str(metrics_path.relative_to(repo_root)).replace("/", "\\")
             if metrics_path and metrics_path.exists()

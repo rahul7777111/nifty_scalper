@@ -32,7 +32,6 @@ CONFIG_FILES = [
     REPO_ROOT / "config" / "shadow_candidates.json",
     REPO_ROOT / "config" / "live_candidate_whitelist.json",
     REPO_ROOT / "config" / "paper_forward_artifact_registry.json",
-    REPO_ROOT / "config" / "ensemble_auto_router.json",
 ]
 ARTIFACT_ROOTS = [
     REPO_ROOT / "artifacts" / "candidates",

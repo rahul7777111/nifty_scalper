@@ -108,6 +108,14 @@ from exit_optimizer import (
 from label_policies import get_label_policy_spec
 from ml_signals import evaluate_ml_gating_before_execution, feature_vector_from_candles, load_model, predict
 
+try:
+    from ml.ensemble_artifact_loader import try_load_ensemble_dir
+except Exception:  # noqa: BLE001
+    try:
+        from ensemble_artifact_loader import try_load_ensemble_dir  # type: ignore
+    except Exception:
+        try_load_ensemble_dir = None  # type: ignore
+
 # Production candidate router (must be called for every entry decision path)
 try:
     from candidate_router import route_candidate_decision, get_last_router_decision
@@ -410,11 +418,22 @@ class NiftyScalper:
             self.exit_optimizer = None
 
         # ML model
+        self.ml_model = None
         try:
             if getattr(cfg, "enable_ml_signals", False):
-                self.ml_model = load_model()
-            else:
-                self.ml_model = None
+                ensemble_dir = str(getattr(cfg, "ensemble_artifact_dir", "") or "").strip()
+                if ensemble_dir and try_load_ensemble_dir is not None:
+                    try:
+                        from pathlib import Path
+                        ad = Path(ensemble_dir)
+                        if ad.exists():
+                            loader = try_load_ensemble_dir(ad)
+                            if loader and getattr(loader, "status", "") == "OK":
+                                self.ml_model = loader
+                    except Exception:
+                        pass
+                if self.ml_model is None:
+                    self.ml_model = load_model()
         except Exception:
             self.ml_model = None
 
@@ -628,11 +647,11 @@ class NiftyScalper:
                     feat_names,
                 )
                 LOGGER.debug(
-                    "ML scoring completed prediction_id=%s prob=%.4f features=%d shadow_mode=%s",
+                    "ML scoring completed prediction_id=%s prob=%.4f features=%d paper_mode=%s",
                     prediction_id,
                     float(ml_prob),
                     len(feat_names),
-                    bool(getattr(self.cfg, "shadow_mode", False)),
+                    bool(getattr(self.cfg, "ml_paper_mode_enabled", False)),
                 )
                 self._last_prediction_id = prediction_id
                 self._last_ml_pred = ml_prob
@@ -896,6 +915,17 @@ class NiftyScalper:
                 )
                 ml_bet_multiplier = float(sizing.get("ml_bet_multiplier", 0.0) or 0.0)
                 final_allocated_lots = int(sizing.get("final_allocated_lots", 0) or 0)
+                try:
+                    router_size_mult = max(0.25, min(1.5, float(self._router_size_multiplier())))
+                except Exception:
+                    router_size_mult = 1.0
+                if final_allocated_lots > 0 and abs(router_size_mult - 1.0) > 1e-9:
+                    step_qty = int(getattr(self.cfg, "lot_size", 1) or 1)
+                    if step_qty <= 0:
+                        step_qty = 1
+                    scaled_lots = int(round(float(final_allocated_lots) * float(router_size_mult)))
+                    scaled_lots = max(step_qty, int(round(float(scaled_lots) / float(step_qty))) * step_qty)
+                    final_allocated_lots = int(scaled_lots)
                 size = final_allocated_lots
 
             self._last_ml_bet_multiplier = float(ml_bet_multiplier)
@@ -1311,6 +1341,7 @@ class NiftyScalper:
                     "spread_pct_at_entry": float(_spread_pct_entry),
                     "execution_friction_status": str(friction_preview.get("status") or ""),
                 }
+                meta.update(self._trade_risk_meta_overrides())
                 if prediction_id:
                     try:
                         meta["triple_barrier"] = self._build_triple_barrier_metadata(
@@ -1399,6 +1430,7 @@ class NiftyScalper:
                 "realized_slippage_pct": float(route_meta.get("realized_slippage_pct") or 0.0),
                 "execution_friction_status": str(route_meta.get("execution_friction_status") or ""),
             }
+            meta_live.update(self._trade_risk_meta_overrides())
             if prediction_id and price:
                 try:
                     meta_live["triple_barrier"] = self._build_triple_barrier_metadata(
@@ -4404,7 +4436,14 @@ class NiftyScalper:
             "fsm": fsm,
         }
 
-    def _build_bracket_levels(self, *, entry_price: Optional[float], side: str, quantity: int = 0) -> Dict[str, object]:
+    def _build_bracket_levels(
+        self,
+        *,
+        entry_price: Optional[float],
+        side: str,
+        quantity: int = 0,
+        risk_overrides: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, object]:
         try:
             px = float(entry_price) if entry_price is not None else None
         except Exception:
@@ -4416,12 +4455,22 @@ class NiftyScalper:
         if side_u not in {"BUY", "SELL"}:
             return {}
 
+        override = risk_overrides if isinstance(risk_overrides, dict) else {}
+
         try:
-            stop_pct = float(getattr(self.cfg, "premium_mtm_stop_pct", 0.30) or 0.30)
+            stop_pct = float(
+                override.get("stop_loss_pct")
+                if override.get("stop_loss_pct") is not None
+                else getattr(self.cfg, "premium_mtm_stop_pct", 0.30) or 0.30
+            )
         except Exception:
             stop_pct = 0.30
         try:
-            target_pct = float(getattr(self.cfg, "premium_mtm_target_pct", 0.18) or 0.18)
+            target_pct = float(
+                override.get("target_pct")
+                if override.get("target_pct") is not None
+                else getattr(self.cfg, "premium_mtm_target_pct", 0.18) or 0.18
+            )
         except Exception:
             target_pct = 0.18
         try:
@@ -4429,7 +4478,11 @@ class NiftyScalper:
         except Exception:
             trail_start_pct = 0.05
         try:
-            trail_stop_pct = float(getattr(self.cfg, "premium_mtm_trail_stop_pct", 0.05) or 0.05)
+            trail_stop_pct = float(
+                override.get("trailing_sl_pct")
+                if override.get("trailing_sl_pct") is not None
+                else getattr(self.cfg, "premium_mtm_trail_stop_pct", 0.05) or 0.05
+            )
         except Exception:
             trail_stop_pct = 0.05
 
@@ -4453,12 +4506,13 @@ class NiftyScalper:
             "quantity": int(quantity),
         }
 
-    def _annotate_leg_brackets(self, leg: Dict[str, object]) -> Dict[str, object]:
+    def _annotate_leg_brackets(self, leg: Dict[str, object], risk_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, object]:
         leg_copy = dict(leg)
         bracket = self._build_bracket_levels(
             entry_price=leg_copy.get("entry_price"),
             side=str(leg_copy.get("side") or ""),
             quantity=int(leg_copy.get("quantity") or 0),
+            risk_overrides=risk_overrides,
         )
         if bracket:
             for key in ("prem_stop", "prem_target", "trail_start", "trail_stop", "stoploss", "targetPrice", "trailingStopLoss"):
@@ -5173,15 +5227,15 @@ class NiftyScalper:
 
         probability = float(probability)
         threshold = float(threshold)
-        shadow_mode = bool(getattr(self.cfg, "shadow_mode", False))
         reason_text = str(reason or "")
-        if shadow_mode:
+        paper_mode = bool(getattr(self.cfg, "ml_paper_mode_enabled", False))
+        if paper_mode:
             if "blocked" in reason_text or "missing" in reason_text:
-                source = "SHADOW_BLOCKED"
+                source = "PAPER_BLOCKED"
             elif take:
-                source = "SHADOW"
+                source = "PAPER"
             else:
-                source = "SHADOW_FILTERED"
+                source = "PAPER_FILTERED"
         else:
             source = "ACTIVE"
         record = {
@@ -5337,11 +5391,27 @@ class NiftyScalper:
 
             if entry_abs is not None and entry_abs > 0:
                 try:
-                    stop_pct_eff = float(meta.get("gpt_mtm_stop_pct")) if isinstance(meta, dict) and meta.get("gpt_mtm_stop_pct") is not None else float(getattr(self.cfg, "premium_mtm_stop_pct", 0.30) or 0.30)
+                    stop_pct_eff = (
+                        float(meta.get("gpt_mtm_stop_pct"))
+                        if isinstance(meta, dict) and meta.get("gpt_mtm_stop_pct") is not None
+                        else float(
+                            meta.get("ml_dynamic_stop_loss_pct")
+                            if isinstance(meta, dict) and meta.get("ml_dynamic_stop_loss_pct") is not None
+                            else getattr(self.cfg, "premium_mtm_stop_pct", 0.30) or 0.30
+                        )
+                    )
                 except Exception:
                     stop_pct_eff = 0.30
                 try:
-                    target_pct_eff = float(meta.get("gpt_mtm_target_pct")) if isinstance(meta, dict) and meta.get("gpt_mtm_target_pct") is not None else float(getattr(self.cfg, "premium_mtm_target_pct", 0.18))
+                    target_pct_eff = (
+                        float(meta.get("gpt_mtm_target_pct"))
+                        if isinstance(meta, dict) and meta.get("gpt_mtm_target_pct") is not None
+                        else float(
+                            meta.get("ml_dynamic_target_pct")
+                            if isinstance(meta, dict) and meta.get("ml_dynamic_target_pct") is not None
+                            else getattr(self.cfg, "premium_mtm_target_pct", 0.18)
+                        )
+                    )
                 except Exception:
                     target_pct_eff = 0.18
 
@@ -5397,7 +5467,11 @@ class NiftyScalper:
                     stop_pct_eff = (
                         float(meta.get("gpt_mtm_stop_pct"))
                         if isinstance(meta, dict) and meta.get("gpt_mtm_stop_pct") is not None
-                        else float(getattr(self.cfg, "premium_mtm_stop_pct", 0.30) or 0.30)
+                        else float(
+                            meta.get("ml_dynamic_stop_loss_pct")
+                            if isinstance(meta, dict) and meta.get("ml_dynamic_stop_loss_pct") is not None
+                            else getattr(self.cfg, "premium_mtm_stop_pct", 0.30) or 0.30
+                        )
                     )
                 except Exception:
                     stop_pct_eff = 0.30
@@ -5405,7 +5479,11 @@ class NiftyScalper:
                     target_pct_eff = (
                         float(meta.get("gpt_mtm_target_pct"))
                         if isinstance(meta, dict) and meta.get("gpt_mtm_target_pct") is not None
-                        else float(getattr(self.cfg, "premium_mtm_target_pct", 0.18))
+                        else float(
+                            meta.get("ml_dynamic_target_pct")
+                            if isinstance(meta, dict) and meta.get("ml_dynamic_target_pct") is not None
+                            else getattr(self.cfg, "premium_mtm_target_pct", 0.18)
+                        )
                     )
                 except Exception:
                     target_pct_eff = 0.18
@@ -5973,9 +6051,9 @@ class NiftyScalper:
             factor *= float(atr_factor)
 
         try:
-            qty = int(round(float(base_qty) * float(factor)))
+            qty = int(round(float(qty) * float(factor)))
         except Exception:
-            qty = base_qty
+            qty = max(base_qty, qty)
 
         try:
             step = int(getattr(self.cfg, "risk_scale_step_qty", 0) or 0)
@@ -6007,6 +6085,16 @@ class NiftyScalper:
         if max_qty > 0:
             qty = min(max_qty, qty)
 
+        try:
+            size_mult = float(self._router_size_multiplier())
+        except Exception:
+            size_mult = 1.0
+        size_mult = max(0.25, min(1.5, float(size_mult)))
+        if abs(size_mult - 1.0) > 1e-9:
+            qty = max(step, int(round(float(qty) * float(size_mult)) / float(step)) * int(step))
+            if max_qty > 0:
+                qty = min(max_qty, qty)
+
         # P3: Apply GPT position sizing factor
         try:
             if getattr(self.cfg, "gpt_position_sizing_enabled", False):
@@ -6022,6 +6110,46 @@ class NiftyScalper:
         except Exception:
             pass
         return int(qty)
+
+    def _router_risk_overrides(self) -> Dict[str, Any]:
+        router_dec = getattr(self, "_last_router_decision", None) or {}
+        risk = router_dec.get("risk") if isinstance(router_dec, dict) else {}
+        if not isinstance(risk, dict):
+            return {}
+        return dict(risk)
+
+    def _router_size_multiplier(self) -> float:
+        risk = self._router_risk_overrides()
+        try:
+            return float(risk.get("size_multiplier") or 1.0)
+        except Exception:
+            return 1.0
+
+    def _trade_risk_meta_overrides(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        risk = self._router_risk_overrides()
+        out: Dict[str, Any] = {}
+        for key in (
+            "stop_loss_pct",
+            "target_pct",
+            "trailing_sl_pct",
+            "size_multiplier",
+            "dir_sl_atr_mult",
+            "dir_tp_atr_mult",
+            "dir_trail_atr_mult",
+            "cooldown_minutes",
+            "max_trades_per_day",
+        ):
+            value = risk.get(key)
+            if value is not None:
+                out[f"ml_dynamic_{key}"] = value
+        router_dec = getattr(self, "_last_router_decision", None) or {}
+        if isinstance(router_dec, dict):
+            selected_preset = str(router_dec.get("selected_preset") or "").strip()
+            if selected_preset:
+                out["ml_dynamic_preset"] = selected_preset
+        if extra:
+            out.update(extra)
+        return out
 
     def _current_atm_iv(self, call: Optional[dict], put: Optional[dict]) -> Optional[float]:
         vals: List[float] = []
@@ -8389,7 +8517,7 @@ class NiftyScalper:
                 "iv": opt.get("iv"),
             }
         ]
-        projected_legs = [self._annotate_leg_brackets(lg) for lg in projected_legs]
+        projected_legs = [self._annotate_leg_brackets(lg, risk_overrides=self._trade_risk_meta_overrides()) for lg in projected_legs]
         if not self._portfolio_caps_allow_legs(float(spot), projected_legs, context=f"directional {name}"):
             return None
         # Optional: allow GPT gate TAKE to override price / liquidity checks
@@ -8557,6 +8685,7 @@ class NiftyScalper:
             "final_allocated_lots": int(getattr(self, "_last_final_allocated_lots", qty) or qty),
             "order_routing_style": "midpoint_pegged_limit",
         }
+        meta.update(self._trade_risk_meta_overrides())
         try:
             if not self.cfg.enable_live_trading:
                 meta["live_bid_ask_spread_pct"] = float(friction_preview.get("relative_spread_pct") or 0.0)
@@ -8629,7 +8758,7 @@ class NiftyScalper:
                 "strike": strike,
                 "option_type": opt_type,
                 "expiry": expiry,
-            })]
+            }, risk_overrides=self._trade_risk_meta_overrides())]
             self._emit(
                 TradeLogEvent(
                     ts=time.time(),
@@ -11152,7 +11281,20 @@ class NiftyScalper:
 
     def _record_multi_trade_with_meta(self, name: str, legs: List[dict], meta: Optional[Dict[str, object]]) -> None:
         trade_id = self._new_trade_id("M")
-        legs = [self._annotate_leg_brackets(dict(lg)) for lg in legs if isinstance(lg, dict)]
+        effective_meta: Dict[str, object] = dict(meta or {})
+        effective_meta.update(self._trade_risk_meta_overrides())
+        legs = [
+            self._annotate_leg_brackets(
+                dict(lg),
+                risk_overrides={
+                    "stop_loss_pct": effective_meta.get("ml_dynamic_stop_loss_pct"),
+                    "target_pct": effective_meta.get("ml_dynamic_target_pct"),
+                    "trailing_sl_pct": effective_meta.get("ml_dynamic_trailing_sl_pct"),
+                },
+            )
+            for lg in legs
+            if isinstance(lg, dict)
+        ]
         payload: Dict[str, object] = {
             "trade_id": trade_id,
             "name": name,
@@ -11161,8 +11303,8 @@ class NiftyScalper:
         }
 
         # Ensure delta-hedge scope can apply to multi trades (e.g. strategy=`auto`).
-        if meta is not None:
-            payload["meta"] = meta
+        if effective_meta:
+            payload["meta"] = effective_meta
         self._apply_delta_hedge_scope(payload, position_type="multi")
 
         # ---- Pyramiding for multi-leg trades ----
@@ -13219,6 +13361,24 @@ class NiftyScalper:
                     and bool(router_decision.get("allowed_by_risk"))
                 )
                 router_no_trade_reason = router_decision.get("no_trade_reason") or ""
+                risk_cfg = (router_decision or {}).get("risk") if isinstance(router_decision, dict) else {}
+                if isinstance(risk_cfg, dict):
+                    try:
+                        router_max_trades = int(risk_cfg.get("max_trades_per_day") or 0)
+                    except Exception:
+                        router_max_trades = 0
+                    if router_max_trades > 0 and int(self.state.trades_today) >= router_max_trades:
+                        router_allowed = False
+                        router_no_trade_reason = f"router_max_trades_{self.state.trades_today}_gte_{router_max_trades}"
+                    try:
+                        cooldown_minutes = int(risk_cfg.get("cooldown_minutes") or 0)
+                    except Exception:
+                        cooldown_minutes = 0
+                    if cooldown_minutes > 0:
+                        last_entry_ts = float(getattr(self.state, "last_entry_ts", 0.0) or 0.0)
+                        if last_entry_ts > 0 and (time.time() - last_entry_ts) < (cooldown_minutes * 60):
+                            router_allowed = False
+                            router_no_trade_reason = f"router_cooldown_{cooldown_minutes}m_active"
                 # Stash for GUI + later placement guards
                 self._last_router_decision = router_decision
                 self._last_router_allowed = router_allowed
@@ -15657,7 +15817,8 @@ class NiftyScalper:
             except Exception:
                 be_mult = 0.6
             try:
-                trail_mult = float(getattr(self.cfg, "dir_trail_atr_mult", 1.0) or 1.0)
+                router_risk = self._router_risk_overrides()
+                trail_mult = float(router_risk.get("dir_trail_atr_mult") or getattr(self.cfg, "dir_trail_atr_mult", 1.0) or 1.0)
             except Exception:
                 trail_mult = 1.0
             try:
@@ -15707,6 +15868,7 @@ class NiftyScalper:
                 token = tr.get("token")
                 exchange = str(tr.get("exchange") or "") or None
                 entry_price = tr.get("entry_price")
+                meta = tr.get("meta") if isinstance(tr.get("meta"), dict) else {}
                 tb_state = self._extract_triple_barrier_state(tr)
                 if tb_state is not None:
                     tb_legs = tr.get("legs")
@@ -15937,7 +16099,11 @@ class NiftyScalper:
                                 pass
 
                         # Target Exit (Final TP)
-                        tp_mult = float(getattr(self.cfg, "dir_tp_atr_mult", 0.0))
+                        tp_mult = float(
+                            meta.get("ml_dynamic_dir_tp_atr_mult")
+                            if isinstance(meta, dict) and meta.get("ml_dynamic_dir_tp_atr_mult") is not None
+                            else getattr(self.cfg, "dir_tp_atr_mult", 0.0)
+                        )
                         if tp_mult > 0:
                             tp_price = entry_spot + (tp_mult * atr_val)
                             try:
@@ -16082,7 +16248,11 @@ class NiftyScalper:
                             be_trigger_mult = max(float(be_mult_local), 0.0)
                             
                             # Explicit ATR Stop Loss
-                            sl_mult = float(getattr(self.cfg, "dir_sl_atr_mult", 1.5))
+                            sl_mult = float(
+                                meta.get("ml_dynamic_dir_sl_atr_mult")
+                                if isinstance(meta, dict) and meta.get("ml_dynamic_dir_sl_atr_mult") is not None
+                                else getattr(self.cfg, "dir_sl_atr_mult", 1.5)
+                            )
                             # ---- #6: Theta-Adjusted Stop Distance ----
                             try:
                                 if bool(getattr(self.cfg, "theta_stop_widen_enabled", False)):
@@ -16161,7 +16331,11 @@ class NiftyScalper:
                                     reason = f"pivot_target_{tgt_key}"
 
                         # Target Exit (Final TP)
-                        tp_mult = float(getattr(self.cfg, "dir_tp_atr_mult", 0.0))
+                        tp_mult = float(
+                            meta.get("ml_dynamic_dir_tp_atr_mult")
+                            if isinstance(meta, dict) and meta.get("ml_dynamic_dir_tp_atr_mult") is not None
+                            else getattr(self.cfg, "dir_tp_atr_mult", 0.0)
+                        )
                         if tp_mult > 0:
                             tp_price = entry_spot - (tp_mult * atr_val)
                             try:
@@ -16295,7 +16469,11 @@ class NiftyScalper:
                             be_trigger_mult = max(float(be_mult_local), 0.0)
                             
                             # Explicit ATR Stop Loss
-                            sl_mult = float(getattr(self.cfg, "dir_sl_atr_mult", 1.5))
+                            sl_mult = float(
+                                meta.get("ml_dynamic_dir_sl_atr_mult")
+                                if isinstance(meta, dict) and meta.get("ml_dynamic_dir_sl_atr_mult") is not None
+                                else getattr(self.cfg, "dir_sl_atr_mult", 1.5)
+                            )
                             # ---- #6: Theta-Adjusted Stop Distance ----
                             try:
                                 if bool(getattr(self.cfg, "theta_stop_widen_enabled", False)):

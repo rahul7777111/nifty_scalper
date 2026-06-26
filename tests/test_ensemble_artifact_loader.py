@@ -208,6 +208,46 @@ def test_loader_predict_with_missing_features(tmp_path: Path) -> None:
     assert result["status"] == STATUS_OK or result["status"] == STATUS_FEATURES_MISSING
 
 
+def test_loader_supports_joblib_serialized_pkl(tmp_path: Path) -> None:
+    """Loader must handle joblib-written models even when they use a .pkl suffix."""
+    from ml.ensemble_artifact_loader import EnsembleArtifactLoader, STATUS_OK
+
+    import joblib
+
+    d = tmp_path / "joblib_ensemble"
+    d.mkdir()
+
+    joblib.dump(FakeModel(prob=0.57), d / "random_forest_model.pkl")
+    joblib.dump(FakeModel(prob=0.67), d / "xgboost_model.pkl")
+    (d / "ensemble_config.json").write_text(
+        json.dumps(
+            {
+                "feature_columns": ["open", "high", "low", "ltp"],
+                "fill_values": {"open": 100.0, "high": 101.0, "low": 99.0, "ltp": 100.5},
+                "xgb_weight": 0.7,
+                "rf_weight": 0.3,
+                "ensemble_threshold": 0.6,
+                "xgb_min_prob": 0.58,
+                "rf_min_prob": 0.52,
+                "max_model_disagreement": 0.25,
+                "block_on_disagreement": True,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    loader = EnsembleArtifactLoader(d).load()
+    assert loader.status == STATUS_OK
+    assert loader.rf_model is not None
+    assert loader.xgb_model is not None
+
+    result = loader.predict({"open": 100.0, "high": 101.0, "low": 99.0, "ltp": 100.5})
+    assert result["status"] == STATUS_OK
+    assert result["rf_prob"] == pytest.approx(0.57, abs=1e-6)
+    assert result["xgb_prob"] == pytest.approx(0.67, abs=1e-6)
+
+
 def test_loader_predict_missing_models(tmp_path: Path) -> None:
     """``EnsembleArtifactLoader`` gracefully handles missing model files."""
     from ml.ensemble_artifact_loader import (

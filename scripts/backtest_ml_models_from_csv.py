@@ -5,7 +5,7 @@ scripts/backtest_ml_models_from_csv.py
 Offline historical ML-driven backtester for NIFTY options chain CSV data.
 
 - Tolerant column mapping for common option data fields (timestamp, ltp/close, strike, option_type, trading_symbol, etc.)
-- Loads ML candidate config (paper_forward_candidates.json style) if provided; loads model bundles and scores rows.
+- Loads an ML candidate config/model artifact if provided; otherwise can use embedded score columns.
 - Falls back to pre-existing model_score / probability / proba columns in the CSV if no model/config.
 - Applies simple filters (spread, premium, DTE proxy via expiry if parsable).
 - Simulates entries on score >= threshold (with daily cap).
@@ -92,6 +92,14 @@ except Exception:
     def estimate_option_execution_costs_frame(frame: pd.DataFrame, config: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
         recs = [estimate_option_execution_cost(r, config=config) for r in frame.to_dict("records")]
         return pd.DataFrame.from_records(recs, index=frame.index)
+
+try:
+    from src.ml.ensemble_artifact_loader import try_load_ensemble_dir  # type: ignore
+except Exception:
+    try:
+        from ml.ensemble_artifact_loader import try_load_ensemble_dir  # type: ignore
+    except Exception:
+        try_load_ensemble_dir = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +295,44 @@ def _resolve_path(value: Any, root: Optional[Path] = None, base: Optional[Path] 
     return (root / p).resolve()
 
 
+def _config_has_candidate_rows(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    rows = payload.get("candidates", payload.get("selected_candidates", payload.get("models", [])))
+    return bool(isinstance(rows, list) and rows)
+
+
+def _prefer_wrapped_candidate_config(
+    value: Optional[str],
+    *,
+    root: Path,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> tuple[Optional[Path], Optional[Path]]:
+    requested = _resolve_path(value, root=root) if value else None
+    if requested is None or not requested.exists() or requested.is_file():
+        return requested, requested
+
+    wrapper_config = (root / "config" / "ensemble_xgb_rf_dynamic_candidate.json").resolve()
+    if not wrapper_config.is_file() or not _config_has_candidate_rows(wrapper_config):
+        return requested, requested
+
+    broad_models_root = (root / "models").resolve()
+    raw_ensemble_dir = (root / "models" / "all_combined_parquet_rf_xgb_ensemble").resolve()
+    if requested.resolve() not in {broad_models_root, raw_ensemble_dir}:
+        return requested, requested
+
+    _log(
+        log_fn,
+        f"Candidate config path {requested} points at a broad/raw model directory; "
+        f"using guarded ensemble wrapper {wrapper_config} instead.",
+    )
+    return wrapper_config, requested
+
+
 def _normalize_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(name or "").strip().lower()).strip("_")
 
@@ -471,6 +517,14 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         col_map[oicol] = "oi"
     if col_map:
         df = df.rename(columns=col_map)
+    if "ltp" not in df.columns and {"bid", "ask"}.issubset(df.columns):
+        bid = pd.to_numeric(df["bid"], errors="coerce")
+        ask = pd.to_numeric(df["ask"], errors="coerce")
+        mid = ((bid + ask) / 2.0).where((bid > 0) & (ask > 0) & (ask >= bid))
+        if mid.notna().any():
+            df["ltp"] = mid
+            if "mid_price" not in df.columns:
+                df["mid_price"] = mid
     # Preserve model-facing aliases after canonical trade-column normalization.
     if "strike" in df.columns and "strike_price" not in df.columns:
         df["strike_price"] = df["strike"]
@@ -743,7 +797,20 @@ def _get_price(row: pd.Series) -> float:
     for c in ("ltp", "close", "price", "premium"):
         if c in row and pd.notna(row[c]):
             return _safe_float(row[c], 0.0)
+    bid = _safe_float(row.get("bid"), 0.0)
+    ask = _safe_float(row.get("ask"), 0.0)
+    if ask >= bid > 0:
+        return (bid + ask) / 2.0
     return 0.0
+
+
+def _selected_price_column_label(df: pd.DataFrame) -> str | None:
+    for col in ("ltp", "close", "price", "premium"):
+        if col in df.columns:
+            return col
+    if {"bid", "ask"}.issubset(df.columns):
+        return "mid_from_bid_ask"
+    return None
 
 
 def _get_spread_pct(row: pd.Series) -> float:
@@ -1133,6 +1200,52 @@ class _XgbRfEnsembleAdapter:
         return self.predict_proba(X)[:, 1] - 0.5
 
 
+class _EnsembleArtifactDirAdapter:
+    """Backtest adapter for directory-based RF+XGB ensemble artifacts.
+
+    The adapter uses the existing ensemble gate logic and emits 0 probability
+    when a row is blocked by the ensemble gates, so backtests do not silently
+    degrade into raw XGBoost-only scoring.
+    """
+
+    def __init__(self, loader: Any, feature_names: Optional[List[str]] = None) -> None:
+        self.loader = loader
+        self.feature_names_in_ = list(feature_names or list(getattr(loader, "feature_columns", []) or []))
+        self.classes_ = [0, 1]
+
+    def _predict_positive_prob_from_row(self, row: Any) -> float:
+        if hasattr(row, "to_dict"):
+            payload = row.to_dict()
+        elif isinstance(row, dict):
+            payload = dict(row)
+        else:
+            payload = {}
+        result = self.loader.predict(payload)
+        if str(result.get("status") or "") != "OK":
+            return 0.0
+        if not bool(result.get("allowed")):
+            return 0.0
+        return _safe_float(result.get("ensemble_prob"), 0.0)
+
+    def predict_proba(self, X: Any) -> Any:
+        import numpy as np
+
+        if hasattr(X, "iterrows"):
+            positive = [self._predict_positive_prob_from_row(row) for _, row in X.iterrows()]
+        else:
+            positive = [self._predict_positive_prob_from_row(row) for row in X]
+        pos = np.clip(np.asarray(positive, dtype=float).reshape(-1), 0.0, 1.0)
+        return np.column_stack([1.0 - pos, pos])
+
+    def predict(self, X: Any) -> Any:
+        import numpy as np
+
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+    def decision_function(self, X: Any) -> Any:
+        return self.predict_proba(X)[:, 1] - 0.5
+
+
 def _extract_named_component(container: Any, keys: Iterable[str]) -> Any:
     if container is None:
         return None
@@ -1215,6 +1328,75 @@ def _extract_xgb_rf_ensemble_estimator(obj: Any, feature_cols: Optional[List[str
         rf_weight=float(rf_weight),
         feature_names=list(feature_cols or []),
     )
+
+
+def _load_ensemble_dir_estimator(
+    cand: Dict[str, Any],
+    *,
+    root: Path,
+    config_dir: Optional[Path],
+    fallback_threshold: float,
+    use_candidate_thresholds: bool,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> Optional[LoadedCandidateModel]:
+    if str(cand.get("model_name") or "").strip().lower() != "xgb_rf_ensemble":
+        return None
+    if try_load_ensemble_dir is None:
+        return None
+    resolved_artifact_dir = _resolve_path(cand.get("artifact_dir") or cand.get("model_dir"), root=root, base=config_dir)
+    resolved_model_path = _resolve_path(cand.get("model_path") or cand.get("artifact_path"), root=root, base=config_dir)
+    candidate_dirs: List[Path] = []
+    for maybe_dir in (
+        resolved_artifact_dir,
+        resolved_model_path.parent if resolved_model_path and resolved_model_path.exists() else None,
+    ):
+        if maybe_dir is not None and maybe_dir.is_dir() and maybe_dir not in candidate_dirs:
+            candidate_dirs.append(maybe_dir)
+
+    loader = None
+    ensemble_dir = None
+    for maybe_dir in candidate_dirs:
+        try:
+            maybe_loader = try_load_ensemble_dir(maybe_dir)
+        except Exception as exc:
+            _log(log_fn, f"Candidate {cand.get('candidate_id') or 'xgb_rf_ensemble'}: ensemble dir load failed for {maybe_dir}: {exc}")
+            continue
+        if maybe_loader is None:
+            continue
+        if str(getattr(maybe_loader, "status", "") or "").upper() in {"ARTIFACT_NOT_FOUND", "MODEL_LOAD_FAILED"}:
+            _log(log_fn, f"Candidate {cand.get('candidate_id') or 'xgb_rf_ensemble'}: ensemble dir not ready for {maybe_dir}: {getattr(maybe_loader, 'error', '')}")
+            continue
+        loader = maybe_loader
+        ensemble_dir = maybe_dir
+        break
+    if loader is None or ensemble_dir is None:
+        return None
+    feature_cols, feature_source = _candidate_declared_feature_order(
+        cand,
+        root=root,
+        config_dir=config_dir,
+        artifact_path=ensemble_dir,
+    )
+    if not feature_cols:
+        feature_cols = list(getattr(loader, "feature_columns", []) or [])
+        feature_source = feature_source or "ensemble_config.feature_columns"
+    threshold_value = _candidate_threshold(cand, fallback_threshold, use_candidate_thresholds=use_candidate_thresholds)
+    model = LoadedCandidateModel(
+        candidate_id=str(cand.get("candidate_id") or cand.get("id") or ensemble_dir.name),
+        artifact_path=ensemble_dir,
+        estimator=_EnsembleArtifactDirAdapter(loader, feature_names=feature_cols),
+        feature_cols=[str(x) for x in feature_cols if str(x).strip()],
+        threshold=float(threshold_value),
+        metadata={"source": "ensemble_artifact_dir", "gate_config": dict(getattr(loader, "gate_config", {}) or {})},
+        feature_source=feature_source or "ensemble_artifact_dir",
+        model_type="xgb_rf_ensemble",
+        option_type_filter=_candidate_option_types(cand),
+        filters=cand.get("filters") or cand.get("entry_filters") or {},
+        preset=cand.get("preset") if isinstance(cand.get("preset"), dict) else {},
+        max_trades_per_day=_candidate_max_trades_per_day(cand),
+    )
+    _log(log_fn, f"Candidate {model.candidate_id}: selected ensemble artifact dir {ensemble_dir} threshold={model.threshold:.4f}")
+    return model
 
 
 def _find_predictable_model(obj: Any, depth: int = 0) -> Any:
@@ -1596,10 +1778,18 @@ def _load_candidate_model(
     allow_artifact_fallback: bool = False,
     debug: bool = False,
 ) -> Tuple[Optional[LoadedCandidateModel], List[ArtifactLoadFailure]]:
-    from candidate_artifact_resolver import log_artifact_resolution, resolve_candidate_artifact
-
     cid = str(cand.get("candidate_id") or cand.get("id") or cand.get("model_name") or "candidate")
     failures: List[ArtifactLoadFailure] = []
+    ensemble_dir_model = _load_ensemble_dir_estimator(
+        cand,
+        root=root,
+        config_dir=config_dir,
+        fallback_threshold=fallback_threshold,
+        use_candidate_thresholds=use_candidate_thresholds,
+        log_fn=log_fn,
+    )
+    if ensemble_dir_model is not None:
+        return ensemble_dir_model, failures
     direct_artifact = bool(cand.get("direct_model_artifact"))
     direct_path = _resolve_path(cand.get("model_path") or cand.get("artifact_path"), root=root, base=config_dir)
     if direct_artifact and direct_path and direct_path.is_file() and direct_path.suffix.lower() in {".pkl", ".joblib"}:
@@ -1638,6 +1828,29 @@ def _load_candidate_model(
             _log(log_fn, tb)
             failures.append(ArtifactLoadFailure(cid, str(artifact), str(exc), tb))
             return None, failures
+
+    try:
+        from candidate_artifact_resolver import log_artifact_resolution, resolve_candidate_artifact
+    except Exception as exc:
+        direct_path = _resolve_path(cand.get("model_path") or cand.get("artifact_path"), root=root, base=config_dir)
+        if direct_path and direct_path.is_file() and direct_path.suffix.lower() in {".pkl", ".joblib"}:
+            try:
+                obj = _load_pickle_or_joblib(direct_path)
+                model = _normalize_loaded_artifact(
+                    cand,
+                    direct_path,
+                    obj,
+                    fallback_threshold=fallback_threshold,
+                    use_candidate_thresholds=use_candidate_thresholds,
+                )
+                _log(log_fn, f"Candidate {cid}: selected direct artifact path {direct_path} threshold={model.threshold:.4f}")
+                return model, failures
+            except Exception as load_exc:
+                tb = traceback.format_exc()
+                failures.append(ArtifactLoadFailure(cid, str(direct_path), str(load_exc), tb))
+                return None, failures
+        failures.append(ArtifactLoadFailure(cid, str(direct_path or ""), f"candidate_artifact_resolver_unavailable:{exc}"))
+        return None, failures
 
     resolution = resolve_candidate_artifact(
         cand,
@@ -2395,7 +2608,11 @@ def run_historical_ml_backtest(
     root = _project_root()
     csv_abs = _resolve_path(csv_path, root=root) or Path(csv_path).resolve()
     data_abs = _preferred_data_path(csv_abs, log_fn)
-    config_abs = _resolve_path(candidate_config_path, root=root) if candidate_config_path else None
+    config_abs, requested_config_abs = _prefer_wrapped_candidate_config(
+        candidate_config_path,
+        root=root,
+        log_fn=log_fn,
+    )
     out_dir = _resolve_path(output_dir, root=root) or (root / output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = _now_stamp()
@@ -2648,6 +2865,7 @@ def run_historical_ml_backtest(
             "status": status,
             "csv_path": str(csv_abs),
             "candidate_config_path": str(config_abs) if config_abs else None,
+            "requested_candidate_config_path": str(requested_config_abs) if requested_config_abs else None,
             "parameters": {
                 "fallback_threshold": threshold,
                 "use_candidate_thresholds": use_candidate_thresholds,
@@ -2996,11 +3214,16 @@ def run_historical_ml_backtest(
     top_20_scores = top_scores[:20]
     artifact_failure_payload = [asdict(f) for f in artifact_failures]
     selected_score_label = selected_score_col or ("artifact_model_scores" if loaded_models else None)
+    if selected_score_label is None and score_candidates:
+        selected_score_label = ",".join(
+            str(model.score_column or model.candidate_id).replace("csv_score::", "")
+            for model in score_candidates[:5]
+        )
     zero_trade_diagnostics = {
         "total_rows": original_rows,
         "valid_timestamp_rows": valid_timestamp_rows,
         "valid_price_rows": valid_price_rows,
-        "selected_price_column": "ltp" if "ltp" in df.columns else None,
+        "selected_price_column": _selected_price_column_label(df),
         "selected_timestamp_column": "timestamp" if "timestamp" in df.columns else None,
         "selected_score_column": selected_score_label,
         "rows_above_threshold": rows_above_threshold,
@@ -3013,7 +3236,7 @@ def run_historical_ml_backtest(
             "select the correct artifact directory or repair candidate config paths",
             "run the retrainer/export step to materialize model.pkl/joblib artifacts",
             "use a CSV with embedded score/probability columns",
-            "repair config/paper_forward_candidates.json artifact_path/model_path fields",
+            "repair candidate config artifact_path/model_path fields or select a valid model artifact",
         ],
     }
 
@@ -3023,6 +3246,7 @@ def run_historical_ml_backtest(
         "csv_path": str(csv_abs),
         "data_path": str(data_abs),
         "candidate_config_path": str(config_abs) if config_abs else None,
+        "requested_candidate_config_path": str(requested_config_abs) if requested_config_abs else None,
         "parameters": {
             "fallback_threshold": threshold,
             "use_candidate_thresholds": use_candidate_thresholds,
@@ -3065,6 +3289,7 @@ def run_historical_ml_backtest(
         "feature_materialization": feature_materialization,
         "csv_score_candidate_count": len(score_candidates),
         "selected_score_column": selected_score_label,
+        "selected_price_column": _selected_price_column_label(df),
         "rows_above_threshold": rows_above_threshold,
         "rejected_by_filters": int(sum(v for k, v in rejection_counts.items() if k != "score_threshold")),
         "rejection_counts": dict(rejection_counts),
@@ -3149,7 +3374,7 @@ def run_historical_ml_backtest(
             f"- total_rows: {original_rows}",
             f"- valid_timestamp_rows: {valid_timestamp_rows}",
             f"- valid_price_rows: {valid_price_rows}",
-            f"- selected_price_column: {'ltp' if 'ltp' in df.columns else 'none'}",
+            f"- selected_price_column: {_selected_price_column_label(df) or 'none'}",
             f"- selected_timestamp_column: {'timestamp' if 'timestamp' in df.columns else 'none'}",
             f"- selected_score_column: {selected_score_label or 'none'}",
             f"- rows_above_threshold: {rows_above_threshold}",
@@ -3181,7 +3406,7 @@ def run_historical_ml_backtest(
             "- Select the correct artifact directory or repair candidate config paths.",
             "- Run retrainer/export step to materialize model artifacts.",
             "- Use a CSV with embedded score/probability columns.",
-            "- Repair candidate config paths in `config/paper_forward_candidates.json`.",
+            "- Repair candidate config artifact/model paths or select a valid model artifact.",
         ])
     if stopped:
         lines.append("- Backtest was stopped early; results are partial.")
@@ -3223,7 +3448,7 @@ def run_historical_ml_backtest(
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description="Run ML score threshold backtest over historical options CSV.")
     p.add_argument("--csv", required=True, help="Path to historical options CSV (processed or raw with tolerant cols)")
-    p.add_argument("--config", default=None, help="Path to ML candidate config JSON (e.g. config/paper_forward_candidates.json)")
+    p.add_argument("--config", default=None, help="Path to ML candidate config JSON, model artifact, or artifact directory")
     p.add_argument("--output-dir", "--output", dest="output_dir", default="reports/backtests", help="Where to write artefacts")
     p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
     p.add_argument("--target-pct", type=float, default=DEFAULT_TARGET_PCT)

@@ -43,6 +43,14 @@
       "max_open_positions": 1,
       "spread_limit_tier": "tight",
       "feature_coverage_minimum": 0.97,
+      "cooldown_minutes": 20,
+      "stop_loss_pct": 0.22,
+      "target_pct": 0.14,
+      "trailing_sl_pct": 0.04,
+      "size_multiplier": 0.5,
+      "dir_sl_atr_mult": 1.2,
+      "dir_tp_atr_mult": 1.8,
+      "dir_trail_atr_mult": 0.7,
       "description": "Paper only, +0.05 threshold bump, max 1 trade/day, tighter spread limit"
     },
     "NORMAL": {
@@ -55,6 +63,14 @@
       "max_open_positions": 1,
       "spread_limit_tier": "normal",
       "feature_coverage_minimum": 0.95,
+      "cooldown_minutes": 10,
+      "stop_loss_pct": 0.28,
+      "target_pct": 0.18,
+      "trailing_sl_pct": 0.05,
+      "size_multiplier": 0.8,
+      "dir_sl_atr_mult": 1.4,
+      "dir_tp_atr_mult": 2.2,
+      "dir_trail_atr_mult": 0.9,
       "description": "Paper only, base threshold, max 3 trades/day"
     },
     "AGGRESSIVE_SHADOW_ONLY": {
@@ -67,6 +83,14 @@
       "max_open_positions": 2,
       "spread_limit_tier": "wide",
       "feature_coverage_minimum": 0.93,
+      "cooldown_minutes": 5,
+      "stop_loss_pct": 0.34,
+      "target_pct": 0.24,
+      "trailing_sl_pct": 0.08,
+      "size_multiplier": 1.0,
+      "dir_sl_atr_mult": 1.8,
+      "dir_tp_atr_mult": 3.0,
+      "dir_trail_atr_mult": 1.15,
       "allowed_modes": ["shadow"],
       "description": "Shadow-logged only, -0.03 threshold max, NEVER paper or live"
     }

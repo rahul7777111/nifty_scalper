@@ -118,16 +118,24 @@ def _find_rf_model(path: Path) -> Optional[Path]:
 
 
 def _load_pickle(path: Path) -> Any:
+    joblib_error: Optional[Exception] = None
     suffix = path.suffix.lower()
-    if suffix == ".joblib":
+    if suffix in {".joblib", ".pkl", ".pickle"}:
         try:
             import joblib  # type: ignore[import-untyped]
+
             return joblib.load(path)
-        except Exception:
-            pass
-    with path.open("rb") as fh:
-        import pickle
-        return pickle.load(fh)
+        except Exception as exc:
+            joblib_error = exc
+    try:
+        with path.open("rb") as fh:
+            import pickle
+
+            return pickle.load(fh)
+    except Exception:
+        if joblib_error is not None:
+            raise joblib_error
+        raise
 
 
 def _find_positive_class_index(model: Any) -> Optional[int]:

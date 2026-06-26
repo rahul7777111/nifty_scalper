@@ -30,8 +30,6 @@ class StrategyConfig:
     max_daily_profit: float = 10000.0
     polling_interval_sec: float = 1.0
     enable_live_trading: bool = False
-    shadow_mode: bool = False
-    ml_shadow_mode_enabled: bool = False
     ml_paper_mode_enabled: bool = False
     ml_deployment_manifest_path: str = ""
     ml_min_confidence_threshold: float = 0.0
@@ -435,6 +433,7 @@ class StrategyConfig:
     # ---- Enhancement toggles ----
     enable_volatility_forecast: bool = True
     enable_ml_signals: bool = True
+    ensemble_artifact_dir: str = "models/all_combined_parquet_rf_xgb_ensemble"
     enable_cvar_sizing: bool = False
     cvar_target: float = 0.05
     enable_exit_optimizer: bool = True
@@ -2240,12 +2239,6 @@ def load_strategy_config() -> StrategyConfig:
     if live is not None:
         cfg.enable_live_trading = str(live).strip().lower() in {"1", "true", "yes", "y"}
 
-    shadow = os.getenv("MSTOCK_SHADOW_MODE")
-    if shadow is not None:
-        cfg.shadow_mode = str(shadow).strip().lower() in {"1", "true", "yes", "y"}
-    shadow_mode = os.getenv("ML_SHADOW_MODE_ENABLED")
-    if shadow_mode is not None:
-        cfg.ml_shadow_mode_enabled = str(shadow_mode).strip().lower() in {"1", "true", "yes", "y"}
     paper_mode = os.getenv("ML_PAPER_MODE_ENABLED")
     if paper_mode is not None:
         cfg.ml_paper_mode_enabled = str(paper_mode).strip().lower() in {"1", "true", "yes", "y"}

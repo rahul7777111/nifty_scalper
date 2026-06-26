@@ -42,7 +42,6 @@ class MLRuntimeEngine:
         risk_manager: MLPaperRiskManager,
         log_dir: str | Path = "logs",
         kill_switch: bool = False,
-        shadow_mode_enabled: bool = False,
         paper_mode_enabled: bool = False,
         min_confidence_threshold: float | None = None,
         max_predictions_per_day: int = 1000,
@@ -55,7 +54,6 @@ class MLRuntimeEngine:
         self.risk_manager = risk_manager
         self.log_dir = Path(log_dir)
         self.kill_switch = bool(kill_switch)
-        self.shadow_mode_enabled = bool(shadow_mode_enabled)
         self.paper_mode_enabled = bool(paper_mode_enabled)
         self.min_confidence_threshold = min_confidence_threshold
         self.max_predictions_per_day = int(max_predictions_per_day)
@@ -107,22 +105,22 @@ class MLRuntimeEngine:
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         if ts is None:
             ts = datetime.now()
-        if self.kill_switch or not self.shadow_mode_enabled:
-            status = {"shadow_decision": "ERROR", "reason": "ml_disabled", "production_order_sent": False}
+        if self.kill_switch or not self.paper_mode_enabled:
+            status = {"paper_decision": "ERROR", "reason": "ml_disabled", "production_order_sent": False}
             self._last_prediction = status
             return status
         if self._prediction_count_today >= self.max_predictions_per_day:
             decision = "BLOCKED_MAX_DAILY_TRADES"
             reason = "max_predictions_per_day"
-            return self._log_shadow(snapshot, ts, symbol, current_position_state, market_regime, 0.0, decision, reason, [], [], {})
+            return self._log_paper(snapshot, ts, symbol, current_position_state, market_regime, 0.0, decision, reason, [], [], {})
         health = self.registry.model_health_status()
         manifest = self.registry.manifest()
         if not health.get("ok") or manifest is None:
-            return self._log_shadow(snapshot, ts, symbol, current_position_state, market_regime, 0.0, "ERROR", "registry_unhealthy", [], [], {})
+            return self._log_paper(snapshot, ts, symbol, current_position_state, market_regime, 0.0, "ERROR", "registry_unhealthy", [], [], {})
         valid, missing, invalid = self.registry.validate_runtime_features(snapshot)
         if not valid:
             decision = "BLOCKED_SCHEMA" if self.fail_closed_on_schema_mismatch else "ERROR"
-            return self._log_shadow(snapshot, ts, symbol, current_position_state, market_regime, 0.0, decision, "runtime_feature_validation_failed", missing, invalid, {})
+            return self._log_paper(snapshot, ts, symbol, current_position_state, market_regime, 0.0, decision, "runtime_feature_validation_failed", missing, invalid, {})
 
         # --- Dynamic preset filter (live-computable only) ---
         # Load preset from candidate directory; skip if not present
@@ -132,7 +130,7 @@ class MLRuntimeEngine:
             preset_result = apply_dynamic_preset_filter(dict(snapshot), preset_config)
             if not preset_result.get("filter_passed", False):
                 rejection = preset_result.get("rejection_reason", "preset_blocked")
-                return self._log_shadow(
+                return self._log_paper(
                     snapshot, ts, symbol, current_position_state, market_regime,
                     0.0, "BLOCKED_DYNAMIC_PRESET", rejection, [], [], {}
                 )
@@ -141,12 +139,12 @@ class MLRuntimeEngine:
         threshold = float(manifest.payload.get("selected_threshold") or 0.5)
         min_threshold = threshold if self.min_confidence_threshold is None else max(threshold, float(self.min_confidence_threshold))
         if probability < min_threshold:
-            return self._log_shadow(snapshot, ts, symbol, current_position_state, market_regime, probability, "BLOCKED_LOW_CONFIDENCE", "below_threshold", [], [], {})
+            return self._log_paper(snapshot, ts, symbol, current_position_state, market_regime, probability, "BLOCKED_LOW_CONFIDENCE", "below_threshold", [], [], {})
         risk = self.risk_manager.evaluate(dict(snapshot))
         if not risk.get("allowed"):
-            return self._log_shadow(snapshot, ts, symbol, current_position_state, market_regime, probability, "BLOCKED_RISK_FILTER", str(risk.get("blocking_reason") or "risk_block"), [], [], risk)
+            return self._log_paper(snapshot, ts, symbol, current_position_state, market_regime, probability, "BLOCKED_RISK_FILTER", str(risk.get("blocking_reason") or "risk_block"), [], [], risk)
         decision = "WOULD_ENTER"
-        row = self._log_shadow(snapshot, ts, symbol, current_position_state, market_regime, probability, decision, "threshold_and_risk_passed", [], [], risk)
+        row = self._log_paper(snapshot, ts, symbol, current_position_state, market_regime, probability, decision, "threshold_and_risk_passed", [], [], risk)
         paper_allowed, paper_reason = paper_mode_allowed(
             manifest_payload=manifest.payload,
             registry_health=health,
@@ -197,7 +195,7 @@ class MLRuntimeEngine:
         _append_jsonl(log_path, trade)
         return trade
 
-    def _log_shadow(self, snapshot: Mapping[str, Any], ts: datetime, symbol: str, current_position_state: str, market_regime: str, probability: float, decision: str, reason: str, missing: list[str], invalid: list[str], risk: Mapping[str, Any]) -> Dict[str, Any]:
+    def _log_paper(self, snapshot: Mapping[str, Any], ts: datetime, symbol: str, current_position_state: str, market_regime: str, probability: float, decision: str, reason: str, missing: list[str], invalid: list[str], risk: Mapping[str, Any]) -> Dict[str, Any]:
         manifest = self.registry.manifest()
         feature_names = self.registry.get_model_features()
         row = {
@@ -214,7 +212,7 @@ class MLRuntimeEngine:
             "feature_set_name": (manifest.payload.get("feature_set_name") if manifest else ""),
             "selected_threshold": (manifest.payload.get("selected_threshold") if manifest else None),
             "predicted_probability": probability,
-            "shadow_decision": decision,
+            "paper_decision": decision,
             "reason": reason if self.log_prediction_reason else "",
             "missing_features": missing,
             "invalid_features": invalid,
@@ -228,13 +226,12 @@ class MLRuntimeEngine:
         }
         self._prediction_count_today += 1
         self._last_prediction = row
-        path = self.log_dir / f"ml_shadow_predictions_{self._date_suffix(ts)}.jsonl"
+        path = self.log_dir / f"ml_paper_predictions_{self._date_suffix(ts)}.jsonl"
         _append_jsonl(path, row)
         return row
 
     def status(self) -> Dict[str, Any]:
         return {
-            "shadow_mode_enabled": self.shadow_mode_enabled and not self.kill_switch,
             "paper_mode_enabled": self.paper_mode_enabled and not self.kill_switch,
             "kill_switch": self.kill_switch,
             "prediction_count_today": self._prediction_count_today,

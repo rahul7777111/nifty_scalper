@@ -7,15 +7,99 @@ Runtime dynamic preset selection for candidate profiles.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from candidate_profile import (
-    CandidateProfile,
-    DynamicPreset,
-    SIDE_AUTO_DIRECTIONAL,
-    SIDE_CE_ONLY,
-    SIDE_PE_ONLY,
-)
+SIDE_AUTO_DIRECTIONAL = "AUTO_DIRECTIONAL"
+SIDE_CE_ONLY = "CE_ONLY"
+SIDE_PE_ONLY = "PE_ONLY"
+
+
+@dataclass
+class DynamicPreset:
+    name: str = "default"
+    preset_family: str = "default"
+    option_side_policy: str = "BOTH"
+    entry_threshold: float = 0.35
+    min_confidence: float = 0.35
+    max_trades_per_day: int = 3
+    cooldown_minutes: int = 0
+    spread_limit_pct: float = 0.20
+    stop_loss_pct: float = 0.30
+    target_pct: float = 0.18
+    trailing_sl_pct: float = 0.05
+    size_multiplier: float = 1.0
+    dir_sl_atr_mult: float = 1.5
+    dir_tp_atr_mult: float = 2.5
+    dir_trail_atr_mult: float = 1.0
+    regime_filter_str: str = "all"
+    regime_filter: Dict[str, Any] = field(default_factory=dict)
+    volatility_filter: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DynamicPreset":
+        return cls(
+            name=str(data.get("name") or data.get("preset_name") or data.get("preset_id") or "default"),
+            preset_family=str(data.get("preset_family") or data.get("family") or "default"),
+            option_side_policy=str(data.get("option_side_policy") or data.get("side_policy") or "BOTH"),
+            entry_threshold=float(data.get("entry_threshold", data.get("threshold", 0.35)) or 0.35),
+            min_confidence=float(data.get("min_confidence", data.get("entry_threshold", data.get("threshold", 0.35))) or 0.35),
+            max_trades_per_day=int(data.get("max_trades_per_day", 3) or 3),
+            cooldown_minutes=int(data.get("cooldown_minutes", 0) or 0),
+            spread_limit_pct=float(data.get("spread_limit_pct", 0.20) or 0.20),
+            stop_loss_pct=float(data.get("stop_loss_pct", data.get("sl_pct", 0.30)) or 0.30),
+            target_pct=float(data.get("target_pct", 0.18) or 0.18),
+            trailing_sl_pct=float(data.get("trailing_sl_pct", 0.05) or 0.05),
+            size_multiplier=float(data.get("size_multiplier", 1.0) or 1.0),
+            dir_sl_atr_mult=float(data.get("dir_sl_atr_mult", 1.5) or 1.5),
+            dir_tp_atr_mult=float(data.get("dir_tp_atr_mult", 2.5) or 2.5),
+            dir_trail_atr_mult=float(data.get("dir_trail_atr_mult", 1.0) or 1.0),
+            regime_filter_str=str(data.get("regime_filter_str") or data.get("regime") or "all"),
+            regime_filter=dict(data.get("regime_filter") or {}),
+            volatility_filter=dict(data.get("volatility_filter") or {}),
+        )
+
+    def to_retrainer_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "preset_family": self.preset_family,
+            "option_side_policy": self.option_side_policy,
+            "entry_threshold": self.entry_threshold,
+            "min_confidence": self.min_confidence,
+            "max_trades_per_day": self.max_trades_per_day,
+            "cooldown_minutes": self.cooldown_minutes,
+            "spread_limit_pct": self.spread_limit_pct,
+            "stop_loss_pct": self.stop_loss_pct,
+            "target_pct": self.target_pct,
+            "trailing_sl_pct": self.trailing_sl_pct,
+            "size_multiplier": self.size_multiplier,
+            "dir_sl_atr_mult": self.dir_sl_atr_mult,
+            "dir_tp_atr_mult": self.dir_tp_atr_mult,
+            "dir_trail_atr_mult": self.dir_trail_atr_mult,
+            "regime_filter_str": self.regime_filter_str,
+            "regime_filter": dict(self.regime_filter),
+            "volatility_filter": dict(self.volatility_filter),
+        }
+
+
+@dataclass
+class CandidateProfile:
+    candidate_id: str = ""
+    model_name: str = ""
+    preset_family: str = "default"
+    threshold_policy: Dict[str, Any] = field(default_factory=dict)
+    dynamic_presets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CandidateProfile":
+        return cls(
+            candidate_id=str(data.get("candidate_id") or ""),
+            model_name=str(data.get("model_name") or ""),
+            preset_family=str(data.get("preset_family") or "default"),
+            threshold_policy=dict(data.get("threshold_policy") or {}),
+            dynamic_presets=dict(data.get("dynamic_presets") or data.get("presets") or {}),
+        )
 
 
 def detect_market_regime(snapshot: Dict[str, Any]) -> str:
@@ -176,8 +260,8 @@ def select_dynamic_preset(
     if not presets:
         # PHASE 2: try global central loader fallback (config/dynamic_presets.json etc) so we never emit the old generic no_dynamic... when paper testing
         try:
-            from paper_forward_engine import load_dynamic_presets
-            greg = load_dynamic_presets()
+            from candidate_router import load_dynamic_presets
+            greg = load_dynamic_presets(Path(__file__).resolve().parent.parent)
             gdata = greg.get("data", {}) if greg.get("loaded") else {}
             gp = gdata.get("presets", gdata.get("dynamic_presets", {})) if isinstance(gdata, dict) else {}
             for _name, pdata in (gp or {}).items():

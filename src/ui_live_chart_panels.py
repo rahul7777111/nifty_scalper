@@ -1417,36 +1417,6 @@ def refresh_live_chart_snapshot(app: Any, snapshot: LiveChartSnapshot) -> None:
             sig = snapshot.current_signal or "NO_TRADE"
             app._lc_signal_var.set(f"Signal: {sig}")
 
-            # TASK: Feed paper-forward multi engine from live snapshot (even if candles=0, use oc data)
-            # Use gated publish + runtime merge; no direct engine call with poor data
-            if hasattr(app, "pf_engine") and getattr(app, "pf_engine", None):
-                mkt = {
-                    "timestamp": snapshot.timestamp.isoformat() if getattr(snapshot, "timestamp", None) else datetime.now(timezone.utc).isoformat(),
-                    "price": getattr(snapshot, "spot_price", None) or (snapshot.candles[-1].close if getattr(snapshot, "candles", None) else None),
-                    "regime": getattr(snapshot, "regime_label", "UNKNOWN"),
-                    "market_regime": getattr(snapshot, "regime_label", "UNKNOWN"),
-                }
-                oc = getattr(snapshot, "option_chain_summary", None)
-                chain = None
-                if oc:
-                    chain = {
-                        "ltp": getattr(oc, "ce_ltp", None) or getattr(oc, "pe_ltp", None) or getattr(snapshot, "spot_price", None),
-                        "best_bid": getattr(oc, "ce_bid", None) or getattr(oc, "pe_bid", None),
-                        "best_ask": getattr(oc, "ce_ask", None) or getattr(oc, "pe_ask", None),
-                        "volume": getattr(oc, "total_oi", None) or getattr(oc, "volume", None),
-                    }
-                try:
-                    if hasattr(app, "_pf_runtime") and app._pf_runtime:
-                        rt = app._pf_runtime
-                        if mkt.get("price"):
-                            rt.spot = mkt.get("price")
-                        if hasattr(app, "_publish_market_snapshot_to_paper_forward"):
-                            app._publish_market_snapshot_to_paper_forward(mkt, chain if chain else None, source="live_chart_candles_only_update")
-                    if hasattr(app, "_pf_refresh_monitor_ui") and hasattr(app, "pf_engine") and app.pf_engine:
-                        app._pf_refresh_monitor_ui(source="live_chart_snapshot")
-                except Exception as _e_pf:
-                    logger.debug("[PF-FEED] %s", _e_pf)
-
             pcr_val = snapshot.option_chain_summary.pcr if snapshot.option_chain_summary else None
             pcr_str = f"PCR: {pcr_val:.2f}" if pcr_val is not None else "PCR: --"
             app._lc_pcr_var.set(pcr_str)
@@ -1996,28 +1966,14 @@ def _refresh_current_prediction_card(app: Any, snap: LiveChartSnapshot) -> None:
             # No runtime decision yet - provide exact reason (TASK)
             reason = "no active candidate configured"
             try:
-                if hasattr(app, "pf_engine") and getattr(app, "pf_engine", None):
-                    reason = "paper multi running (see Paper Forward Monitor tab)"
-                elif not os.path.exists("config/paper_forward_candidates.json"):
-                    reason = "candidate file missing (config/paper_forward_candidates.json)"
+                if not os.path.exists("config/ml_candidates.json") and not os.path.exists("models"):
+                    reason = "candidate config/model path missing (config/ml_candidates.json or models/)"
                 elif os.getenv("MSTOCK_ENABLE_LIVE_ORDERS", "false").lower() in ("1","true","yes"):
                     reason = "live orders enabled (blocked for paper)"
                 else:
                     act = os.getenv("MSTOCK_ACTIVE_CANDIDATE_ID") or os.getenv("MSTOCK_ACTIVE_CANDIDATE_IDS")
-                    if hasattr(app, "pf_engine") and getattr(app, "pf_engine", None):
-                        try:
-                            cands = getattr(app.pf_engine, "candidates", []) or []
-                            n_total = len(cands)
-                            n_valid = sum(1 for c in cands if c.get("enabled", True) and not c.get("disabled_reason"))
-                            reason = f"paper_forward_multi running: valid={n_valid} invalid={n_total-n_valid}; see Paper Forward Monitor tab"
-                            print(f"[ML-STATUS] paper_multi=true valid_candidates={n_valid} invalid_candidates={n_total-n_valid} latest_snapshot_status=ok", flush=True)
-                        except Exception:
-                            reason = "paper multi running (see Paper Forward Monitor tab)"
-                    elif not act:
-                        if os.path.exists("config/paper_forward_candidates.json"):
-                            reason = "paper_forward_multi (candidates loaded from file; no single MSTOCK_ACTIVE_CANDIDATE_ID needed)"
-                        else:
-                            reason = "no active candidate (set MSTOCK_ACTIVE_CANDIDATE_ID or use paper_forward_multi)"
+                    if not act:
+                        reason = "no active candidate (set MSTOCK_ACTIVE_CANDIDATE_ID or MSTOCK_ACTIVE_CANDIDATE_IDS)"
                     else:
                         reason = f"router not run yet for {act} (waiting for snapshot)"
             except Exception:

@@ -118,6 +118,32 @@ except ImportError:
 _PF_MODEL_CACHE: Dict[str, Dict[str, Any]] = {}
 _PF_FEATURE_SCHEMA_CACHE: Dict[str, List[str]] = {}
 
+
+def _safe_load_json(path: Path) -> Dict[str, Any] | None:
+    try:
+        if path.exists() and path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+    return None
+
+
+def load_dynamic_presets(project_root: Path | str) -> Dict[str, Any]:
+    """Load global dynamic preset config without paper-forward module dependencies."""
+    root = Path(project_root).resolve()
+    for env_key in ("DYNAMIC_PRESETS_PATH", "PAPER_FORWARD_DYNAMIC_PRESETS_PATH"):
+        raw = os.environ.get(env_key)
+        if raw:
+            data = _safe_load_json(Path(raw))
+            if data:
+                return {"source": raw, "data": data, "loaded": True}
+    for rel in ("config/dynamic_presets.json", "config/presets.json"):
+        data = _safe_load_json(root / rel)
+        if data:
+            return {"source": str(root / rel), "data": data, "loaded": True}
+    return {"source": None, "data": {}, "loaded": False}
+
 # ---------------------------------------------------------------------------
 # Feature alignment (imported lazily to avoid circular deps)
 # ---------------------------------------------------------------------------
@@ -727,6 +753,10 @@ def build_no_trade_decision(
             "stop_loss_pct": 0.0,
             "target_pct": 0.0,
             "trailing_sl_pct": None,
+            "size_multiplier": 1.0,
+            "dir_sl_atr_mult": None,
+            "dir_tp_atr_mult": None,
+            "dir_trail_atr_mult": None,
             "max_trades_per_day": 0,
             "cooldown_minutes": 0,
         },
@@ -1020,12 +1050,49 @@ def _load_preset_for_profile(profile: Dict[str, _Any] | None, snapshot: Dict[str
 
 
 def _build_aligned_feature_row(feature_order: List[str], snapshot: Dict[str, _Any], debug: Dict[str, _Any] | None = None, optional_features: List[str] | None = None) -> "np.ndarray":
-    """Build exactly 1 row X in artifact feature_order (delegates to paper_forward_predict)."""
-    try:
-        from .paper_forward_predict import build_aligned_feature_row
-    except ImportError:
-        from paper_forward_predict import build_aligned_feature_row  # type: ignore
-    return build_aligned_feature_row(feature_order, snapshot, debug, optional_features)
+    """Build exactly one aligned feature row without paper-forward dependencies."""
+    import numpy as np
+
+    opts = set(optional_features or [])
+    values: List[float] = []
+    missing: List[str] = []
+    nan_names: List[str] = []
+    zero_count = 0
+    nan_count = 0
+    inf_count = 0
+    for feature in feature_order:
+        raw = snapshot.get(feature)
+        try:
+            value = float(raw) if raw is not None else np.nan
+        except Exception:
+            value = np.nan
+        if np.isinf(value):
+            inf_count += 1
+            value = np.nan
+        if np.isnan(value):
+            nan_count += 1
+            nan_names.append(feature)
+            if feature in opts:
+                value = 0.0
+            else:
+                missing.append(feature)
+        if value == 0.0:
+            zero_count += 1
+        values.append(value)
+    X = np.array([values], dtype=np.float32)
+    if debug is not None:
+        debug.update(
+            {
+                "X_shape": X.shape,
+                "nan_count": nan_count,
+                "inf_count": inf_count,
+                "zero_count": zero_count,
+                "nan_feature_names": nan_names,
+                "required_missing_after_optional_impute": missing,
+                "constant_feature_count": int(X.shape[1] > 0 and np.isfinite(X[0]).any() and np.sum(X[0][np.isfinite(X[0])] == X[0][np.isfinite(X[0])][0])),
+            }
+        )
+    return X
 
 
 def _resolve_feature_order_cached(
@@ -1146,30 +1213,66 @@ def _load_model_bundle_cached(pkl_path: "Path", artifact_dir: str | None, cand_m
 
 
 def _predict_confidence_from_artifact(model_pkl_path: str | None, snapshot: Dict[str, _Any], feature_order: List[str] | None = None, artifact_dir: str | None = None, cand_meta: Dict[str, _Any] | None = None) -> Dict[str, _Any]:
-    """Artifact inference with feature gates + robust probability extraction."""
-    try:
-        from .paper_forward_predict import predict_confidence_from_artifact
-    except ImportError:
-        from paper_forward_predict import predict_confidence_from_artifact  # type: ignore
-
+    """Artifact inference with feature gates and local probability extraction."""
     fo = feature_order
     if not fo and cand_meta:
         fo = cand_meta.get("_feature_order") or cand_meta.get("feature_order") or cand_meta.get("live_computable_features")
-    thr = None
-    if cand_meta:
-        tp = cand_meta.get("threshold_policy") or {}
-        if isinstance(tp, dict):
-            thr = tp.get("entry_threshold") or tp.get("min_confidence")
-        if thr in (None, ""):
-            thr = cand_meta.get("threshold") or cand_meta.get("selected_threshold")
-    return predict_confidence_from_artifact(
-        model_pkl_path,
-        snapshot,
-        feature_order=fo,
-        artifact_dir=artifact_dir,
-        cand_meta=cand_meta,
-        threshold=float(thr) if thr not in (None, "") else None,
-    )
+    try:
+        from pathlib import Path as _Path
+        import pickle as _pickle
+    except Exception as exc:  # pragma: no cover
+        return {"error": f"IMPORT_ERROR:{exc}", "confidence": None, "prob": None, "predict_method": "none"}
+
+    if not model_pkl_path:
+        return {"error": "MODEL_PATH_MISSING", "confidence": None, "prob": None, "predict_method": "none"}
+    pkl = _Path(model_pkl_path)
+    if not pkl.exists():
+        return {"error": "MODEL_FILE_MISSING", "confidence": None, "prob": None, "predict_method": "none"}
+    try:
+        bundle, scaler, bundle_debug = _load_model_bundle_cached(pkl, artifact_dir, cand_meta)
+        if bundle is None:
+            return {"error": bundle_debug.get("load_error", "MODEL_LOAD_FAILED"), "confidence": None, "prob": None, "predict_method": "none"}
+        fo, _ = _resolve_feature_order_cached(
+            artifact_dir=artifact_dir,
+            cand_meta=cand_meta,
+            feature_order=fo,
+            bundle=bundle,
+        )
+        if not fo:
+            fo = [str(k) for k in snapshot.keys() if isinstance(k, str)]
+        feat_debug: Dict[str, _Any] = {}
+        X = _build_aligned_feature_row(fo, snapshot, feat_debug, optional_features=[])
+        missing = list(feat_debug.get("required_missing_after_optional_impute") or [])
+        if missing:
+            return {
+                "error": "FEATURE_VECTOR_INVALID",
+                "confidence": None,
+                "prob": None,
+                "predict_method": "none",
+                "missing_features": missing,
+                **feat_debug,
+            }
+        model = bundle.get("model", bundle.get("estimator", bundle)) if isinstance(bundle, dict) else bundle
+        if scaler is not None and hasattr(scaler, "transform"):
+            X = scaler.transform(X)
+        raw, prob, method = _extract_probability(model, X)
+        return {
+            "raw": raw,
+            "prob": prob,
+            "confidence": prob,
+            "predict_method": method,
+            "error": None,
+            "model_type": bundle_debug.get("model_class", type(model).__name__),
+            "feature_count": len(fo),
+            **feat_debug,
+        }
+    except Exception as exc:
+        return {
+            "error": f"{type(exc).__name__}:{exc}",
+            "confidence": None,
+            "prob": None,
+            "predict_method": "none",
+        }
 
 
 def _predict_confidence_from_artifact_legacy(model_pkl_path: str | None, snapshot: Dict[str, _Any]) -> float:
@@ -1515,6 +1618,10 @@ def route_candidate_decision(
         "stop_loss_pct": float(preset_cfg.get("stop_loss_pct") or preset_cfg.get("sl_pct") or 0.0),
         "target_pct": float(preset_cfg.get("target_pct") or 0.0),
         "trailing_sl_pct": preset_cfg.get("trailing_sl_pct"),
+        "size_multiplier": float(preset_cfg.get("size_multiplier") or 1.0),
+        "dir_sl_atr_mult": preset_cfg.get("dir_sl_atr_mult"),
+        "dir_tp_atr_mult": preset_cfg.get("dir_tp_atr_mult"),
+        "dir_trail_atr_mult": preset_cfg.get("dir_trail_atr_mult"),
         "max_trades_per_day": int(preset_cfg.get("max_trades_per_day") or preset_cfg.get("top_n_confidence_per_day") or 3),
         "cooldown_minutes": int(preset_cfg.get("cooldown_minutes") or 0),
     }

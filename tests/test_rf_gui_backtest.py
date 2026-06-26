@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
@@ -32,6 +34,8 @@ def test_load_ensemble_feature_names_from_feature_order_json(tmp_path: Path) -> 
 
 def test_find_latest_ensemble_artifact_under_gui_retrain_root() -> None:
     root = REPO_ROOT / "models" / "ensemble_gui_retrain_fixed"
+    if not root.exists():
+        pytest.skip("ensemble fixture not present")
     artifact_path, artifact_dir = find_latest_ensemble_artifact(root)
     assert artifact_path is not None
     assert artifact_dir is not None
@@ -40,6 +44,8 @@ def test_find_latest_ensemble_artifact_under_gui_retrain_root() -> None:
 
 def test_materialize_ensemble_dynamic_candidate_without_feature_manifest() -> None:
     root = REPO_ROOT / "models" / "ensemble_gui_retrain_fixed"
+    if not root.exists():
+        pytest.skip("ensemble fixture not present")
     artifact_path, artifact_dir = find_latest_ensemble_artifact(root)
     assert artifact_path is not None and artifact_dir is not None
 
